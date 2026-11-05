@@ -206,17 +206,18 @@ these routes when it rewrites its distribution.
 
 ### Retiring the per-site analytics
 
-Both sites ran their own analytics before this (cartercole.net's `cartercole-net-api`
-Lambda, cartercole.com's GraphQL mutations). The code is gone from both repositories;
-these AWS resources remain until removed by hand, after the new routes are live:
+Both sites ran their own analytics before this: cartercole.net's `cartercole-net-api`
+Lambda behind `/api/*` and `/auth/*`, and cartercole.com's GraphQL mutations. Both sites
+now load `/_c/c.js`, and the code is gone from both repositories.
 
-- cartercole.net: Lambda `cartercole-net-api` (and its URL, role, log group, origin
-  request policy `cartercole-net-api`), table `cartercole-net-analytics`, bucket
-  `cartercole-net-recordings`, parameters under `/cartercole-net/`. The `/api/*` and
-  `/auth/*` behaviors go with `routes cartercole.net --drop`; the unused `api` origin
-  can then be removed from the distribution.
-- cartercole.com: table `cartercole-analytics`, kept (`DeletionPolicy: Retain`) when it
-  leaves the stack; parameters `/cartercole/auth/admin-token` and `admin-ids`.
+- cartercole.net: `/api/*` and `/auth/*` were removed from its distribution
+  (`routes cartercole.net --drop`). The old Lambda, its table, bucket, role, parameters,
+  origin request policy, the unused `api` origin and its hub client are being retired
+  separately.
+- cartercole.com: the table `cartercole-analytics` stays in its stack with
+  `DeletionPolicy: Retain`. Delete the block after a deploy to orphan it, then the table
+  by hand if its few days of counts aren't wanted. The parameters
+  `/cartercole/auth/admin-token` and `admin-ids` are no longer read.
 
 ## Cost
 
