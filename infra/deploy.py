@@ -395,7 +395,7 @@ def ensure_function(role_arn: str, env: dict, dry: bool) -> str:
         "FunctionName": FUNCTION, "Role": role_arn, "Runtime": "python3.13",
         "Handler": "carterlitics.app.lambda_handler", "MemorySize": 512, "Timeout": 60,
         "Environment": {"Variables": env},
-        "Description": "carterlitics: first-party analytics for " + ", ".join(CFG.sites),
+        "Description": f"carterlitics: first-party analytics for {len(CFG.sites)} sites (console on {CFG.console})"[:256],
         "LoggingConfig": {"LogFormat": "Text", "LogGroup": LOG_GROUP},
     }
     exists = not error_of("lambda", "get-function-configuration", "--function-name", FUNCTION)
@@ -488,6 +488,15 @@ def provision(dry: bool) -> None:
 # ---------------------------------------------------------------- routes
 
 
+def canonical(policy: dict) -> str:
+    """A policy config as CloudFront compares it: header names in any order or case."""
+    p = json.loads(json.dumps(policy))
+    items = p.get("HeadersConfig", {}).get("Headers", {}).get("Items")
+    if items:
+        p["HeadersConfig"]["Headers"]["Items"] = sorted(h.lower() for h in items)
+    return json.dumps(p, sort_keys=True)
+
+
 def ensure_origin_request_policy(dry: bool) -> str:
     listing = aws("cloudfront", "list-origin-request-policies", "--type", "custom")["OriginRequestPolicyList"]
     config = {
@@ -501,7 +510,7 @@ def ensure_origin_request_policy(dry: bool) -> str:
     for item in listing.get("Items", []):
         policy = item["OriginRequestPolicy"]
         if policy["OriginRequestPolicyConfig"]["Name"] == ORIGIN_REQUEST_POLICY:
-            if policy["OriginRequestPolicyConfig"] != config and not dry:
+            if canonical(policy["OriginRequestPolicyConfig"]) != canonical(config) and not dry:
                 etag = aws("cloudfront", "get-origin-request-policy", "--id", policy["Id"])["ETag"]
                 aws("cloudfront", "update-origin-request-policy", "--id", policy["Id"], "--if-match", etag,
                     "--origin-request-policy-config", json.dumps(config))
@@ -661,7 +670,9 @@ def log_one(site, dist: str, dry: bool) -> None:
         return
     aws("logs", "create-delivery", "--delivery-source-name", source, "--delivery-destination-arn", destination,
         "--record-fields", *LOG_FIELDS,
-        "--s3-delivery-configuration", "suffixPath={DistributionId}/{yyyy}/{MM}/{dd}/{HH},enableHiveCompatiblePath=false")
+        # JSON, not shorthand: the CLI's shorthand parser reads the {braces} as structure.
+        "--s3-delivery-configuration", json.dumps({"suffixPath": "{DistributionId}/{yyyy}/{MM}/{dd}/{HH}",
+                                                   "enableHiveCompatiblePath": False}))
     log("logging", f"{dist} ({site.id}) -> s3://{logs_bucket()}/{dist}/ (JSON); the first files take a few minutes")
 
 
