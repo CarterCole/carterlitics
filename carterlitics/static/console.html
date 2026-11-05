@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>carterlitics</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='8' width='3' height='7' rx='1' fill='%232a78d6'/%3E%3Crect x='6.5' y='4' width='3' height='11' rx='1' fill='%232a78d6'/%3E%3Crect x='12' y='1' width='3' height='14' rx='1' fill='%23eb6834'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="{{asset:console.css}}">
+</head>
+<body>
+<div class="app" data-app data-mount="{{mount}}">
+
+  <header class="top">
+    <a class="brand" href="{{mount}}/admin/">carterlitics</a>
+    <div class="filters" role="group" aria-label="Filters">
+      <label class="field"><span class="sr-only">Site</span><select data-site aria-label="Site"></select></label>
+      <div class="seg" role="group" aria-label="Date range" data-range></div>
+    </div>
+    <form class="who" method="post" action="{{mount}}/auth/logout">
+      <span data-who></span>
+      <button type="submit" class="btn btn--quiet">Sign out</button>
+    </form>
+  </header>
+
+  <nav class="tabs" aria-label="Views" data-tabs>
+    <a href="#overview" data-tab="overview">Overview</a>
+    <a href="#traffic" data-tab="traffic">Traffic</a>
+    <a href="#bots" data-tab="bots">Bots</a>
+    <a href="#visitors" data-tab="visitors">Visitors</a>
+    <a href="#events" data-tab="events">Events</a>
+    <a href="#errors" data-tab="errors">Errors</a>
+  </nav>
+
+  <p class="status" data-status role="status">Loading…</p>
+  <noscript><p class="status status--bad">The console needs JavaScript.</p></noscript>
+
+  <main data-view></main>
+</div>
+<script src="{{asset:console.js}}" defer></script>
+</body>
+</html>

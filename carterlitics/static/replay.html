@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Replay · carterlitics</title>
+<link rel="stylesheet" href="{{asset:console.css}}">
+<link rel="stylesheet" href="{{asset:vendor/rrweb-player.css}}">
+</head>
+<body>
+<div class="app" data-replay data-mount="{{mount}}">
+  <header class="top">
+    <a class="brand" href="{{mount}}/admin/">carterlitics</a>
+    <div class="filters"><a data-back href="{{mount}}/admin/#visitors">&larr; Sessions</a></div>
+  </header>
+  <section class="card">
+    <h2>Session <span class="mono" data-session>…</span></h2>
+    <p class="sub" data-when></p>
+    <p class="status" data-status role="status">Loading the recording…</p>
+    <noscript><p class="status status--bad">The player needs JavaScript.</p></noscript>
+    <div class="player" data-player></div>
+  </section>
+</div>
+<script src="{{asset:vendor/rrweb-player.min.js}}" defer></script>
+<script src="{{asset:replay.js}}" defer></script>
+</body>
+</html>

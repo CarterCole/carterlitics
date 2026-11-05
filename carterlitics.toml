@@ -1,0 +1,108 @@
+# The sites this collector serves. `infra/deploy.py` hands this (minus `[aws]`) to the
+# Lambda as JSON; `python3 -m carterlitics.dev` reads it directly.
+#
+# A site is found on CloudFront by its host names (`id`, the URL's host, `aliases`), so
+# no distribution ids live here; set `distribution` to pin one. `client = false` is for
+# hosts whose pages don't load c.js: they are counted from CloudFront's logs alone.
+
+# The console lives at https://<console>/_c/admin/. Every other site's /_c/admin/
+# redirects there, so there is one sign-in and one OIDC redirect URI.
+console = "cartercole.net"
+mount = "/_c"
+
+[auth]
+issuer = "https://accounts.cartercole.net"
+admin_role = "god"          # the hub's policy: "sites treat this as admin"
+admin_ids = []              # extra administrators, by `sub` (never by email)
+
+[retention]                 # days
+counts = 400
+visits = 400
+events = 180
+errors = 90
+server = 30
+recordings = 30
+
+# ---------------------------------------------------------------- the main sites
+
+[[site]]
+id = "cartercole.net"
+url = "https://cartercole.net"
+aliases = ["www.cartercole.net"]
+exclude = ["/admin", "/auth", "/api"]
+dev_url = "http://localhost:8793"
+
+[[site]]
+id = "cartercole.com"
+url = "https://cartercole.com"
+aliases = ["www.cartercole.com"]
+exclude = ["/admin", "/auth", "/graphql"]
+dev_url = "http://localhost:4321"
+
+# ---------------------------------------------------------------- project sites
+
+[[site]]
+id = "resume.cartercole.net"
+url = "https://resume.cartercole.net"
+aliases = ["resume.cartercole.com"]
+
+[[site]]
+id = "mosaic.cartercole.net"
+url = "https://mosaic.cartercole.net"
+
+[[site]]
+id = "rollopolis.cartercole.net"
+url = "https://rollopolis.cartercole.net"
+
+[[site]]
+id = "raindrive.cartercole.net"
+url = "https://raindrive.cartercole.net"
+
+[[site]]
+id = "clock.cartercole.net"
+url = "https://clock.cartercole.net"
+
+[[site]]
+id = "types.cartercole.net"
+url = "https://types.cartercole.net"
+
+[[site]]
+id = "bond.cartercole.net"
+url = "https://bond.cartercole.net"
+
+[[site]]
+id = "badge.cartercole.net"
+url = "https://badge.cartercole.net"
+
+# ---------------------------------------------------------------- server logs only
+
+[[site]]
+id = "accounts.cartercole.net"     # the Kith hub: an identity provider gets no page script
+url = "https://accounts.cartercole.net"
+client = false
+
+[[site]]
+id = "power.cartercole.net"
+url = "https://power.cartercole.net"
+client = false
+
+[[site]]
+id = "*.cartercole.net"            # the catch-all redirect: who asks for which subdomain
+url = "https://cartercole.net"
+aliases = ["*.cartercole.net"]
+client = false
+
+[[site]]
+id = "*.cartercole.com"
+url = "https://cartercole.com"
+aliases = ["*.cartercole.com"]
+client = false
+
+[aws]
+region = "us-east-1"
+function = "carterlitics"
+table = "carterlitics"
+params = "/carterlitics"     # SSM prefix for the secrets
+hub_ssh = "gputy"            # where the issuer runs, for register-client
+deploy_role = "cartercole-net-deploy"   # CI roles that may ship code (see `grant-deploy`)
+deploy_user = "site-publisher"

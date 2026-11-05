@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+.claude/
+infra/.state/
+# .mmdb files for the Lambda package (infra/deploy.py geo); licensed, not committed
+geo/
