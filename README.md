@@ -99,6 +99,12 @@ from CloudFront's logs alone (`client = false`): the account hub, the power app,
 two `*.` catch-all redirects. A site is matched to its distributions by host name, so
 `resume` covers both resume.cartercole.net and resume.cartercole.com.
 
+The two main sites have funnels. cartercole.com's events come from its
+`frontend/src/lib/track.ts` (`post_read`, `outbound`, and sign-in as `login_view`,
+`login_start` and `login`, since `/auth/*` isn't counted as pages); cartercole.net's from its
+`static/modal.js` (`dossier_open`, `shot_open`, `outbound`). Each funnel's comment in
+`carterlitics.toml` names the properties.
+
 **Bots** are recognised by user agent (about 150 named crawlers and tools, by kind: search, AI,
 social, SEO, monitoring, feeds, scanners, automation and HTTP libraries), by asking for
 something only a scanner wants (`.php`, `/.env`, `/.git/`, `/wp-…`), by sending no user

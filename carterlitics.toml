@@ -32,6 +32,23 @@ aliases = ["www.cartercole.net"]
 exclude = ["/admin", "/auth", "/api"]
 dev_url = "http://localhost:8793"
 
+# Funnels go under their site, after its keys (README: Funnels), and count consented
+# sessions only. The events come from the site's static/modal.js: dossier_open and
+# shot_open {entry}, and outbound {host, kind, href, entry, where} for a link off the
+# site, where kind is site (cartercole.net or .com), code (GitHub), social or other.
+
+[[site.funnel]]
+name = "Index to a project's site"
+steps = ["/", "event:outbound?kind=site"]
+
+[[site.funnel]]
+name = "Index to the code"
+steps = ["/", "event:outbound?kind=code"]
+
+[[site.funnel]]
+name = "Dossier to a link"
+steps = ["/", "event:dossier_open", "event:outbound"]
+
 [[site]]
 id = "cartercole.com"
 url = "https://cartercole.com"
@@ -39,12 +56,25 @@ aliases = ["www.cartercole.com"]
 exclude = ["/admin", "/auth", "/graphql"]
 dev_url = "http://localhost:4321"
 
-# Funnels go under their site, after its keys (README: Funnels). For example:
-#
-# [[site.funnel]]
-# name = "Reader to sign-up"
-# by = "session"             # or "visitor"
-# steps = ["/", "/blog", "/blog/*", "event:sign_up", "event:email_confirmed"]
+# Events from the site's frontend/src/lib/track.ts: post_read {slug} once the end of a
+# post is in view, outbound {host, kind, href}, and sign-in as events, since /auth/*
+# isn't counted as pages: login_view {error}, login_start {provider}, login {provider}.
+
+[[site.funnel]]
+name = "Home to a finished post"
+steps = ["/", "/blog/*", "event:post_read"]
+
+[[site.funnel]]
+name = "A post, read to the end"
+steps = ["/blog/*", "event:post_read"]
+
+[[site.funnel]]
+name = "Home to a link off the site"
+steps = ["/", "event:outbound"]
+
+[[site.funnel]]
+name = "Sign-in"
+steps = ["event:login_view", "event:login_start", "event:login"]
 
 # ---------------------------------------------------------------- project sites
 
