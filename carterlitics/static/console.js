@@ -52,6 +52,14 @@
     else node.append(child instanceof Node ? child : document.createTextNode(String(child)));
   }
 
+  /* replaceChildren with add's rules. The native one prints arrays as "[object HTMLDivElement],…"
+     and null as "null". */
+  function refill(node) {
+    node.replaceChildren();
+    for (var i = 1; i < arguments.length; i++) add(node, arguments[i]);
+    return node;
+  }
+
   function status(text, bad) {
     var s = root.querySelector("[data-status]");
     s.textContent = text || "";
@@ -191,7 +199,7 @@
     function show(bar, r) {
       chart.querySelectorAll(".col.is-on").forEach(function (n) { n.classList.remove("is-on"); });
       bar.classList.add("is-on");
-      tip.replaceChildren(el("div", { class: "tip-day", text: dayLabel(r.day) + ", " + r.day.slice(0, 4) }),
+      refill(tip, el("div", { class: "tip-day", text: dayLabel(r.day) + ", " + r.day.slice(0, 4) }),
         keys.slice().reverse().map(function (k) {
           return el("div", { class: "tip-row" }, el("i", { class: "tip-key", style: "--key:" + k.color }),
             el("strong", { text: num(r[k.key]) }), el("span", { text: k.label }));
@@ -327,7 +335,7 @@
       body);
     if (!dialog.open) dialog.showModal();
     var seen = sightings(ip);
-    function show(first) { body.replaceChildren(); add(body, [first, seen]); }
+    function show(first) { refill(body, first, seen); }
     get("/ip", { ip: ip }).then(function (d) { show(addressFacts(d)); },
       function (e) { show(el("p", { class: "empty bad", text: e.message })); });
   }
@@ -606,7 +614,7 @@
     var figure = el("div", { class: "funnel-fig" }, list, tip);
 
     function show(track, s, i) {
-      tip.replaceChildren(
+      refill(tip,
         el("div", { class: "tip-day", text: "Step " + (i + 1) + ": " + s.step }),
         el("div", { class: "tip-row" }, el("strong", { text: num(s.count) }), el("span", { text: unit })),
         el("div", { class: "tip-row" }, el("strong", { text: share(s.count, first) }), el("span", { text: "of step 1" })),
@@ -726,7 +734,7 @@
     cell.replaceChildren(el("p", { class: "empty", text: "Loading…" }));
     get("/error", { id: gid }).then(function (d) {
       var g = d.group;
-      cell.replaceChildren(
+      refill(cell,
         el("dl", { class: "kv" },
           el("dt", { text: "Kind" }), el("dd", { text: [g.kind, g.name].filter(Boolean).join(" · ") }),
           el("dt", { text: "Source" }), el("dd", { class: "mono", text: g.src || "—" }),
