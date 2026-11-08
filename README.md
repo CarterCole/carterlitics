@@ -7,7 +7,10 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
 - **Server side, every request.** CloudFront's access logs flow into the collector, so
   every page request is counted, cache hits included: people, crawlers, AI bots,
   scanners probing `/wp-login.php`, feed readers. Each comes with its IP, user agent,
-  country and network.
+  country, network and reverse DNS name, and with what the address is: an ISP, a
+  datacenter, iCloud Private Relay, a VPN, Tor, a crawler's own range, or a known attacker.
+  A request that says it's Googlebot (or Bingbot, GPTBot, Applebot, …) is checked
+  against the crawler's published ranges and forward-confirmed DNS, so fakes show up.
 - **Client side, one script.** `/_c/c.js` counts page views (SPA navigations too),
   engaged time, unique visitors (cookieless, a daily-salted hash), custom events
   (`cl("track", …)`, awaitable), and JavaScript errors: uncaught, unhandled rejections,
@@ -19,7 +22,8 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
 - **Funnels.** Steps in order (pages, events, a backend's events), counted over consented
   sessions or visitors, with drop-off per step and replays of the sessions that stopped.
 - **One console** at `/_c/admin/`: overview, traffic, bots, visitors and sessions,
-  events, funnels, errors, replays, for every site.
+  events, funnels, errors, replays, for every site. Click any address for everything
+  known about it, its registry record (RDAP) included.
 
 Stdlib Python on Lambda (no dependencies beyond the runtime's boto3), one DynamoDB table,
 two S3 buckets. No build step for the browser side.
@@ -31,6 +35,7 @@ carterlitics/        the collector (a Python package; Lambda handler carterlitic
   classify.py        bots, browsers, page paths, referrers, datacenter networks
   logs.py            CloudFront access logs (v2 JSON or W3C) -> records
   geo.py             a pure-Python .mmdb reader: IPinfo Lite, GeoLite2 Country/City/ASN
+  intel.py           what an address is: reverse DNS, published ranges, crawler checks, RDAP
   auth.py            console sign-in: OpenID Connect + PKCE, admins only; server keys
   config.py          sites, retention, secrets
   backends.py        DynamoDB and S3, and in-memory twins for tests and dev
@@ -70,12 +75,13 @@ country and ASN, and blockers that target third-party analytics hosts don't appl
 
 | | When | What | Kept |
 |---|---|---|---|
-| Server requests | always | IP, user agent, method, path, query, status, referrer, country, network, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
-| Page counters | always, unless DNT/GPC | daily counts per page, referrer, country, device size, browser, OS; engaged (visible) time per page; bots that run JS are counted apart | 400 days |
+| Server requests | always | IP, user agent, method, path, query, status, referrer, country, network, reverse DNS name, kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
+| Page counters | always, unless DNT/GPC | daily counts per page, referrer, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; bots that run JS are counted apart | 400 days |
 | Unique visitors | always, unless DNT/GPC | `sha256(daily salt, site, IP, UA)`; the salt is random and deleted after 2 days, so hashes can't be reversed afterwards | 400 days (as a count) |
 | Events | always, unless DNT/GPC | name, properties (≤ 2 KB), page | 180 days |
 | Errors | always | message, type, stack, source, page, user agent; no identifier unless consented | 90 days |
-| Visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo, per page view | 400 days |
+| Visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view | 400 days |
+| Address names | with the above | an address's reverse DNS name, as a cache (`ip\|<address>`) | 7 days |
 | Recordings | consent only | rrweb: DOM, mouse, scroll; inputs masked, `[data-private]` blocked, `[data-mask]` text masked | 30 days |
 
 Retention is `[retention]` in `carterlitics.toml`; everything expires through the table's
@@ -96,9 +102,46 @@ two `*.` catch-all redirects. A site is matched to its distributions by host nam
 **Bots** are recognised by user agent (about 150 named crawlers and tools, by kind: search, AI,
 social, SEO, monitoring, feeds, scanners, automation and HTTP libraries), by asking for
 something only a scanner wants (`.php`, `/.env`, `/.git/`, `/wp-…`), by sending no user
-agent or a non-browser one, and, for scripts that run, by `navigator.webdriver`. A
-browser user agent from a hosting network (AWS, GCP, DigitalOcean, Hetzner, …) is
-flagged "datacenter" rather than called a bot, since it may be a VPN.
+agent or a non-browser one, by coming from a Spamhaus DROP network, and, for scripts
+that run, by `navigator.webdriver`. A browser user agent from a hosting network (AWS,
+GCP, Azure, DigitalOcean, Hetzner, …) is flagged "datacenter" rather than called a bot,
+since it may be a VPN.
+
+### What an address is
+
+`intel.py` answers this for every address the collector keeps, without sending it to
+any lookup service:
+
+- **Reverse DNS**: the name its owner gives it (`c-73-22-1-9.hsd1.il.comcast.net`,
+  `crawl-66-249-66-1.googlebot.com`), from AWS's resolver, cached a week. Its domain
+  is counted too (Traffic: *Host domains*), which names companies with their own
+  networks as well as ISPs. Only addresses that are stored anyway are looked up: server
+  logs, consented visits, and backend events that carry an IP. A site with
+  `server_ip = "truncate"` gets none, since the names spell the address out.
+- **Published ranges**, built into `geo/ranges.bin` by `infra/deploy.py intel` from
+  about thirty public lists: the ranges Google, Bing, OpenAI, Perplexity, Apple,
+  DuckDuckGo, Common Crawl, UptimeRobot and Pingdom crawl from; AWS, Google Cloud,
+  Azure, Oracle, Cloudflare, Fastly, DigitalOcean, Linode, Vultr and GitHub Actions;
+  iCloud Private Relay's egress; Tor exits; Mullvad's servers and other VPN providers'
+  networks (X4BNet); datacenters (X4BNet); Starlink; Spamhaus DROP; and addresses seen
+  attacking in the last days (blocklist.de, DShield). One binary search per address,
+  about 4 µs. Each record gets a *connection* (`isp`, `hosting`, `relay`, `vpn`, `tor`,
+  `crawler`) and the most specific name the lists give ("AWS EC2 us-east-1"). Private
+  Relay is told apart from the Akamai and Cloudflare networks it rides on, which used
+  to be flagged as datacenters.
+- **Crawler checks.** A request that names a crawler with a published way to verify
+  it is marked `verified` (its address is in the crawler's published ranges, or its
+  reverse DNS name is the crawler's and resolves back to it, or it comes from the
+  crawler's own network) or `spoofed` (a check that could pass didn't). Spoofed requests
+  are counted as "Googlebot (fake)", kind "impostor". facebookexternalhit isn't checked:
+  iMessage sends it from people's phones.
+- **Clocks.** c.js sends the browser's time zone. When it keeps a different time from
+  the address's (CloudFront's `CloudFront-Viewer-Time-Zone`, or GeoLite2 City), the view
+  counts as *clock elsewhere*: a traveller, or a VPN in another country.
+- **The registry**, on request: clicking an address in the console asks RDAP (ARIN,
+  which redirects to the registry that holds the block) who holds it, its range, and
+  its abuse contact. This sends the address to the registry, so it only happens when
+  you click.
 
 ## Using it on a site
 
@@ -245,13 +288,16 @@ sites' own files. Visitor-supplied strings reach the page only through `textCont
 
 ```bash
 python3 -m carterlitics.dev --demo         # http://127.0.0.1:8795/_c/admin/, 30 days of fake data
-python3 -m unittest discover tests         # GEO_MMDB=path/to/file.mmdb also tests the geo reader;
+python3 -m unittest discover tests         # GEO_MMDB=path/to/file.mmdb also tests the geo reader,
+                                           # INTEL_RANGES=geo/ranges.bin the built ranges table;
                                            # with node on PATH, c.js runs in a stub page too
 ```
 
 The dev server keeps everything in memory, signs you straight in as an administrator,
 and accepts `POST /_c/dev/logs` with CloudFront log text, to see the server-side reports
-without AWS. `GEO_MMDB` (comma-separated `.mmdb` paths) turns on network names.
+without AWS. `GEO_MMDB` (comma-separated `.mmdb` paths) turns on network names,
+`INTEL_RANGES=geo/ranges.bin` the published ranges; reverse DNS is on unless
+`INTEL_DNS=off`. `--demo` makes up its own places, names and ranges, and asks no DNS.
 
 Each site's own dev server forwards `/_c/*` here the way CloudFront does:
 cartercole.net's `uv run build.py --serve` always does, and cartercole.com's frontend
@@ -265,7 +311,9 @@ Everything below runs under `AWS_PROFILE=carter-admin` and is safe to re-run.
 
 ```bash
 infra/deploy.py register-client                 # OIDC client at accounts.cartercole.net (over ssh gputy)
-infra/deploy.py geo                             # optional: IPinfo Lite into geo/ (IPINFO_TOKEN)
+infra/deploy.py geo                             # GeoLite2 City + ASN into geo/ (MAXMIND_ACCOUNT_ID,
+                                                # MAXMIND_LICENSE_KEY), or IPinfo Lite (IPINFO_TOKEN)
+infra/deploy.py intel                           # the published ranges -> geo/ranges.bin (no keys needed)
 infra/deploy.py provision                       # table, buckets, role, function, URL, secrets, log trigger
 infra/deploy.py routes cartercole.net --dry-run --drop '/api/*' '/auth/*'
 infra/deploy.py routes cartercole.net --drop '/api/*' '/auth/*'   # replaces the old per-site API routes
@@ -276,7 +324,17 @@ infra/deploy.py grant-deploy                    # let CI and site-publisher run 
 
 Then deploy each site (its `deploy.sh`) so its pages load `/_c/c.js`. After that,
 `infra/deploy.py code` ships a changed collector: a deterministic zip of the package (and
-any `.mmdb` in `geo/`), uploaded only when its SHA-256 differs from what Lambda runs.
+any `.mmdb` and `ranges.bin` in `geo/`), uploaded only when its SHA-256 differs from what
+Lambda runs.
+
+The lists change: Tor exits hourly, attackers daily, clouds weekly. Re-run
+`infra/deploy.py intel && infra/deploy.py code` to refresh them (the console says how old
+they are), and `geo` now and then for MaxMind's weekly databases. A new file in `geo/`
+needs `provision` once, which points the function at it; so does the first run after
+this change, which also lets the function batch-read its address cache
+(`dynamodb:BatchGetItem`). `routes <any site>` once updates the shared origin request
+policy to forward CloudFront's time-zone header (the policy's tenth and last; the region
+comes from GeoLite2 City).
 
 Buckets are `carterlitics-<account id>` and `…-logs` unless `[aws]` names them. `routes`
 adds the `carterlitics` origin and three behaviors at the front of the

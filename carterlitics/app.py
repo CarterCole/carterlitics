@@ -8,6 +8,7 @@
     GET  /_c/admin/                 the console (on the console site; others redirect there)
     GET  /_c/admin/replay           one session recording, played back
     GET  /_c/api/*                  the console's data, for a signed-in administrator
+                                    (/api/ip?ip=…: one address, registry included)
     GET  /_c/auth/login|callback    sign-in at the OpenID Connect issuer
     POST /_c/auth/logout
 
@@ -36,6 +37,7 @@ from . import auth, logs
 from .backends import DynamoTable, S3Blobs
 from .config import Config, Funnel
 from .geo import Geolocator
+from .intel import Intelligence
 from .store import LOG_KINDS, Meta, Store
 from .web import NO_STORE, Request, Response, from_lambda, no_content, plain, redirect, reply_json, to_lambda
 
@@ -109,10 +111,11 @@ class App:
         return self.cfg.site_for_host(req.headers.get("host")) if self.cfg.dev else None
 
     def meta(self, req: Request) -> Meta:
-        return Meta(ip=req.ip, user_agent=req.headers.get("user-agent"),
-                    country=req.headers.get("cloudfront-viewer-country", ""),
-                    asn=req.headers.get("cloudfront-viewer-asn", ""),
-                    city=req.headers.get("cloudfront-viewer-city", ""), opted_out=req.opted_out)
+        h = req.headers
+        return Meta(ip=req.ip, user_agent=h.get("user-agent"), country=h.get("cloudfront-viewer-country", ""),
+                    asn=h.get("cloudfront-viewer-asn", ""), city=h.get("cloudfront-viewer-city", ""),
+                    region=h.get("cloudfront-viewer-country-region-name", ""),
+                    tz=h.get("cloudfront-viewer-time-zone", ""), opted_out=req.opted_out)
 
     def csp(self) -> str:
         sites = " ".join(o for s in self.cfg.sites.values() for o in s.origins)
@@ -276,6 +279,10 @@ class App:
                     return reply_json({"error": str(e)}, 400)
             return self.big_json({**self.store.funnels(site, funnels, self.clamp(q.get("days"), 30, 1, 90)),
                                   "configured": [f.to_data() for f in site.funnels]})
+        if path == "/ip":
+            # One address, everything known: place, network, reverse DNS, lists, registry.
+            found = self.store.about(q.get("ip", ""), registry=q.get("whois") != "0")
+            return reply_json(found) if found else reply_json({"error": "not an address"}, 400)
         if path == "/error":
             found = self.store.error(site, q.get("id", ""))
             return self.big_json(found) if found else reply_json({"error": "not found"}, 404)
@@ -309,8 +316,9 @@ _app: App | None = None
 def build_from_env() -> App:
     cfg = Config.from_env()
     table, bucket = os.environ.get("TABLE"), os.environ.get("BUCKET")
-    store = Store(cfg, DynamoTable(table) if table else None, S3Blobs(bucket) if bucket else None,
-                  Geolocator.from_env())
+    table = DynamoTable(table) if table else None
+    store = Store(cfg, table, S3Blobs(bucket) if bucket else None, Geolocator.from_env(),
+                  Intelligence.from_env(table))
     return App(cfg, store)
 
 

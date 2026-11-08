@@ -7,6 +7,8 @@ A site's dev server forwards `/_c/*` here with an `x-carterlitics-site` header, 
 CloudFront does in production, so beacons, the console and replays all work on the
 site's own origin. Sign-in is a shortcut: /_c/auth/login makes you the administrator.
 Set GEO_MMDB to a .mmdb file (or several, comma-separated) for country and network.
+Set INTEL_RANGES to geo/ranges.bin (`infra/deploy.py intel`) for the published ranges;
+reverse DNS is on unless INTEL_DNS=off. The demo uses neither: it makes its own.
 
     POST /_c/dev/logs   CloudFront log text (W3C or JSON lines), counted as if S3 had
                         delivered it: the way to see the server-side reports locally.
@@ -26,6 +28,7 @@ from .app import App
 from .backends import MemoryBlobs, MemoryTable
 from .config import Config
 from .geo import Geolocator
+from .intel import Intelligence
 from .store import Store
 from .web import Request
 
@@ -88,7 +91,9 @@ def main() -> int:
         from .demo import configure
 
         cfg = configure(cfg)
-    app = App(cfg, Store(cfg, MemoryTable(), MemoryBlobs(), geo))
+    table = MemoryTable()
+    intel = Intelligence.from_env(table)
+    app = App(cfg, Store(cfg, table, MemoryBlobs(), geo, intel))
     if args.demo:
         from .demo import fill
 
@@ -96,7 +101,7 @@ def main() -> int:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(app))
     sites = ", ".join(f"{s.id} ({s.dev_url or 'no dev_url'})" for s in cfg.sites.values())
     print(f"carterlitics dev: http://127.0.0.1:{args.port}{cfg.mount}/  sites: {sites}"
-          f"{'  geo: on' if geo else ''}", flush=True)
+          f"{'  geo: on' if geo else ''}{'  ranges: ' + app.store.intel.ranges.built if app.store.intel.ranges else ''}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

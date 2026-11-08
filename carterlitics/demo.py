@@ -12,6 +12,8 @@ from unittest import mock
 
 from . import store as store_module
 from .config import Funnel
+from .geo import Geo
+from .intel import Intelligence, Ranges, build_ranges
 from .store import LogLine, Meta
 
 PEOPLE = [
@@ -24,6 +26,7 @@ PEOPLE = [
 ]
 BOTS = [
     ("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "66.249.66.{}"),
+    ("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "45.148.10.{}"),  # not Google
     ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)", "20.171.207.{}"),
     ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)", "34.162.46.{}"),
     ("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "40.77.167.{}"),
@@ -37,10 +40,87 @@ PROBES = ["/wp-login.php", "/.env", "/xmlrpc.php", "/.git/config", "/wp-admin/se
 REFERRERS = [None, None, None, "https://news.ycombinator.com/item?id=4242", "https://www.google.com/",
              "https://duckduckgo.com/", "https://github.com/CarterCole", "https://www.reddit.com/r/rust/",
              "https://lobste.rs/s/abc"]
+# country -> (city, region, time zone, ASN, network, reverse DNS name for a.b.c.d)
+PLACES = {
+    "US": [("Chicago", "Illinois", "America/Chicago", "7922", "Comcast Cable Communications, LLC",
+            "c-{a}-{b}-{c}-{d}.hsd1.il.comcast.net"),
+           ("Brooklyn", "New York", "America/New_York", "701", "Verizon Business",
+            "pool-{a}-{b}-{c}-{d}.nycmny.fios.verizon.net"),
+           ("Seattle", "Washington", "America/Los_Angeles", "20115", "Charter Communications",
+            "syn-{a:03d}-{b:03d}-{c:03d}-{d:03d}.res.spectrum.com")],
+    "GB": [("London", "England", "Europe/London", "2856", "British Telecommunications PLC",
+            "host{d}-{c}-{b}-{a}.range{a}-{b}.btcentralplus.com")],
+    "DE": [("Berlin", "Land Berlin", "Europe/Berlin", "3320", "Deutsche Telekom AG", "p{a:02x}{b:02x}{c:02x}{d:02x}.dip0.t-ipconnect.de")],
+    "CA": [("Toronto", "Ontario", "America/Toronto", "812", "Rogers Communications Canada Inc.",
+            "cpe{a:02x}{b:02x}-{c}-{d}.cpe.net.cable.rogers.com")],
+    "FR": [("Paris", "Ile-de-France", "Europe/Paris", "3215", "Orange S.A.", "lfbn-par-1-{c}-{d}.w{a}-{b}.abo.wanadoo.fr")],
+    "NL": [("Amsterdam", "North Holland", "Europe/Amsterdam", "33915", "Vodafone Libertel B.V.", "")],
+    "IN": [("Mumbai", "Maharashtra", "Asia/Kolkata", "55836", "Reliance Jio Infocomm Limited", "")],
+    "JP": [("Tokyo", "Tokyo", "Asia/Tokyo", "2516", "KDDI CORPORATION", "kd{a}{b}{c}{d}.au-net.ne.jp")],
+    "AU": [("Sydney", "New South Wales", "Australia/Sydney", "1221", "Telstra Limited", "")],
+    "BR": [("Sao Paulo", "Sao Paulo", "America/Sao_Paulo", "28573", "Claro NXT Telecomunicacoes Ltda", "")],
+}
 COUNTRIES = ["US", "US", "US", "GB", "DE", "CA", "FR", "NL", "IN", "JP", "AU", "BR"]
-NETWORKS = [("7922", "Comcast Cable Communications, LLC"), ("701", "Verizon Business"),
-            ("2856", "British Telecommunications PLC"), ("3320", "Deutsche Telekom AG"),
-            ("16509", "Amazon.com, Inc.")]
+# How people reach the sites, beyond their ISP: (share, kind, address, place, ASN, network, name)
+HIDDEN = [
+    (0.08, "relay", "172.224.{c}.{d}", ("", "", "", "US"), "36183", "Akamai Technologies, Inc.",
+     "a172-224-{c}-{d}.source.akaquill.net"),
+    (0.04, "vpn", "185.213.154.{d}", ("Stockholm", "Stockholm County", "Europe/Stockholm", "SE"), "39351",
+     "31173 Services AB", ""),
+    (0.02, "tor", "185.220.101.{d}", ("Berlin", "Land Berlin", "Europe/Berlin", "DE"), "60729",
+     "Stiftung Erneuerbare Freiheit", "tor-exit-{d}.relayon.org"),
+    (0.04, "hosting", "52.4.{c}.{d}", ("Ashburn", "Virginia", "America/New_York", "US"), "14618",
+     "Amazon.com, Inc.", "ec2-52-4-{c}-{d}.compute-1.amazonaws.com"),
+]
+BOT_NETWORKS = {"66.249.66": ("US", "15169", "Google LLC", "crawl-66-249-66-{d}.googlebot.com"),
+                "45.148.10": ("NL", "48090", "Techoff SRV Limited", ""),
+                "20.171.207": ("US", "8075", "Microsoft Corporation", ""),
+                "34.162.46": ("US", "396982", "Google LLC", "{d}.46.162.34.bc.googleusercontent.com"),
+                "40.77.167": ("US", "8075", "Microsoft Corporation", "msnbot-40-77-167-{d}.search.msn.com"),
+                "5.39.1": ("FR", "16276", "OVH SAS", "ip-5-39-1-{d}.a.ahrefs.com"),
+                "69.171.249": ("US", "32934", "Facebook, Inc.", "fwdproxy-prn-{d}.fbsv.net"),
+                "52.4.1": ("US", "14618", "Amazon.com, Inc.", "ec2-52-4-1-{d}.compute-1.amazonaws.com"),
+                "198.51.100": ("US", "64496", "Example Hosting", "")}
+# What the published lists would say about the demo's addresses.
+DEMO_RANGES = [("crawler:Googlebot", "66.249.64.0/19"), ("crawler:GPTBot", "20.171.206.0/23"),
+               ("crawler:Bingbot", "40.77.167.0/24"), ("cloud:AWS", "52.0.0.0/11"),
+               ("cloud:AWS EC2 us-east-1", "52.4.0.0/14"), ("cloud:Google Cloud us-east5", "34.162.0.0/16"),
+               ("hosting:datacenter", "45.148.10.0/24"), ("abuse:blocklist.de", "45.148.10.0/26"),
+               ("relay:iCloud Private Relay", "172.224.0.0/12"), ("vpn:Mullvad", "185.213.154.0/24"),
+               ("tor:Tor exit", "185.220.101.0/24"), ("hosting:datacenter", "198.51.100.0/24")]
+
+
+class DemoGeo:
+    """Places and names for the demo's own addresses; the real databases for the rest."""
+
+    def __init__(self, real):
+        self.real = real
+        self.readers = getattr(real, "readers", [])
+        self.places: dict[str, Geo] = {}
+        self.hosts: dict[str, str] = {}
+
+    def __bool__(self) -> bool:
+        return True
+
+    def lookup(self, ip):
+        return self.places.get(ip) or (self.real.lookup(ip) if self.real else Geo())
+
+    def add(self, ip: str, geo: Geo, host: str) -> None:
+        self.places[ip] = geo
+        self.hosts[ip] = host
+
+
+def intelligence(directory: DemoGeo, table) -> Intelligence:
+    """Reverse DNS from the demo's own names (crawler names resolve back unless they're
+    made up), and the ranges its addresses would be on: no network."""
+    return Intelligence(Ranges(build_ranges(DEMO_RANGES, "demo")), table, dns=True,
+                        reverse=lambda ip, timeout: directory.hosts.get(ip, ""),
+                        forward=lambda host, ip, timeout: directory.hosts.get(ip) == host)
+
+
+def _named(template: str, ip: str) -> str:
+    a, b, c, d = (int(x) for x in ip.split("."))
+    return template.format(a=a, b=b, c=c, d=d) if template else ""
 # For sites with no funnels of their own. Some consented visitors walk the first one,
 # dropping off along the way; `email_confirmed` comes from the site's backend.
 FUNNELS = {
@@ -68,6 +148,29 @@ def configure(cfg):
 def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
     rng = random.Random(seed)
     now = datetime.now(timezone.utc)
+    directory = DemoGeo(store.geo)
+    store.geo = directory
+    store.intel = intelligence(directory, store.table)
+
+    def person():
+        """An address, what CloudFront says about it, and the browser's time zone."""
+        country = rng.choice(COUNTRIES)
+        city, region, zone, asn, network, name = rng.choice(PLACES[country])
+        roll, browser_zone = rng.random(), zone
+        for share, kind, template, place, h_asn, h_net, h_name in HIDDEN:
+            if roll < share:
+                ip = template.format(c=rng.randrange(256), d=rng.randrange(1, 255))
+                city, region, zone, country = place
+                asn, network, name = h_asn, h_net, h_name
+                if kind == "relay":  # Private Relay keeps the visitor's region and zone
+                    zone = browser_zone
+                break
+            roll -= share
+        else:
+            ip = f"{rng.randrange(24, 220)}.{rng.randrange(256)}.{rng.randrange(256)}.{rng.randrange(1, 255)}"
+        directory.add(ip, Geo(country, asn, network, city, region, zone), _named(name, ip))
+        return Meta(ip=ip, country=country, asn=asn, city=city, region=region, tz=zone), browser_zone
+
     today = now.replace(minute=0, second=0, microsecond=0)
 
     def past(at: datetime) -> datetime:
@@ -87,9 +190,9 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                                        minute=rng.randrange(60), second=rng.randrange(60)))
                 with mock.patch.object(store_module, "now", lambda at=at: at):
                     ua = rng.choice(PEOPLE)
-                    ip = f"{rng.randrange(24, 220)}.{rng.randrange(256)}.{rng.randrange(256)}.{rng.randrange(1, 255)}"
-                    asn, network = rng.choice(NETWORKS)
-                    meta = Meta(ip=ip, user_agent=ua, country=rng.choice(COUNTRIES), asn=asn)
+                    meta, zone = person()
+                    meta = dataclasses.replace(meta, user_agent=ua)
+                    ip = meta.ip
                     consent = rng.random() < 0.3
                     sid, vid = str(uuid.UUID(int=rng.getrandbits(128))), str(uuid.UUID(int=rng.getrandbits(128)))
                     ids = {"sid": sid, "vid": vid, "sd": at.strftime("%Y-%m-%d"),
@@ -97,10 +200,11 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                     ref = rng.choice(REFERRERS)
                     width = rng.choice([390, 414, 820, 1280, 1440, 1728])
                     walks = consent and bool(site.funnels) and rng.random() < 0.55
+                    ids = {**ids, "tz": zone}
                     if walks:
                         for when, path in _journey(store, site, rng, at, now, ids, meta, width, ref):
                             lines.append(LogLine(when, site.host, ip, "GET", path, "", 200, ref or "", ua,
-                                                 edge="Hit", seconds=0.004))
+                                                 edge="Hit", seconds=0.004, country=meta.country, asn=meta.asn))
                     for n in range(0 if walks else rng.choice([1, 1, 1, 2, 3, 5])):
                         path = rng.choice(paths)
                         items = [{"t": "pv", "p": path, "r": ref if n == 0 else f"{site.url}/",
@@ -115,7 +219,8 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                                           "m": message.format(host=site.host), "st": stack.format(host=site.host)})
                         store.ingest(site, {"w": width, "items": items, **ids}, meta)
                         lines.append(LogLine(at, site.host, ip, "GET", path, "", 200, ref or "", ua,
-                                             edge=rng.choice(["Hit", "Hit", "Miss", "RefreshHit"]), seconds=0.004))
+                                             edge=rng.choice(["Hit", "Hit", "Miss", "RefreshHit"]), seconds=0.004,
+                                             country=meta.country, asn=meta.asn))
                     if consent:
                         store.chunk(site, {"sid": sid, "vid": vid, "sd": ids["sd"], "seq": 0, "p": "/",
                                            "events": _recording(at, site)}, meta)
@@ -123,10 +228,14 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                 ua, net = rng.choice(BOTS)
                 at = past(base.replace(hour=rng.randrange(0, 24 if back else max(1, base.hour + 1)),
                                        minute=rng.randrange(60)))
-                probe = "Chrome/120" in ua or ua.startswith("curl")
+                probe = "Chrome/120" in ua or ua.startswith("curl") or net.startswith("45.148.10")
                 path = rng.choice(PROBES) if probe and rng.random() < 0.7 else rng.choice(paths + ["/robots.txt", "/sitemap.xml", "/rss.xml"])
-                lines.append(LogLine(at, site.host, net.format(rng.randrange(1, 250)), "GET", path, "",
-                                     404 if path in PROBES else 200, "", ua, edge="Miss" if path in PROBES else "Hit"))
+                ip = net.format(rng.randrange(1, 250))
+                country, asn, network, name = BOT_NETWORKS[ip.rsplit(".", 1)[0]]
+                directory.add(ip, Geo(country, asn, network), _named(name, ip))
+                lines.append(LogLine(at, site.host, ip, "GET", path, "",
+                                     404 if path in PROBES else 200, "", ua, edge="Miss" if path in PROBES else "Hit",
+                                     country=country, asn=asn))
             store.ingest_log(lines)
 
 

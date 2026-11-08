@@ -20,7 +20,8 @@
     explore: { steps: params.get("steps") || "", by: params.get("by") === "visitor" ? "visitor" : "session" },
     me: null,
     report: null,
-    cache: {}
+    cache: {},
+    loaded: {}
   };
   var nf = new Intl.NumberFormat("en-US");
   var compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
@@ -83,9 +84,44 @@
     return el("span", { class: "clip" + (wide ? " clip--wide" : ""), text: text || "", title: text || "" });
   }
   function short(id, n) { return el("span", { class: "mono", text: (id || "").slice(0, n || 8), title: id || "" }); }
-  function where(row) {
-    var parts = [row.country, row.asn ? "AS" + row.asn : "", row.network].filter(Boolean);
-    return clip(parts.join(" · "));
+  /* Kinds of connection (intel.py's net): how an address reaches the site. */
+  var NET = { isp: "ISP or mobile", hosting: "Hosting or cloud", relay: "iCloud Private Relay", vpn: "VPN",
+    tor: "Tor", crawler: "A crawler's own range" };
+  var NET_PILL = { hosting: "datacenter", relay: "private relay", vpn: "vpn", tor: "tor" };
+  function netLabel(r) { return NET[r.name] || r.name; }
+
+  /* Country, place and network, with the reverse DNS name under it; `marks` adds flags. */
+  function where(row, marks) {
+    var place = [row.city, row.region].filter(Boolean).join(", ");
+    var parts = [row.country, place, row.asn ? "AS" + row.asn : "", row.network].filter(Boolean);
+    var title = [parts.join(" · "), row.host, row.svc].filter(Boolean).join("\n");
+    return el("span", { class: "where" },
+      el("span", { class: "clip", text: parts.join(" · "), title: title }),
+      row.host ? el("span", { class: "clip host", text: row.host, title: row.host }) : null,
+      marks ? flags(row) : null);
+  }
+
+  /* What's notable about a record's address: a verified or fake crawler, the kind of
+     connection, a browser clock elsewhere, a recent attacker. */
+  function flags(row) {
+    var out = [];
+    var net = row.net || (row.dc ? "hosting" : "");
+    if (row.ver === "verified") out.push(el("span", { class: "pill pill--good", text: "verified",
+      title: "The address is the crawler's own" }));
+    if (row.ver === "spoofed") out.push(el("span", { class: "pill pill--bad", text: "fake",
+      title: "Says it is a crawler; its address says otherwise" }));
+    if (NET_PILL[net]) out.push(el("span", { class: "pill", text: NET_PILL[net], title: row.svc || NET[net] }));
+    if (row.tzx) out.push(el("span", { class: "pill", text: "clock elsewhere",
+      title: "The browser keeps " + (row.tz || "another zone") + "'s time, not the address's" }));
+    if (row.abuse) out.push(el("span", { class: "pill pill--bad", text: "attacker", title: "Listed by " + row.abuse }));
+    return out.length ? el("span", { class: "flags" }, out) : null;
+  }
+
+  /* An address you can click for everything known about it. */
+  function ipCell(ip) {
+    if (!ip) return "";
+    return el("button", { type: "button", class: "ip", text: ip, title: "Look up " + ip,
+      onclick: function (e) { e.stopPropagation(); inspect(ip); } });
   }
   function replayLink(sid, label) {
     return el("a", { href: MOUNT + "/admin/replay?site=" + encodeURIComponent(state.site) + "&id=" + encodeURIComponent(sid),
@@ -113,7 +149,8 @@
   function cached(key, load) {
     var k = state.site + "|" + state.days + "|" + key;
     if (!state.cache[k]) {
-      state.cache[k] = load().catch(function (e) { delete state.cache[k]; throw e; });
+      state.cache[k] = load().then(function (v) { state.loaded[k] = v; return v; },
+        function (e) { delete state.cache[k]; throw e; });
     }
     return state.cache[k];
   }
@@ -270,6 +307,85 @@
 
   function td(value, cls) { return { td: el("td", { class: cls }, value) }; }
 
+  /* ---------------------------------------------------------------- one address */
+
+  var LOG_NAMES = { "log:hum": "request", "log:bot": "bot request", "log:pv": "page view", "log:ev": "event",
+    sessions: "session" };
+  var dialog = null;
+
+  function inspect(ip) {
+    if (!dialog) {
+      dialog = el("dialog", { class: "ip-panel" });
+      dialog.addEventListener("click", function (e) { if (e.target === dialog) dialog.close(); });
+      document.body.append(dialog);
+    }
+    var body = el("div", null, el("p", { class: "empty", text: "Looking up " + ip + "…" }));
+    dialog.setAttribute("aria-label", "Address " + ip);
+    dialog.replaceChildren(
+      el("div", { class: "ip-head" }, el("h2", { class: "mono", text: ip }),
+        el("button", { type: "button", class: "btn btn--quiet", text: "Close", onclick: function () { dialog.close(); } })),
+      body);
+    if (!dialog.open) dialog.showModal();
+    var seen = sightings(ip);
+    function show(first) { body.replaceChildren(); add(body, [first, seen]); }
+    get("/ip", { ip: ip }).then(function (d) { show(addressFacts(d)); },
+      function (e) { show(el("p", { class: "empty bad", text: e.message })); });
+  }
+
+  function addressFacts(d) {
+    var g = d.geo || {}, w = d.whois, rows = [];
+    function kv(k, v) {
+      if (v === null || v === undefined || v === "" || (Array.isArray(v) && !v.length)) return;
+      rows.push(el("dt", { text: k }), el("dd", null, v));
+    }
+    kv("Place", [[g.city, g.region, g.country].filter(Boolean).join(", "), g.tz].filter(Boolean).join(" · "));
+    kv("Network", [g.asn ? "AS" + g.asn : "", g.network].filter(Boolean).join(" · "));
+    kv("Connection", [NET[d.net || "isp"], d.service && d.service !== NET[d.net] ? d.service : ""].filter(Boolean).join(" · "));
+    kv("Reverse DNS", d.host === null ? (d.dns ? "no answer in time" : "not looked up (INTEL_DNS is off)")
+      : d.host === "" ? "none"
+      : [el("span", { class: "mono", text: d.host }), " ",
+        d.confirmed === true ? el("span", { class: "pill pill--good", text: "resolves back" })
+          : d.confirmed === false ? el("span", { class: "pill pill--bad", text: "doesn't resolve back" }) : null]);
+    kv("Domain", d.domain);
+    kv("On lists", d.ranges ? (d.tags.length ? el("span", { class: "flags" }, d.tags.map(function (t) {
+      var bad = /^(drop|abuse):/.test(t);
+      return el("span", { class: "pill" + (bad ? " pill--bad" : ""), text: t.replace(":", ": ") });
+    })) : "none") : "no ranges table (infra/deploy.py intel)");
+    if (d.ranges) kv("Lists from", /^\d{4}-/.test(d.ranges) ? stamp(d.ranges) + " UTC" : d.ranges);
+    if (!d.global) kv("Scope", "Not a public address");
+    if (w && w.error) kv("Registry", w.error);
+    else if (w) {
+      kv("Held by", [w.holder, w.address].filter(Boolean).join(" · "));
+      kv("Block", [w.name, w.handle ? "(" + w.handle + ")" : "", w.type].filter(Boolean).join(" "));
+      kv("Range", [w.start && w.end ? w.start + " – " + w.end : "", (w.cidrs || []).join(", ")].filter(Boolean).join(" · "));
+      kv("Registered", [w.registered ? w.registered.slice(0, 10) : "", w.updated ? "changed " + w.updated.slice(0, 10) : ""].filter(Boolean).join(", "));
+      kv("Abuse contact", w.abuse);
+      kv("Notes", (w.remarks || []).join(" "));
+      kv("Registry", [w.registry, w.country].filter(Boolean).join(" · "));
+    }
+    return el("dl", { class: "kv" }, rows);
+  }
+
+  /* The address in whatever logs this page has loaded, newest first. */
+  function sightings(ip) {
+    var prefix = state.site + "|" + state.days + "|", hits = [];
+    Object.keys(state.loaded).forEach(function (k) {
+      var kind = k.slice(prefix.length);
+      if (k.indexOf(prefix) !== 0 || !LOG_NAMES[kind] || !Array.isArray(state.loaded[k])) return;
+      state.loaded[k].forEach(function (i) { if (i.ip === ip) hits.push({ kind: LOG_NAMES[kind], item: i }); });
+    });
+    if (!hits.length) return el("p", { class: "sub", text: "Not among the newest requests and visits loaded here " +
+      "(Traffic, Bots and Visitors each load their newest 300)." });
+    hits.sort(function (a, b) { return (b.item.at || b.item.started || "") < (a.item.at || a.item.started || "") ? -1 : 1; });
+    return [el("h3", { class: "ip-seen", text: num(hits.length) + " in the logs loaded here" }),
+      table(["Time (UTC)", "What", "", "User agent"], hits.slice(0, 50).map(function (h) {
+        var i = h.item;
+        var what = i.method ? i.method + " " + i.path : i.name || i.path || "";
+        return [el("span", { class: "when", text: stamp(i.at || i.started) }), clip(h.kind + ": " + what, true),
+          i.bot ? el("span", { class: "pill pill--bot", text: i.bot }) : "", clip(i.ua, true)];
+      }))];
+  }
+
   /* ---------------------------------------------------------------- views */
 
   function overview(r) {
@@ -301,7 +417,11 @@
       el("div", { class: "grid" },
         card("Devices", "By window width.", ranked(r.top.devices)),
         card("Browsers", null, ranked(r.top.browsers)),
-        card("Systems", null, ranked(r.top.systems)))
+        card("Systems", null, ranked(r.top.systems)),
+        card("Connections", "How page views reached the site. " + (t.tzx ? num(t.tzx) + " (" +
+          pct.format(t.tzx / (t.pv || 1)) + ") came from a browser whose clock is in another time zone than its " +
+          "address: travel, or a VPN." : "Browser and address time zones agree."),
+          ranked(r.top.connections, { label: netLabel })))
     ];
   }
 
@@ -310,9 +430,9 @@
       var req = i.method + " " + i.path + (i.query ? "?" + i.query : "");
       var cells = [el("span", { class: "when", text: stamp(i.at) })];
       if (bots) cells.push(el("span", { class: "pill pill--bot", text: i.bot, title: i.cat }));
-      cells.push(el("span", { class: "mono", text: i.ip }), where(i), clip(req, true),
+      cells.push(ipCell(i.ip), where(i), clip(req, true),
         td(el("span", { class: i.status >= 400 ? "bad" : null, text: String(i.status) }), "num"),
-        clip(i.ref), clip(i.ua, true), i.dc ? el("span", { class: "pill", text: "datacenter" }) : i.edge);
+        clip(i.ref), clip(i.ua, true), flags(i) || i.edge);
       return row(cells, i);
     });
   }
@@ -321,13 +441,19 @@
     var holder = el("div", null, el("p", { class: "empty", text: "Loading requests…" }));
     logOf("hum").then(function (items) {
       holder.replaceChildren.apply(holder, searchable(
-        ["Time (UTC)", "IP", "Where", "Request", "#Status", "Referrer", "User agent", "Edge"],
+        ["Time (UTC)", "IP", "Where", "Request", "#Status", "Referrer", "User agent", "Notes"],
         trafficRows(items, false), "No requests from people yet."));
     }, function (e) { holder.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
+    var conn = {};
+    (r.top.server_connections || []).forEach(function (c) { conn[c.name] = c.value; });
+    var hidden = (conn.relay || 0) + (conn.vpn || 0) + (conn.tor || 0);
     return [
       tiles([
         ["People", big(r.totals.hum), "page requests at the edge"],
         ["From datacenters", big(r.totals.dc), "browser user agent, hosting network"],
+        ["Relays, VPNs, Tor", big(hidden), hidden ? num(conn.relay || 0) + " Private Relay · " + num(conn.vpn || 0) +
+          " VPN · " + num(conn.tor || 0) + " Tor" : "address hidden behind one"],
+        ["From attackers", big(r.totals.abuse), "addresses on blocklist.de or DShield, people and bots"],
         ["Bots", big(r.totals.bot), "see the Bots tab"]
       ]),
       el("div", { class: "grid" },
@@ -335,15 +461,28 @@
           ranked(r.top.server_paths, { head: ["Page", "Requests"] })),
         card("Where people are", "Country of each request's address.", ranked(r.top.server_countries)),
         card("Responses", "Every request, people and bots.", ranked(r.top.statuses, { head: ["Status", "Requests"] }))),
-      card("Requests from people", "Newest first, up to 300.", holder)
+      el("div", { class: "grid" },
+        card("Connections", intelNote(r), ranked(r.top.server_connections, { label: netLabel })),
+        card("Networks", "The organisation that owns the address.", ranked(r.top.server_networks, { limit: 15 })),
+        card("Host domains", "From reverse DNS: an ISP, or a company with its own network.",
+          ranked(r.top.server_domains, { limit: 15 }))),
+      card("Requests from people", "Newest first, up to 300. Click an address for everything known about it.", holder)
     ];
   }
+
+  function intelNote(r) {
+    var i = r.intel || {};
+    return (i.ranges ? "Published ranges from " + i.ranges.slice(0, 10) + "." : "No ranges table: run infra/deploy.py intel.") +
+      (i.dns === false ? " Reverse DNS is off." : "");
+  }
+
+  function sum(rows) { return (rows || []).reduce(function (s, x) { return s + x.value; }, 0); }
 
   function bots(r) {
     var holder = el("div", null, el("p", { class: "empty", text: "Loading requests…" }));
     logOf("bot").then(function (items) {
       holder.replaceChildren.apply(holder, searchable(
-        ["Time (UTC)", "Bot", "IP", "Where", "Request", "#Status", "Referrer", "User agent", "Edge"],
+        ["Time (UTC)", "Bot", "IP", "Where", "Request", "#Status", "Referrer", "User agent", "Notes"],
         trafficRows(items, true), "No bot requests yet."));
     }, function (e) { holder.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     var t = r.totals;
@@ -353,17 +492,35 @@
         ["Distinct bots", num(r.top.bots.length), "by user agent and behaviour"],
         ["Running JavaScript", big(t.jsbot), "page views c.js dropped as bots"],
         ["Probes", num((r.top.bots.filter(function (b) { return b.name === "probe"; })[0] || {}).value),
-          "requests for things a scanner looks for"]
+          "requests for things a scanner looks for"],
+        ["Verified crawlers", big(sum(r.top.verified)), "address checked: reverse DNS or published range"],
+        ["Fake crawlers", big(sum(r.top.impostors)), "claimed a crawler's name from someone else's address"]
       ]),
       el("div", { class: "grid" },
         card("Bots", null, ranked(r.top.bots, { head: ["Bot", "Requests"], limit: 20 })),
         card("Kinds", null, ranked(r.top.categories)),
         card("Networks", "The organisation that owns the address.", ranked(r.top.bot_networks, { limit: 15 }))),
       el("div", { class: "grid" },
+        card("Verified crawlers", intelNote(r), ranked(r.top.verified, { limit: 15,
+          empty: "None checked yet: crawlers are verified by reverse DNS and their published ranges." })),
+        card("Impostors", "Said they were these crawlers; the address said no.",
+          ranked(r.top.impostors, { limit: 15, empty: "No fake crawlers in this range." })),
+        card("Host domains", "From reverse DNS.", ranked(r.top.bot_domains, { limit: 15 }))),
+      el("div", { class: "grid" },
         card("Paths bots asked for", null, ranked(r.top.bot_paths, { limit: 20 })),
-        card("Addresses", null, ranked(r.top.bot_ips, { limit: 20, label: function (x) { return x.name; } }))),
-      card("Bot requests", "Newest first, up to 300.", holder)
+        card("Addresses", "Click one for everything known about it.", addressList(r.top.bot_ips))),
+      card("Bot requests", "Newest first, up to 300. Click an address for everything known about it.", holder)
     ];
+  }
+
+  /* A ranked list of addresses, each one clickable. */
+  function addressList(rows) {
+    var list = ranked(rows, { limit: 20 });
+    list.querySelectorAll("tbody th .name").forEach(function (n) {
+      var ip = n.textContent;
+      n.replaceChildren(ipCell(ip));
+    });
+    return list;
   }
 
   function visitors() {
@@ -378,7 +535,7 @@
           return row([el("span", { class: "when", text: stamp(s.started) }), span(s.started, s.last),
             td(num(s.pages), "num"), td(num(s.events), "num"),
             td(el("span", { class: s.errors ? "bad" : null, text: num(s.errors) }), "num"),
-            clip(s.path), clip(s.ref), el("span", { class: "mono", text: s.ip || "" }), where(s),
+            clip(s.path), clip(s.ref), ipCell(s.ip), where(s, true),
             clip([s.browser, s.os, s.device].filter(Boolean).join(" · ")), short(s.vid), clip(s.uid),
             s.rec ? replayLink(s.id) : el("span", { class: "empty", text: "no recording" })], s);
         }), "No consented sessions yet."));
@@ -387,8 +544,8 @@
       views.replaceChildren.apply(views, searchable(
         ["Time (UTC)", "Page", "IP", "Where", "Visitor", "Device", "Browser", "User agent", ""],
         items.map(function (v) {
-          return row([el("span", { class: "when", text: stamp(v.at) }), clip(v.path), el("span", { class: "mono", text: v.ip }),
-            where(v), short(v.vid), short(v.fp), clip([v.browser, v.os, v.device].filter(Boolean).join(" · ")),
+          return row([el("span", { class: "when", text: stamp(v.at) }), clip(v.path), ipCell(v.ip),
+            where(v, true), short(v.vid), short(v.fp), clip([v.browser, v.os, v.device].filter(Boolean).join(" · ")),
             clip(v.ua, true), v.sid ? replayLink(v.sid) : ""], v);
         }), "No consented page views yet."));
     }, function (e) { views.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
@@ -408,7 +565,7 @@
           var props = e.props && typeof e.props === "object" ? JSON.stringify(e.props) : String(e.props || "");
           return row([el("span", { class: "when", text: stamp(e.at) }), el("strong", { text: e.name }),
             el("span", { class: "props clip clip--wide", text: props === "{}" ? "" : props, title: props }),
-            clip(e.path), e.source || "", where(e), e.vid ? short(e.vid) : clip(e.uid), e.sid ? replayLink(e.sid) : ""], e);
+            clip(e.path), e.source || "", where(e, true), e.vid ? short(e.vid) : clip(e.uid), e.sid ? replayLink(e.sid) : ""], e);
         }), "No events yet. Send one with cl(\"track\", \"name\", { … })."));
     }, function (e) { holder.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     return [
@@ -578,7 +735,7 @@
         el("h2", { style: "font-size:13px;margin:14px 0 6px", text: "Latest occurrences" }),
         table(["Time (UTC)", "Page", "Browser", "Where", "User agent", ""], d.occurrences.map(function (o) {
           return [el("span", { class: "when", text: stamp(o.at) }), clip(o.path),
-            clip([o.browser, o.os].filter(Boolean).join(" · ")), where(o), clip(o.ua, true),
+            clip([o.browser, o.os].filter(Boolean).join(" · ")), where(o, true), clip(o.ua, true),
             o.sid ? replayLink(o.sid) : ""];
         }), "None kept."));
     }, function (e) { cell.replaceChildren(el("p", { class: "empty bad", text: e.message })); });

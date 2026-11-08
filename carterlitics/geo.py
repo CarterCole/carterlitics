@@ -1,8 +1,9 @@
-"""IP address -> country and network, from MaxMind-format databases (.mmdb).
+"""IP address -> country, place and network, from MaxMind-format databases (.mmdb).
 
 A small reader for the MaxMind DB format in pure Python, so the Lambda needs no
 dependencies. It reads IPinfo Lite (`country_code`, `asn`, `as_name`) and MaxMind's
-GeoLite2 Country, City and ASN files; give it several and their answers are merged.
+GeoLite2 Country, City and ASN files (City adds the city, region and time zone); give it
+several and their answers are merged.
 Files are memory-mapped, so a large database costs page cache, not heap.
 
 Format: https://maxmind.github.io/MaxMind-DB/
@@ -25,10 +26,13 @@ class Geo:
     asn: str = ""       # digits only, "15169"
     network: str = ""   # the AS organisation, "Google LLC"
     city: str = ""
+    region: str = ""    # the first subdivision, "California"
+    tz: str = ""        # IANA time zone, "America/Los_Angeles"
 
     def merge(self, other: "Geo") -> "Geo":
         return Geo(self.country or other.country, self.asn or other.asn,
-                   self.network or other.network, self.city or other.city)
+                   self.network or other.network, self.city or other.city,
+                   self.region or other.region, self.tz or other.tz)
 
 
 class InvalidDatabase(Exception):
@@ -182,10 +186,15 @@ def normalise(record: dict | None) -> Geo:
     asn = record.get("asn") or record.get("autonomous_system_number") or ""
     asn = str(asn).upper().removeprefix("AS")
     network = record.get("as_name") or record.get("autonomous_system_organization") or ""
-    city = ""
+    city = region = tz = ""
     if isinstance(record.get("city"), dict):
         city = (record["city"].get("names") or {}).get("en", "")
-    return Geo(str(country)[:8], asn[:12], str(network)[:120], str(city)[:80])
+    subdivisions = record.get("subdivisions")
+    if isinstance(subdivisions, list) and subdivisions and isinstance(subdivisions[0], dict):
+        region = (subdivisions[0].get("names") or {}).get("en", "") or subdivisions[0].get("iso_code", "")
+    if isinstance(record.get("location"), dict):
+        tz = record["location"].get("time_zone") or ""
+    return Geo(str(country)[:8], asn[:12], str(network)[:120], str(city)[:80], str(region)[:80], str(tz)[:64])
 
 
 class Geolocator:

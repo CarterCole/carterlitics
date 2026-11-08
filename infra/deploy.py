@@ -11,11 +11,16 @@ on each site's CloudFront distribution.
     infra/deploy.py register-client [--force] an OIDC client at the issuer, for the console
     infra/deploy.py server-key SITE           the key SITE's backend sends to /_c/server/events
     infra/deploy.py grant-deploy [--dry-run]  let the CI role and publishing user run `code`
-    infra/deploy.py geo                       fetch IPinfo Lite into geo/ (needs IPINFO_TOKEN)
+    infra/deploy.py geo                       GeoLite2 City + ASN into geo/ (MAXMIND_ACCOUNT_ID and
+                                              MAXMIND_LICENSE_KEY), or IPinfo Lite (IPINFO_TOKEN)
+    infra/deploy.py intel                     published IP ranges -> geo/ranges.bin: crawlers, clouds,
+                                              Private Relay, Tor, VPNs, Starlink, DROP, attackers
 
 Settings are carterlitics.toml's [aws] table and its site list. Every step looks before it
 creates, so re-running is safe. It drives the AWS CLI (no boto3) with whatever credentials
-the environment selects: AWS_PROFILE=carter-admin for everything but `code`.
+the environment selects: AWS_PROFILE=carter-admin for everything but `code`. Run as the
+deploy user or role (which may only ship code), the other commands stop before touching
+anything and say so; a call AWS refuses always stops, naming who made it.
 
 Secrets live in SSM Parameter Store under [aws].params and reach the function as
 environment variables. They go to the CLI in files readable only by you, never on a
@@ -31,12 +36,16 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
+import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tomllib
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -45,12 +54,14 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 PACKAGE = ROOT / "carterlitics"
 GEO_DIR = ROOT / "geo"
+RANGES = GEO_DIR / "ranges.bin"
 STATE = HERE / ".state"
 CONFIG = ROOT / "carterlitics.toml"
 
 sys.path.insert(0, str(ROOT))
 from carterlitics.auth import server_key  # noqa: E402
 from carterlitics.config import Config  # noqa: E402
+from carterlitics.intel import Ranges, build_ranges  # noqa: E402
 
 RAW = tomllib.loads(CONFIG.read_text())
 CFG = Config.from_data(RAW)
@@ -63,6 +74,9 @@ PARAMS = AWS.get("params", "/carterlitics").rstrip("/")
 LOG_GROUP = f"/aws/lambda/{FUNCTION}"
 DEPLOY_ROLE = AWS.get("deploy_role", "")
 DEPLOY_USER = AWS.get("deploy_user", "")
+ADMIN_PROFILE = AWS.get("admin_profile", "carter-admin")
+# How the CLI says a call was refused, as opposed to failed. A refusal is never "not there".
+DENIED = ("AccessDenied", "UnauthorizedOperation", "not authorized to perform", "is not authorized to")
 ORIGIN_REQUEST_POLICY = AWS.get("origin_request_policy", "carterlitics")
 LOG_DAYS = 7          # raw access log files: counted within minutes, kept a week for re-runs
 DIRECT_UPLOAD = 45 * 1024 * 1024
@@ -73,10 +87,14 @@ CACHING_OPTIMIZED = "658327ea-f89d-4fab-a63d-7e88639e58f6"
 
 # What the collector reads off a request. Host is left out on purpose: a Function URL
 # answers only to its own. The CloudFront-* ones are set by CloudFront, not the client.
+# A policy forwards at most 10 headers (an adjustable quota), so the region comes from
+# GeoLite2 City; the collector reads cloudfront-viewer-country-region-name if it's sent.
 FORWARDED_HEADERS = [
     "origin", "user-agent", "sec-gpc", "dnt", "x-carterlitics-key",
     "cloudfront-viewer-address", "cloudfront-viewer-country", "cloudfront-viewer-asn", "cloudfront-viewer-city",
+    "cloudfront-viewer-time-zone",
 ]
+MAX_POLICY_HEADERS = 10
 ORIGIN_ID = "carterlitics"
 # The access log fields the collector reads (no cookies: they never leave CloudFront).
 LOG_FIELDS = ["timestamp(ms)", "c-ip", "cs-method", "x-host-header", "cs-uri-stem", "cs-uri-query", "sc-status",
@@ -91,9 +109,43 @@ def log(step: str, msg: str) -> None:
     print(f"  {step:<9} {msg}", flush=True)
 
 
-def aws(*args: str, check: bool = True, payload: dict | None = None):
-    """Run the CLI and parse its JSON. `payload` goes in via --cli-input-json from a file
-    readable only by us, which is how secrets travel."""
+@functools.cache
+def caller() -> str:
+    """Who the CLI acts as, for messages. Straight to the CLI: never refused, never recursive."""
+    proc = subprocess.run(["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text",
+                           "--region", REGION], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else "credentials the CLI can't identify"
+
+
+def rerun_as_admin() -> str:
+    return f"AWS_PROFILE={ADMIN_PROFILE} infra/deploy.py {' '.join(shlex.quote(a) for a in sys.argv[1:])}"
+
+
+def refused(args, stderr: str) -> Fail:
+    reason = stderr.strip().splitlines()[-1] if stderr.strip() else ""
+    if sys.argv[1:2] == ["code"]:
+        hint = (f"`code` runs as {DEPLOY_USER or 'the deploy user'} or {DEPLOY_ROLE or 'the deploy role'} once "
+                f"`AWS_PROFILE={ADMIN_PROFILE} infra/deploy.py grant-deploy` has allowed it; or: {rerun_as_admin()}")
+    else:
+        hint = f"Commands other than `code` need administrator credentials: {rerun_as_admin()}"
+    return Fail(f"AWS refused `aws {' '.join(args[:2])}`: this shell acts as {caller()}.\n{reason}\n{hint}")
+
+
+def require_admin(command: str) -> None:
+    """Stop before anything happens when the shell holds the deploy user's or role's
+    credentials, which may only ship code."""
+    arn = caller()
+    if (DEPLOY_USER and arn.endswith(f":user/{DEPLOY_USER}")) or \
+            (DEPLOY_ROLE and f":assumed-role/{DEPLOY_ROLE}/" in arn):
+        raise Fail(f"`{command}` needs administrator credentials, but this shell acts as {arn}, which may "
+                   f"only run `code`.\nRun: {rerun_as_admin()}")
+
+
+def aws(*args: str, missing: tuple[str, ...] = (), payload: dict | None = None):
+    """Run the CLI and parse its JSON. A failure whose error names one of the codes in
+    `missing` (ResourceNotFoundException, NoSuchEntity, …) returns None: the thing isn't
+    there. Any other failure raises, a refusal with who was refused. `payload` goes in via
+    --cli-input-json from a file readable only by us, which is how secrets travel."""
     cmd = ["aws", *args, "--region", REGION, "--output", "json"]
     tmp = None
     try:
@@ -107,14 +159,20 @@ def aws(*args: str, check: bool = True, payload: dict | None = None):
         if tmp:
             os.unlink(tmp)
     if proc.returncode != 0:
-        if not check:
+        if any(d in proc.stderr for d in DENIED):
+            raise refused(args, proc.stderr)
+        if any(code in proc.stderr for code in missing):
             return None
         raise Fail(f"aws {' '.join(args[:2])} failed:\n{proc.stderr.strip()}")
     return json.loads(proc.stdout) if proc.stdout.strip() else {}
 
 
 def error_of(*args: str) -> str:
+    """The CLI's error output ("" on success), for callers that expect some failures
+    (not found, already exists). A refusal is never one of those, so it raises."""
     proc = subprocess.run(["aws", *args, "--region", REGION, "--output", "json"], capture_output=True, text=True)
+    if proc.returncode != 0 and any(d in proc.stderr for d in DENIED):
+        raise refused(args, proc.stderr)
     return "" if proc.returncode == 0 else proc.stderr
 
 
@@ -162,11 +220,12 @@ def site_of(name: str):
 
 
 def package() -> bytes:
-    """The collector and its static files, plus any .mmdb in geo/. Byte-identical for
-    identical inputs, so CodeSha256 says whether Lambda already runs it."""
+    """The collector and its static files, plus any .mmdb and the ranges table in geo/.
+    Byte-identical for identical inputs, so CodeSha256 says whether Lambda already runs it."""
     files = sorted(p for p in PACKAGE.rglob("*") if p.is_file() and "__pycache__" not in p.parts
                    and not p.name.startswith("."))
     files += sorted(GEO_DIR.glob("*.mmdb")) if GEO_DIR.exists() else []
+    files += [RANGES] if RANGES.exists() else []
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for path in files:
@@ -231,7 +290,8 @@ def ship_code(dry: bool) -> None:
 
 
 def param(name: str) -> str | None:
-    got = aws("ssm", "get-parameter", "--name", f"{PARAMS}/{name}", "--with-decryption", check=False)
+    got = aws("ssm", "get-parameter", "--name", f"{PARAMS}/{name}", "--with-decryption",
+              missing=("ParameterNotFound",))
     return got["Parameter"]["Value"] if got else None
 
 
@@ -257,7 +317,7 @@ def ensure_secret(name: str, dry: bool) -> str:
 
 
 def ensure_table(dry: bool) -> str:
-    got = aws("dynamodb", "describe-table", "--table-name", TABLE, check=False)
+    got = aws("dynamodb", "describe-table", "--table-name", TABLE, missing=("ResourceNotFoundException",))
     if got:
         log("table", f"{TABLE} exists")
         arn = got["Table"]["TableArn"]
@@ -287,7 +347,9 @@ def ensure_bucket(name: str, acct: str, lifecycle: list[dict], extra_policy: lis
     if not err:
         log("bucket", f"s3://{name} exists")
     elif "403" in err or "Forbidden" in err:
-        raise Fail(f"s3://{name} belongs to another account; pick another name in carterlitics.toml")
+        # HeadBucket's 403 says nothing more: another account's bucket, or one we may not read.
+        raise Fail(f"s3://{name} answers 403 to {caller()}: either another account owns it (pick another "
+                   f"name in carterlitics.toml) or these credentials may not read it ({rerun_as_admin()})")
     elif dry:
         log("bucket", f"would create s3://{name} (private, SSE-S3, TLS only)")
         return f"arn:aws:s3:::{name}"
@@ -337,7 +399,7 @@ def ensure_logs(dry: bool) -> None:
 
 
 def ensure_role(table_arn: str, bucket_arn: str, logs_arn: str, acct: str, dry: bool) -> str:
-    got = aws("iam", "get-role", "--role-name", ROLE, check=False)
+    got = aws("iam", "get-role", "--role-name", ROLE, missing=("NoSuchEntity",))
     if got:
         log("role", f"{ROLE} exists")
         arn = got["Role"]["Arn"]
@@ -352,7 +414,8 @@ def ensure_role(table_arn: str, bucket_arn: str, logs_arn: str, acct: str, dry: 
         log("role", f"created {ROLE}")
     policy = {"Version": "2012-10-17", "Statement": [
         {"Effect": "Allow", "Action": ["dynamodb:UpdateItem", "dynamodb:PutItem", "dynamodb:GetItem",
-                                       "dynamodb:Query", "dynamodb:BatchWriteItem"], "Resource": table_arn},
+                                       "dynamodb:Query", "dynamodb:BatchWriteItem", "dynamodb:BatchGetItem"],
+         "Resource": table_arn},
         {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"], "Resource": f"{bucket_arn}/rec/*"},
         {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": bucket_arn,
          "Condition": {"StringLike": {"s3:prefix": "rec/*"}}},
@@ -377,6 +440,7 @@ def environment(dry: bool) -> dict:
         "BUCKET": bucket(),
         "GEO_MMDB": ",".join(f"/var/task/geo/{p.name}" for p in sorted(GEO_DIR.glob("*.mmdb")))
         if GEO_DIR.exists() else "",
+        "INTEL_RANGES": f"/var/task/geo/{RANGES.name}" if RANGES.exists() else "",
         "ORIGIN_SECRET": ensure_secret("origin-secret", dry),
         "SESSION_SECRET": ensure_secret("session-secret", dry),
         "SERVER_SECRET": ensure_secret("server-secret", dry),
@@ -398,7 +462,10 @@ def ensure_function(role_arn: str, env: dict, dry: bool) -> str:
         "Description": f"carterlitics: first-party analytics for {len(CFG.sites)} sites (console on {CFG.console})"[:256],
         "LoggingConfig": {"LogFormat": "Text", "LogGroup": LOG_GROUP},
     }
-    exists = not error_of("lambda", "get-function-configuration", "--function-name", FUNCTION)
+    err = error_of("lambda", "get-function-configuration", "--function-name", FUNCTION)
+    if err and "ResourceNotFoundException" not in err:
+        raise Fail(f"cannot read {FUNCTION}:\n{err.strip()}")
+    exists = not err
     if dry:
         log("function", f"would {'update' if exists else 'create'} {FUNCTION} (python3.13, arm64)")
         return f"arn:aws:lambda:{REGION}:000000000000:function:{FUNCTION}"
@@ -415,7 +482,8 @@ def ensure_function(role_arn: str, env: dict, dry: bool) -> str:
                   else {"S3Bucket": code[1], "S3Key": code[3]}}
         # A role made a moment ago takes a few seconds before Lambda may assume it.
         for attempt in range(12):
-            if aws("lambda", "create-function", payload=create, check=attempt == 11) is not None:
+            wait = ("cannot be assumed by Lambda",) if attempt < 11 else ()
+            if aws("lambda", "create-function", payload=create, missing=wait) is not None:
                 break
             time.sleep(5)
         wait_updated()
@@ -424,7 +492,8 @@ def ensure_function(role_arn: str, env: dict, dry: bool) -> str:
 
 
 def ensure_url(dry: bool) -> str:
-    got = aws("lambda", "get-function-url-config", "--function-name", FUNCTION, check=False)
+    got = aws("lambda", "get-function-url-config", "--function-name", FUNCTION,
+              missing=("ResourceNotFoundException",))
     if got:
         log("url", got["FunctionUrl"])
         url = got["FunctionUrl"]
@@ -498,6 +567,9 @@ def canonical(policy: dict) -> str:
 
 
 def ensure_origin_request_policy(dry: bool) -> str:
+    if len(FORWARDED_HEADERS) > MAX_POLICY_HEADERS:
+        raise Fail(f"{len(FORWARDED_HEADERS)} forwarded headers; an origin request policy takes "
+                   f"{MAX_POLICY_HEADERS} unless the quota is raised")
     listing = aws("cloudfront", "list-origin-request-policies", "--type", "custom")["OriginRequestPolicyList"]
     config = {
         "Name": ORIGIN_REQUEST_POLICY,
@@ -510,13 +582,20 @@ def ensure_origin_request_policy(dry: bool) -> str:
     for item in listing.get("Items", []):
         policy = item["OriginRequestPolicy"]
         if policy["OriginRequestPolicyConfig"]["Name"] == ORIGIN_REQUEST_POLICY:
-            if canonical(policy["OriginRequestPolicyConfig"]) != canonical(config) and not dry:
+            live = policy["OriginRequestPolicyConfig"]
+            if canonical(live) == canonical(config):
+                log("policy", f"origin request policy {policy['Id']}")
+                return policy["Id"]
+            had = {h.lower() for h in live.get("HeadersConfig", {}).get("Headers", {}).get("Items") or []}
+            change = ", ".join([f"+{h}" for h in FORWARDED_HEADERS if h not in had] +
+                               [f"-{h}" for h in sorted(had - set(FORWARDED_HEADERS))]) or "settings"
+            if dry:
+                log("policy", f"would update origin request policy {policy['Id']} ({change})")
+            else:
                 etag = aws("cloudfront", "get-origin-request-policy", "--id", policy["Id"])["ETag"]
                 aws("cloudfront", "update-origin-request-policy", "--id", policy["Id"], "--if-match", etag,
                     "--origin-request-policy-config", json.dumps(config))
-                log("policy", f"updated origin request policy {policy['Id']}")
-            else:
-                log("policy", f"origin request policy {policy['Id']}")
+                log("policy", f"updated origin request policy {policy['Id']} ({change})")
             return policy["Id"]
     if dry:
         log("policy", f"would create origin request policy {ORIGIN_REQUEST_POLICY}")
@@ -559,7 +638,13 @@ def routed(config: dict, site, api_host: str, secret: str, policy_id: str, drop:
         "ConnectionAttempts": 3, "ConnectionTimeout": 10,
         "OriginShield": {"Enabled": False}, "OriginAccessControlId": "",
     }
-    origins = [o for o in new["Origins"].get("Items", []) if o["Id"] != ORIGIN_ID] + [origin]
+    live_origins = new["Origins"].get("Items", [])
+    origin = keep_live(live_origins, "Id", origin)
+    # Where it already is (a site's own deploy may put it anywhere), else last.
+    if any(o["Id"] == ORIGIN_ID for o in live_origins):
+        origins = [origin if o["Id"] == ORIGIN_ID else o for o in live_origins]
+    else:
+        origins = live_origins + [origin]
     new["Origins"] = {"Quantity": len(origins), "Items": origins}
     mount = CFG.mount
     read = ["GET", "HEAD"]
@@ -571,12 +656,35 @@ def routed(config: dict, site, api_host: str, secret: str, policy_id: str, drop:
         # Beacons, the console and its API: never cached, with the headers the collector reads.
         behavior(f"{mount}/*", CACHING_DISABLED, policy_id, every),
     ]
+    live_behaviors = new.get("CacheBehaviors", {}).get("Items", [])
+    ours = [keep_live(live_behaviors, "PathPattern", b) for b in ours]
     paths = {b["PathPattern"] for b in ours}
-    rest = [b for b in new.get("CacheBehaviors", {}).get("Items", [])
-            if b["PathPattern"] not in paths and b["PathPattern"] not in drop]
+    rest = [b for b in live_behaviors if b["PathPattern"] not in paths and b["PathPattern"] not in drop]
     behaviors = ours + rest
     new["CacheBehaviors"] = {"Quantity": len(behaviors), "Items": behaviors}
     return new
+
+
+def normal(x):
+    """A config fragment as CloudFront means it: lists of names (methods, protocols) in any
+    order, custom headers in any order, and gRPC off whether or not it says so."""
+    if isinstance(x, dict):
+        return {k: normal(v) for k, v in x.items() if not (k == "GrpcConfig" and v == {"Enabled": False})}
+    if isinstance(x, list):
+        items = [normal(v) for v in x]
+        if all(isinstance(v, str) for v in items):
+            return sorted(items)
+        if all(isinstance(v, dict) and "HeaderName" in v for v in items):
+            return sorted(items, key=lambda v: v["HeaderName"])
+        return items
+    return x
+
+
+def keep_live(live: list[dict], key: str, wanted: dict) -> dict:
+    """`wanted`, or the live item with the same key when the two mean the same thing, so a
+    re-run that changes nothing shows no diff and leaves the distribution alone."""
+    twin = next((item for item in live if item.get(key) == wanted[key]), None)
+    return twin if twin is not None and normal(twin) == normal(wanted) else wanted
 
 
 def show_diff(before: dict, after: dict) -> bool:
@@ -599,13 +707,34 @@ def targets(name: str, clients_only: bool = False) -> list:
 
 
 def routes(name: str, dry: bool, rollback: bool, drop: list[str]) -> None:
-    for site in targets(name, clients_only=True):
+    sites = targets(name, clients_only=True)
+    # The policy first: updating it changes every distribution that uses it (and their
+    # ETags), so a distribution read before it could no longer be written.
+    policy_id = None if rollback else ensure_origin_request_policy(dry)
+    for site in sites:
         for dist in distributions(site):
             log("cdn", f"{site.id}: distribution {dist}")
-            route_one(site, dist, dry, rollback, drop)
+            route_one(site, dist, dry, rollback, drop, policy_id)
 
 
-def route_one(site, dist: str, dry: bool, rollback: bool, drop: list[str]) -> None:
+def update_distribution(dist: str, etag: str, live: dict, new: dict) -> None:
+    """update-distribution, with the config (it holds the origin secret) in a private file.
+    If CloudFront moved the ETag on without changing the config, as a policy update can a
+    moment later, once more with the new one; if the config itself changed, stop."""
+    for attempt in range(2):
+        # PreconditionFailed comes back as None: the ETag is stale.
+        done = aws("cloudfront", "update-distribution", payload={"Id": dist, "IfMatch": etag,
+                                                                 "DistributionConfig": new},
+                   missing=("PreconditionFailed",) if not attempt else ())
+        if done is not None:
+            return
+        got = aws("cloudfront", "get-distribution-config", "--id", dist)
+        if got["DistributionConfig"] != live:
+            raise Fail(f"{dist} changed while this ran; run it again to see the new diff")
+        etag = got["ETag"]
+
+
+def route_one(site, dist: str, dry: bool, rollback: bool, drop: list[str], policy_id: str | None) -> None:
     got = aws("cloudfront", "get-distribution-config", "--id", dist)
     etag, live = got["ETag"], got["DistributionConfig"]
     backup = STATE / f"{dist}-before-carterlitics.json"
@@ -617,8 +746,7 @@ def route_one(site, dist: str, dry: bool, rollback: bool, drop: list[str]) -> No
         changed = show_diff(live, before)
         if dry or not changed:
             return
-        aws("cloudfront", "update-distribution", "--id", dist, "--if-match", etag,
-            "--distribution-config", json.dumps(before))
+        update_distribution(dist, etag, live, before)
         log("cdn", f"{dist} restored from {backup.name}; deploying (a few minutes)")
         return
 
@@ -627,7 +755,6 @@ def route_one(site, dist: str, dry: bool, rollback: bool, drop: list[str]) -> No
     secret = param("origin-secret")
     if not secret:
         raise Fail("no origin secret: run `infra/deploy.py provision` first")
-    policy_id = ensure_origin_request_policy(dry)
     new = routed(live, site, api_host, secret, policy_id, drop)
     if not show_diff(live, new) or dry:
         return
@@ -636,8 +763,7 @@ def route_one(site, dist: str, dry: bool, rollback: bool, drop: list[str]) -> No
         STATE.mkdir(exist_ok=True)
         backup.write_text(json.dumps(live, indent=2))
         os.chmod(backup, 0o600)
-    aws("cloudfront", "update-distribution", "--id", dist, "--if-match", etag,
-        "--distribution-config", json.dumps(new))
+    update_distribution(dist, etag, live, new)
     log("cdn", f"{dist} now routes {CFG.mount}/* to {FUNCTION}; deploying (a few minutes)")
     log("cdn", f"roll back with: infra/deploy.py routes {site.id} --rollback")
 
@@ -733,16 +859,221 @@ def grant_deploy(acct: str, dry: bool) -> None:
     log("deploy", f"{', '.join(n for _, n in who)} may update {FUNCTION}'s code, nothing else")
 
 
+MAXMIND = "https://download.maxmind.com/geoip/databases/{}/download?suffix=tar.gz"
+
+
 def fetch_geo() -> None:
+    """GeoLite2 City and ASN from MaxMind (free account), else IPinfo Lite."""
+    account, key = os.environ.get("MAXMIND_ACCOUNT_ID"), os.environ.get("MAXMIND_LICENSE_KEY")
     token = os.environ.get("IPINFO_TOKEN")
-    if not token:
-        raise Fail("set IPINFO_TOKEN (free at ipinfo.io), or put any .mmdb file in geo/ yourself")
+    if not (account and key) and not token:
+        raise Fail("set MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY (free at maxmind.com), or IPINFO_TOKEN "
+                   "(free at ipinfo.io), or put any .mmdb file in geo/ yourself")
     GEO_DIR.mkdir(exist_ok=True)
-    target = GEO_DIR / "ipinfo_lite.mmdb"
-    with urllib.request.urlopen(f"https://ipinfo.io/data/ipinfo_lite.mmdb?token={token}", timeout=120) as res:
-        target.write_bytes(res.read())
-    log("geo", f"{target.relative_to(ROOT)}: {target.stat().st_size // (1024 * 1024)} MB; "
-        "`provision` points the function at it, `code` ships it")
+    if account and key:
+        auth = base64.b64encode(f"{account}:{key}".encode()).decode()
+        for edition in ("GeoLite2-City", "GeoLite2-ASN"):
+            req = urllib.request.Request(MAXMIND.format(edition), headers={"Authorization": f"Basic {auth}"})
+            try:
+                with urllib.request.urlopen(req, timeout=300) as res:
+                    archive = res.read()
+            except urllib.error.HTTPError as e:
+                raise Fail(f"MaxMind {edition}: HTTP {e.code} (check the account id and license key)") from None
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+                member = next((m for m in tar.getmembers() if m.isfile() and m.name.endswith(f"/{edition}.mmdb")), None)
+                if member is None:
+                    raise Fail(f"MaxMind {edition}: no .mmdb in the archive")
+                target = GEO_DIR / f"{edition}.mmdb"
+                target.write_bytes(tar.extractfile(member).read())
+            log("geo", f"{target.relative_to(ROOT)}: {target.stat().st_size // (1024 * 1024)} MB")
+        if (GEO_DIR / "GeoLite2-Country.mmdb").exists():
+            log("geo", "geo/GeoLite2-Country.mmdb is now redundant (City has countries); delete it to "
+                "shrink the package")
+    else:
+        target = GEO_DIR / "ipinfo_lite.mmdb"
+        with urllib.request.urlopen(f"https://ipinfo.io/data/ipinfo_lite.mmdb?token={token}", timeout=120) as res:
+            target.write_bytes(res.read())
+        log("geo", f"{target.relative_to(ROOT)}: {target.stat().st_size // (1024 * 1024)} MB")
+    log("geo", "`provision` points the function at it, `code` ships it")
+
+
+# ---------------------------------------------------------------- published ranges
+
+FETCH_AGENT = "carterlitics-deploy (+https://cartercole.net)"
+GOOGLE_RANGES = "https://developers.google.com/static/crawling/ipranges/"
+
+
+def _prefixes(body: bytes) -> list[str]:
+    """The {"prefixes": [{"ipv4Prefix" | "ipv6Prefix": …}]} shape Google, Bing, OpenAI,
+    Perplexity, Apple, DuckDuckGo and Common Crawl all publish."""
+    return [p.get("ipv4Prefix") or p.get("ipv6Prefix") for p in json.loads(body).get("prefixes", [])
+            if isinstance(p, dict) and (p.get("ipv4Prefix") or p.get("ipv6Prefix"))]
+
+
+def _lines(body: bytes) -> list[str]:
+    """One range per line (the first field, split on space, tab or comma); # comments."""
+    out = []
+    for line in body.decode("utf-8", "replace").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(re.split(r"[\s,;]+", line)[0])
+    return out
+
+
+def tagged(tag: str, parse):
+    return lambda body: [(tag, r) for r in parse(body)]
+
+
+def _aws(body: bytes):
+    data = json.loads(body)
+    for p in data.get("prefixes", []) + data.get("ipv6_prefixes", []):
+        cidr = p.get("ip_prefix") or p.get("ipv6_prefix")
+        yield "cloud:AWS", cidr
+        if p.get("service") == "EC2":
+            yield f"cloud:AWS EC2 {p.get('region')}", cidr
+        elif p.get("service") == "CLOUDFRONT":
+            yield "cloud:AWS CloudFront", cidr
+
+
+def _gcp(body: bytes):
+    for p in json.loads(body).get("prefixes", []):
+        yield f"cloud:Google Cloud {p.get('scope', '')}".strip(), p.get("ipv4Prefix") or p.get("ipv6Prefix")
+
+
+def _azure(page: bytes):
+    """The download page names this week's JSON file; fetch that."""
+    found = re.search(rb"https://download\.microsoft\.com/download/[^\"']+?ServiceTags_Public_\d+\.json", page)
+    if not found:
+        raise ValueError("no ServiceTags link on the download page")
+    for v in json.loads(fetch(found.group(0).decode())).get("values", []):
+        name = v.get("name", "")
+        if name.startswith("AzureCloud."):
+            for cidr in v.get("properties", {}).get("addressPrefixes", []):
+                yield f"cloud:Azure {name.split('.', 1)[1]}", cidr
+
+
+def _oracle(body: bytes):
+    for region in json.loads(body).get("regions", []):
+        for c in region.get("cidrs", []):
+            yield f"cloud:Oracle Cloud {region.get('region', '')}".strip(), c.get("cidr")
+
+
+def _mullvad(body: bytes):
+    for relay in json.loads(body):
+        if relay.get("type") in ("wireguard", "openvpn"):
+            for k in ("ipv4_addr_in", "ipv6_addr_in"):
+                if relay.get(k):
+                    yield "vpn:Mullvad", relay[k]
+
+
+def _dshield(body: bytes):
+    for line in body.decode("utf-8", "replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and not line.startswith("#") and parts[2].strip().isdigit():
+            yield "abuse:DShield", f"{parts[0].strip()}/{parts[2].strip()}"
+
+
+def _json_lines(tag: str, key: str):
+    def parse(body: bytes):
+        for line in body.decode("utf-8", "replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get(key):
+                yield tag, row[key]
+    return parse
+
+
+# (what, URL, parser -> (tag, range) pairs). Tags are `<kind>:<name>`; carterlitics/intel.py
+# says what each kind means, and its PROOFS name the crawler lists it checks.
+INTEL_SOURCES = [
+    ("Googlebot", GOOGLE_RANGES + "common-crawlers.json", tagged("crawler:Googlebot", _prefixes)),
+    ("Google special crawlers", GOOGLE_RANGES + "special-crawlers.json",
+     tagged("crawler:Google special crawlers", _prefixes)),
+    ("Google fetchers", GOOGLE_RANGES + "user-triggered-fetchers.json", tagged("crawler:Google fetchers", _prefixes)),
+    ("Google fetchers (Google)", GOOGLE_RANGES + "user-triggered-fetchers-google.json",
+     tagged("crawler:Google fetchers", _prefixes)),
+    ("Bingbot", "https://www.bing.com/toolbox/bingbot.json", tagged("crawler:Bingbot", _prefixes)),
+    ("GPTBot", "https://openai.com/gptbot.json", tagged("crawler:GPTBot", _prefixes)),
+    ("OAI-SearchBot", "https://openai.com/searchbot.json", tagged("crawler:OAI-SearchBot", _prefixes)),
+    ("ChatGPT-User", "https://openai.com/chatgpt-user.json", tagged("crawler:ChatGPT-User", _prefixes)),
+    ("PerplexityBot", "https://www.perplexity.com/perplexitybot.json", tagged("crawler:PerplexityBot", _prefixes)),
+    ("Perplexity-User", "https://www.perplexity.com/perplexity-user.json", tagged("crawler:Perplexity-User", _prefixes)),
+    ("Applebot", "https://search.developer.apple.com/applebot.json", tagged("crawler:Applebot", _prefixes)),
+    ("DuckDuckBot", "https://duckduckgo.com/duckduckbot.json", tagged("crawler:DuckDuckBot", _prefixes)),
+    ("DuckAssistBot", "https://duckduckgo.com/duckassistbot.json", tagged("crawler:DuckAssistBot", _prefixes)),
+    ("CCBot", "https://index.commoncrawl.org/ccbot.json", tagged("crawler:CCBot", _prefixes)),
+    ("UptimeRobot", "https://uptimerobot.com/inc/files/ips/IPv4andIPv6.txt", tagged("crawler:UptimeRobot", _lines)),
+    ("Pingdom", "https://my.pingdom.com/probes/ipv4", tagged("crawler:Pingdom", _lines)),
+    ("AWS", "https://ip-ranges.amazonaws.com/ip-ranges.json", _aws),
+    ("Google Cloud", "https://www.gstatic.com/ipranges/cloud.json", _gcp),
+    ("Azure", "https://www.microsoft.com/en-us/download/details.aspx?id=56519", _azure),
+    ("Oracle Cloud", "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json", _oracle),
+    ("Cloudflare v4", "https://www.cloudflare.com/ips-v4", tagged("cloud:Cloudflare", _lines)),
+    ("Cloudflare v6", "https://www.cloudflare.com/ips-v6", tagged("cloud:Cloudflare", _lines)),
+    ("Fastly", "https://api.fastly.com/public-ip-list",
+     lambda b: [("cloud:Fastly", c) for k in ("addresses", "ipv6_addresses") for c in json.loads(b).get(k, [])]),
+    ("DigitalOcean", "https://digitalocean.com/geo/google.csv", tagged("cloud:DigitalOcean", _lines)),
+    ("Linode", "https://geoip.linode.com/", tagged("cloud:Linode", _lines)),
+    ("Vultr", "https://geofeed.constant.com/?json",
+     lambda b: [("cloud:Vultr", s["ip_prefix"]) for s in json.loads(b).get("subnets", []) if s.get("ip_prefix")]),
+    ("GitHub Actions", "https://api.github.com/meta",
+     lambda b: [("cloud:GitHub Actions", c) for c in json.loads(b).get("actions", [])]),
+    ("Datacenters (X4BNet)", "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt",
+     tagged("hosting:datacenter", _lines)),
+    ("VPN providers (X4BNet)", "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt",
+     tagged("vpn:VPN provider", _lines)),
+    ("Mullvad", "https://api.mullvad.net/www/relays/all/", _mullvad),
+    ("Tor exits", "https://check.torproject.org/torbulkexitlist", tagged("tor:Tor exit", _lines)),
+    ("iCloud Private Relay", "https://mask-api.icloud.com/egress-ip-ranges.csv",
+     tagged("relay:iCloud Private Relay", _lines)),
+    ("Starlink", "https://geoip.starlinkisp.net/feed.csv", tagged("isp:Starlink", _lines)),
+    ("Spamhaus DROP v4", "https://www.spamhaus.org/drop/drop_v4.json", _json_lines("drop:Spamhaus DROP", "cidr")),
+    ("Spamhaus DROP v6", "https://www.spamhaus.org/drop/drop_v6.json", _json_lines("drop:Spamhaus DROP", "cidr")),
+    ("blocklist.de", "https://lists.blocklist.de/lists/all.txt", tagged("abuse:blocklist.de", _lines)),
+    ("DShield", "https://feeds.dshield.org/block.txt", _dshield),
+]
+
+
+def fetch(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": FETCH_AGENT, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=120) as res:
+        return res.read()
+
+
+def fetch_intel() -> None:
+    """Every list in INTEL_SOURCES, into one table. A list that fails is left out (and
+    said so); the table records what it was built from."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(source):
+        what, url, parse = source
+        try:
+            return what, list(parse(fetch(url))), ""
+        except Exception as e:  # noqa: BLE001 - one list down shouldn't stop the rest
+            return what, [], f"{type(e).__name__}: {str(e)[:160]}"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, INTEL_SOURCES))
+    entries, notes = [], {}
+    for what, pairs, error in results:
+        pairs = [(t, r) for t, r in pairs if t and r]
+        entries += pairs
+        notes[what] = error or len(pairs)
+        log("intel", f"{what:<26} {error or f'{len(pairs):,} ranges'}")
+    if not entries:
+        raise Fail("no list could be fetched")
+    built = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    blob = build_ranges(entries, built, notes)
+    GEO_DIR.mkdir(exist_ok=True)
+    RANGES.write_bytes(blob)
+    table = Ranges(blob)
+    log("intel", f"{RANGES.relative_to(ROOT)}: {len(blob) / 1e6:.1f} MB, {table.n4:,} IPv4 and {table.n6:,} IPv6 "
+        f"pieces, {len(table.combos):,} tag sets. `provision` points the function at it, `code` ships it")
+    failed = [w for w, n in notes.items() if isinstance(n, str)]
+    if failed:
+        log("intel", f"left out: {', '.join(failed)}")
 
 
 # ---------------------------------------------------------------- main
@@ -751,7 +1082,7 @@ def fetch_geo() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["code", "provision", "routes", "logging", "register-client",
-                                        "server-key", "grant-deploy", "geo"])
+                                        "server-key", "grant-deploy", "geo", "intel"])
     ap.add_argument("site", nargs="?", help="routes, logging: a site id from carterlitics.toml, or all; server-key: a site")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rollback", action="store_true", help="routes: restore the config from before")
@@ -761,6 +1092,8 @@ def main() -> int:
     try:
         if args.command in ("routes", "logging", "server-key") and not args.site:
             raise Fail(f"{args.command} needs a site: {', '.join(CFG.sites)}")
+        if args.command not in ("code", "geo", "intel"):
+            require_admin(args.command)
         if args.command == "code":
             ship_code(args.dry_run)
         elif args.command == "provision":
@@ -775,6 +1108,8 @@ def main() -> int:
             grant_deploy(account(), args.dry_run)
         elif args.command == "geo":
             fetch_geo()
+        elif args.command == "intel":
+            fetch_intel()
         else:
             register_client(args.force)
     except Fail as e:

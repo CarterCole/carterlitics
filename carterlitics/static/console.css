@@ -199,6 +199,28 @@ details.table-view summary { color: var(--muted); font-size: 12.5px; cursor: poi
   background: var(--bots); vertical-align: 0;
 }
 .pill--person::before { background: var(--people); }
+.pill--good { color: var(--good); border-color: currentColor; }
+.pill--bad { color: var(--critical); border-color: currentColor; }
+.flags { display: inline-flex; flex-wrap: wrap; gap: 4px; vertical-align: bottom; }
+.where { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 1px; max-width: 34ch; }
+.where .clip { max-width: 100%; }
+.where .host { color: var(--muted); font: 11.5px var(--mono); }
+.where .flags { margin-top: 2px; }
+button.ip {
+  font: 12.5px var(--mono); color: var(--link); background: none; border: 0; padding: 0; cursor: pointer;
+  text-decoration: underline dotted; text-underline-offset: 3px; white-space: nowrap;
+}
+button.ip:hover { text-decoration-style: solid; }
+dialog.ip-panel {
+  width: min(720px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; padding: 16px 18px 20px;
+  background: var(--surface); color: var(--ink); border: 1px solid var(--ring); border-radius: 12px;
+  box-shadow: 0 16px 48px -16px rgba(0, 0, 0, 0.45);
+}
+dialog.ip-panel::backdrop { background: rgba(0, 0, 0, 0.35); }
+.ip-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.ip-head h2 { margin: 0; font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+.ip-panel .kv { margin-bottom: 16px; }
+.ip-seen { font-size: 13px; font-weight: 600; margin: 4px 0 6px; }
 .bad { color: var(--critical); }
 .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
 .toolbar input[type="search"] {

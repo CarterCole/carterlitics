@@ -126,8 +126,15 @@
     }).then(function () {}, function () {});
   }
 
+  // The browser's time zone: when it keeps a different time from the address's, the
+  // visitor is travelling or behind a VPN. Counted, and kept only with consent.
+  var ZONE = (function () {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) { return ""; }
+  })();
+
   function envelope(items) {
     var e = { v: 1, w: w.innerWidth, items: items };
+    if (ZONE) e.tz = ZONE;
     if (nav.webdriver) e.wd = true;
     if (ident) {
       e.vid = ident.vid;

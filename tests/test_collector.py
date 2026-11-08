@@ -9,24 +9,26 @@ import gzip
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from carterlitics import auth, classify, logs  # noqa: E402
+from carterlitics import auth, classify, intel, logs  # noqa: E402
 from carterlitics import store as store_module  # noqa: E402
 from carterlitics.app import App, lambda_handler  # noqa: E402
 from carterlitics.backends import MemoryBlobs, MemoryTable  # noqa: E402
 from carterlitics.config import Config, Step  # noqa: E402
 from carterlitics.geo import Geolocator  # noqa: E402
-from carterlitics.store import Store, group_id, redact_query, top_frame, truncate_ip  # noqa: E402
+from carterlitics.intel import Intel, Intelligence, Ranges, build_ranges, verify  # noqa: E402
+from carterlitics.store import LogLine, Store, group_id, redact_query, top_frame, truncate_ip  # noqa: E402
 from carterlitics.web import Request, from_lambda  # noqa: E402
 
 SAFARI = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -46,10 +48,33 @@ DATA = {
 }
 
 
-def make(**overrides) -> App:
+# What the published lists and reverse DNS say about the tests' addresses.
+RANGES = [("crawler:Googlebot", "66.249.64.0/19"), ("relay:iCloud Private Relay", "172.224.0.0/12"),
+          ("cloud:AWS", "52.0.0.0/11"), ("cloud:AWS EC2 us-east-1", "52.4.0.0/14"),
+          ("drop:Spamhaus DROP", "1.10.16.0/20"), ("abuse:blocklist.de", "203.0.113.0/24"),
+          ("tor:Tor exit", "2001:db8:7::/48")]
+NAMES = {"66.249.66.1": "crawl-66-249-66-1.googlebot.com", "52.4.1.1": "ec2-52-4-1-1.compute-1.amazonaws.com",
+         "198.51.100.7": "c-198-51-100-7.hsd1.il.comcast.net", "198.51.100.8": "host8.b.example",
+         "8.8.8.8": "dns.google", "52.4.9.9": "crawl-52-4-9-9.googlebot.com"}
+
+
+def fake_intel(table=None, calls=None) -> Intelligence:
+    calls = calls if calls is not None else []
+
+    def reverse(ip, timeout):
+        calls.append(ip)
+        return NAMES.get(ip, "")
+
+    # 52.4.9.9 (on AWS) named itself like Googlebot: the name doesn't resolve back.
+    return Intelligence(Ranges(build_ranges(RANGES, "test")), table, dns=True, reverse=reverse,
+                        forward=lambda host, ip, timeout: NAMES.get(ip) == host and ip != "52.4.9.9")
+
+
+def make(with_intel: bool = False, **overrides) -> App:
     cfg = Config.from_data(DATA, session_secret=SECRET, origin_secret="origin", server_secret="server",
                            client_id="client", client_secret="shh", **overrides)
-    return App(cfg, Store(cfg, MemoryTable(), MemoryBlobs()))
+    table = MemoryTable()
+    return App(cfg, Store(cfg, table, MemoryBlobs(), intel=fake_intel(table) if with_intel else None))
 
 
 def body(res):
@@ -328,6 +353,209 @@ class ServerLogs(unittest.TestCase):
                               "s3": {"bucket": {"name": "logs"}, "object": {"key": "logs/a.example/x.gz"}}}]}
         got = self.app.ingest_s3(event, lambda bucket, key: data)
         self.assertEqual(got, {"files": 1, "lines": 6, "stored": 4})
+
+
+def dns_answer(tid: int, qname: str, qtype: int, records, flags: int = 0x8180) -> bytes:
+    out = struct.pack(">HHHHHH", tid, flags, 1, len(records), 0, 0) + intel._encode(qname) + struct.pack(">HH", qtype, 1)
+    for rtype, rdata in records:
+        out += b"\xc0\x0c" + struct.pack(">HHIH", rtype, 1, 300, len(rdata)) + rdata
+    return out
+
+
+class AddressIntel(unittest.TestCase):
+    def test_dns_answers(self):
+        name = intel._encode("crawl-66-249-66-1.googlebot.com")
+        rcode, got = intel.parse(dns_answer(7, "1.66.249.66.in-addr.arpa", intel.PTR, [(intel.PTR, name)]))
+        self.assertEqual((rcode, got), (0, [(intel.PTR, "crawl-66-249-66-1.googlebot.com")]))
+        # A CNAME whose target is compressed against the question, then the address.
+        rcode, got = intel.parse(dns_answer(8, "host.example.com", intel.A, [
+            (intel.CNAME, b"\x03www\xc0\x0c"), (intel.A, bytes([192, 0, 2, 1])),
+            (intel.AAAA, bytes(15) + b"\x01")]))
+        self.assertEqual(got, [(intel.CNAME, "www.host.example.com"), (intel.A, "192.0.2.1"), (intel.AAAA, "::1")])
+        self.assertEqual(intel.parse(dns_answer(9, "x.example", intel.PTR, [], flags=0x8183))[0], intel.NXDOMAIN)
+        for bad in (b"short", dns_answer(1, "x.example", intel.A, [], flags=0x8380),   # truncated
+                    dns_answer(1, "x.example", intel.A, [], flags=0x0100),             # a question
+                    struct.pack(">HHHHHH", 1, 0x8180, 0, 1, 0, 0) + b"\xc0\x0c"):       # a pointer to itself
+            with self.assertRaises(intel.DNSError):
+                intel.parse(bad)
+
+    def test_ranges(self):
+        table = Ranges(build_ranges([("cloud:A", "10.0.0.0/8"), ("vpn:B", "10.1.0.0/16"), ("vpn:B", "10.1.255.0/24"),
+                                     ("tor:T", "2001:db8::/32"), ("tor:T", "192.0.2.7"),
+                                     ("hosting:H", "198.51.100.10-198.51.100.20"), ("x:bad", "not a range")], "t"))
+        self.assertEqual(table.tags("10.1.2.3"), ("cloud:A", "vpn:B"))
+        self.assertEqual(table.tags("10.2.0.1"), ("cloud:A",))
+        self.assertEqual(table.tags("10.0.0.0"), ("cloud:A",))
+        self.assertEqual(table.tags("10.255.255.255"), ("cloud:A",))
+        self.assertEqual(table.tags("11.0.0.0"), ())
+        self.assertEqual(table.tags("9.255.255.255"), ())
+        self.assertEqual(table.tags("::ffff:192.0.2.7"), ("tor:T",))
+        self.assertEqual(table.tags("192.0.2.8"), ())
+        self.assertEqual(table.tags("2001:db8:1::1"), ("tor:T",))
+        self.assertEqual(table.tags("2001:db9::1"), ())
+        self.assertEqual(table.tags("198.51.100.15"), ("hosting:H",))
+        self.assertEqual(table.tags("nonsense"), ())
+        # Overlaps are split: 10/8, then 10.1/16 with both, then the rest of 10/8.
+        self.assertEqual(table.n4, 5)
+        with self.assertRaises(ValueError):
+            Ranges(b"CLRANGES" + struct.pack(">I", 2) + b"{}")
+
+    def test_kinds_and_names(self):
+        self.assertEqual(Intel(tags=("cloud:AWS", "relay:iCloud Private Relay")).net("Akamai"), "relay")
+        self.assertEqual(Intel(tags=("cloud:AWS", "cloud:AWS EC2 us-east-1")).service(), "AWS EC2 us-east-1")
+        self.assertEqual(Intel().net("Hetzner Online GmbH"), "hosting")
+        self.assertEqual(Intel().net("Comcast"), "")
+        self.assertTrue(Intel(tags=("drop:Spamhaus DROP",)).listed)
+        self.assertEqual(Intel(tags=("abuse:DShield",)).abuse, ("DShield",))
+        for host, domain in [("c-73-1-2-3.hsd1.il.comcast.net", "comcast.net"), ("x.bb.example.co.uk", "example.co.uk"),
+                             ("kd1.au-net.ne.jp", "au-net.ne.jp"), ("dns.google", "dns.google"), ("localhost", "localhost")]:
+            self.assertEqual(intel.domain_of(host), domain)
+        self.assertEqual(intel.canonical("::ffff:1.2.3.4"), "1.2.3.4")
+        self.assertIsNone(intel.canonical("1.2.3"))
+
+    def test_verify(self):
+        google = Intel("crawl-1.googlebot.com", True, ("crawler:Googlebot",))
+        self.assertEqual(verify("Googlebot", google), "verified")
+        self.assertEqual(verify("Googlebot", Intel("crawl-1.googlebot.com", True)), "verified")   # by name alone
+        self.assertEqual(verify("Googlebot", Intel("crawl-1.googlebot.com", False), ranges_loaded=False), "spoofed")
+        self.assertEqual(verify("Googlebot", Intel("ec2-1.amazonaws.com")), "spoofed")
+        self.assertEqual(verify("Googlebot", Intel(None), ranges_loaded=False), "")                 # nothing known
+        self.assertEqual(verify("Googlebot", Intel(None)), "spoofed")                               # not in the list
+        self.assertEqual(verify("GPTBot", Intel(None, None, ("crawler:GPTBot",))), "verified")
+        self.assertEqual(verify("GPTBot", Intel(None), ranges_loaded=False), "")
+        self.assertEqual(verify("Meta-ExternalAgent", Intel(), "32934", ranges_loaded=False), "verified")
+        self.assertEqual(verify("Meta-ExternalAgent", Intel(), "16509", ranges_loaded=False), "spoofed")
+        self.assertEqual(verify("Facebook", Intel("x.example")), "")                                # iMessage looks like it
+        self.assertEqual(verify("ClaudeBot", Intel("x.example")), "")
+        # Every crawler's lists have names the deploy script fetches.
+        deploy = (ROOT / "infra" / "deploy.py").read_text()
+        for proof in intel.PROOFS.values():
+            for name in proof.ranges:
+                self.assertIn(f'"crawler:{name}"', deploy)
+
+    def test_clocks(self):
+        at = datetime(2026, 1, 15, 12, tzinfo=timezone.utc)
+        self.assertIs(intel.clock_elsewhere("Europe/Berlin", "America/Chicago", at), True)
+        self.assertIs(intel.clock_elsewhere("America/Winnipeg", "America/Chicago", at), False)   # same offset
+        self.assertIs(intel.clock_elsewhere("America/Chicago", "America/Chicago", at), False)
+        self.assertIsNone(intel.clock_elsewhere("", "America/Chicago", at))
+        self.assertIsNone(intel.clock_elsewhere("../../etc/passwd", "America/Chicago", at))
+        self.assertIsNone(intel.clock_elsewhere("Mars/Olympus", "America/Chicago", at))
+
+    def test_lookups_are_cached(self):
+        table, calls = MemoryTable(), []
+        found = fake_intel(table, calls).lookup_many(["66.249.66.1", "::ffff:198.51.100.7", "192.0.2.55", "bogus"])
+        self.assertEqual(found["66.249.66.1"], Intel("crawl-66-249-66-1.googlebot.com", True, ("crawler:Googlebot",)))
+        self.assertEqual(found["::ffff:198.51.100.7"].host, "c-198-51-100-7.hsd1.il.comcast.net")
+        self.assertEqual(found["192.0.2.55"].host, "")
+        self.assertEqual(found["bogus"], Intel())
+        self.assertEqual(sorted(calls), ["192.0.2.55", "198.51.100.7", "66.249.66.1"])
+        # A fresh instance (another Lambda) finds them in the table, crawler proof included.
+        again = fake_intel(table, calls)
+        self.assertTrue(again.lookup("66.249.66.1").confirmed)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(table.get("ip|198.51.100.7", "-")["host"], "c-198-51-100-7.hsd1.il.comcast.net")
+
+    def test_no_answer_in_time(self):
+        slow = Intelligence(dns=True, reverse=lambda ip, timeout: time.sleep(0.3) or "late.example")
+        found = slow.lookup_many(["192.0.2.1", "192.0.2.2"], budget=0.05)
+        self.assertEqual({i.host for i in found.values()}, {None})
+        self.assertEqual(Intelligence().lookup("192.0.2.1"), Intel())   # DNS off: ranges only
+
+    def test_rdap_summary(self):
+        data = {"handle": "NET-66-249-64-0-1", "name": "GOOGLE", "type": "DIRECT ALLOCATION", "startAddress": "66.249.64.0",
+                "endAddress": "66.249.95.255", "cidr0_cidrs": [{"v4prefix": "66.249.64.0", "length": 19}],
+                "events": [{"eventAction": "registration", "eventDate": "2004-03-05T00:00:00-05:00"}],
+                "remarks": [{"description": ["Google's crawlers"]}],
+                "entities": [{"roles": ["registrant"], "vcardArray": ["vcard", [["fn", {}, "text", "GOOGLE-MNT"],
+                                                                              ["kind", {}, "text", "individual"]]]},
+                             {"roles": ["registrant"], "vcardArray": ["vcard", [["fn", {}, "text", "Google LLC"],
+                                                                              ["kind", {}, "text", "org"]]],
+                              "entities": [{"roles": ["abuse"], "vcardArray": ["vcard", [
+                                  ["fn", {}, "text", "Abuse"], ["email", {}, "text", "network-abuse@google.com"]]]}]}]}
+        got = intel.summarize_rdap(data, "rdap.arin.net")
+        self.assertEqual((got["holder"], got["abuse"], got["cidrs"], got["registered"][:4], got["remarks"]),
+                         ("Google LLC", "network-abuse@google.com", ["66.249.64.0/19"], "2004", ["Google's crawlers"]))
+
+    @unittest.skipUnless(os.environ.get("INTEL_RANGES"), "set INTEL_RANGES to test a built geo/ranges.bin")
+    def test_built_table(self):
+        table = Ranges.open(os.environ["INTEL_RANGES"])
+        self.assertIn("crawler:Googlebot", table.tags("66.249.66.1"))
+        self.assertTrue(any(t.startswith("cloud:AWS") for t in table.tags("3.80.0.1")))
+
+
+class Enrichment(unittest.TestCase):
+    """Addresses as the store keeps them: names, connections, crawlers checked."""
+
+    def setUp(self):
+        self.app = make(with_intel=True)
+        self.call = Client(self.app)
+        self.call.sign_in()
+
+    def report(self, site="a.example"):
+        return body(self.call("GET", "/_c/api/report", query={"site": site, "days": "1"}))
+
+    def test_server_logs(self):
+        now = datetime.now(timezone.utc)
+        google = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+
+        def line(ip, ua, host="a.example", path="/"):
+            return LogLine(now, host, ip, "GET", path, "", 200, "", ua)
+        self.app.store.ingest_log([
+            line("66.249.66.1", google), line("52.4.1.1", google), line("52.4.9.9", google),
+            line("172.224.1.1", SAFARI), line("198.51.100.7", SAFARI), line("1.10.16.5", SAFARI),
+            line("52.4.2.2", SAFARI), line("203.0.113.9", SAFARI), line("198.51.100.8", SAFARI, "b.example")])
+        r = self.report()
+        self.assertEqual(r["top"]["verified"], [{"name": "Googlebot", "value": 1}])
+        self.assertEqual(r["top"]["impostors"], [{"name": "Googlebot", "value": 2}])
+        self.assertEqual({b["name"] for b in r["top"]["bots"]}, {"Googlebot", "Googlebot (fake)", "Spamhaus DROP"})
+        self.assertEqual({c["name"]: c["value"] for c in r["top"]["server_connections"]},
+                         {"relay": 1, "isp": 2, "hosting": 1})
+        self.assertEqual((r["totals"]["dc"], r["totals"]["abuse"]), (1, 1))
+        self.assertIn({"name": "comcast.net", "value": 1}, r["top"]["server_domains"])
+        self.assertIn({"name": "googlebot.com", "value": 2}, r["top"]["bot_domains"])
+        people = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "hum"}))["items"]
+        by_ip = {p["ip"]: p for p in people}
+        self.assertEqual(by_ip["198.51.100.7"]["host"], "c-198-51-100-7.hsd1.il.comcast.net")
+        self.assertEqual((by_ip["172.224.1.1"]["net"], by_ip["172.224.1.1"]["svc"], by_ip["172.224.1.1"]["dc"]),
+                         ("relay", "iCloud Private Relay", 0))
+        self.assertEqual(by_ip["203.0.113.9"]["abuse"], "blocklist.de")
+        bots = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "bot"}))["items"]
+        self.assertEqual({b["ip"]: b.get("ver") for b in bots},
+                         {"66.249.66.1": "verified", "52.4.1.1": "spoofed", "52.4.9.9": "spoofed", "1.10.16.5": None})
+        # A site that truncates addresses gets no reverse DNS: names spell addresses out.
+        other = body(self.call("GET", "/_c/api/log", query={"site": "b.example", "kind": "hum"}))["items"]
+        self.assertNotIn("host", other[0])
+
+    def test_beacons(self):
+        ids = {"vid": VID, "sid": SID, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
+        chicago = {"cloudfront-viewer-time-zone": "America/Chicago", "cloudfront-viewer-country-region-name": "Illinois"}
+        self.call("POST", "/_c/i", {**ids, "tz": "Europe/Berlin", "items": [{"t": "pv", "p": "/", "new": True}]},
+                  ip="198.51.100.7", headers=chicago)
+        self.call("POST", "/_c/i", {"tz": "America/Chicago", "items": [{"t": "pv", "p": "/"}]},
+                  ip="172.224.9.9", headers=chicago)
+        r = self.report()
+        self.assertEqual(r["totals"]["tzx"], 1)
+        self.assertEqual({c["name"]: c["value"] for c in r["top"]["connections"]}, {"isp": 1, "relay": 1})
+        view = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "pv"}))["items"][0]
+        self.assertEqual((view["host"], view["region"], view["tz"], view["tzx"]),
+                         ("c-198-51-100-7.hsd1.il.comcast.net", "Illinois", "Europe/Berlin", 1))
+        session = body(self.call("GET", "/_c/api/sessions", query={"site": "a.example"}))["items"][0]
+        self.assertEqual(session["host"], "c-198-51-100-7.hsd1.il.comcast.net")
+
+    def test_one_address(self):
+        with mock.patch.object(intel, "whois", return_value={"holder": "Google LLC"}) as whois:
+            got = body(self.call("GET", "/_c/api/ip", query={"ip": "66.249.66.1"}))
+            self.assertEqual((got["host"], got["confirmed"], got["net"], got["service"], got["whois"]),
+                             ("crawl-66-249-66-1.googlebot.com", True, "crawler", "Googlebot", {"holder": "Google LLC"}))
+            # Any name is checked forward here, not just crawlers'.
+            self.assertIs(body(self.call("GET", "/_c/api/ip", query={"ip": "198.51.100.7"}))["confirmed"], True)
+            private = body(self.call("GET", "/_c/api/ip", query={"ip": "10.0.0.1"}))
+            self.assertEqual((private["global"], "whois" in private), (False, False))
+            self.assertEqual(whois.call_count, 1)   # 198.51.100.7 is a documentation address: not global
+        self.assertEqual(self.call("GET", "/_c/api/ip", query={"ip": "nope"}).status, 400)
+        self.call.cookies.clear()
+        self.assertEqual(self.call("GET", "/_c/api/ip", query={"ip": "66.249.66.1"}).status, 401)
 
 
 class Console(unittest.TestCase):

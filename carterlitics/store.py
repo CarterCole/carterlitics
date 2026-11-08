@@ -6,6 +6,7 @@ never see each other's data. The layout:
     c|<site>|<day>|web   <dim>#<value>  n        browser counters, one item per value
     c|<site>|<day>|srv   <dim>#<value>  n        server (CloudFront log) counters
     c|<site>|<day>|web   uv             h = {…}  that day's visitor hashes (a string set)
+    ip|<address>         -              host     its reverse DNS name, cached a week (intel.py)
     l|<site>|<day>|<k>   <ts>#<rand>    …        logs: pv (consented page views), ev, err,
                                                  hum and bot (server requests)
     s|<site>|<day>       <session id>   …        a consented session, keyed by its first day
@@ -19,6 +20,10 @@ rrweb events per chunk.
 
 Counters are bumped with an atomic ADD, so nothing is ever aggregated after the fact
 and a report is a handful of queries. Every item carries `expires` for the table's TTL.
+
+Every record that keeps an address also says what the address is (`intel.py`): its
+reverse DNS name, the kind of connection (Tor, iCloud Private Relay, VPN, hosting, a
+crawler's own range) and, for a request claiming to be a crawler, whether it is one.
 
 Unique visitors are counted the way Plausible does it: a hash of a random daily salt,
 the site, the IP address and the user agent. The salt is thrown away after two days, so
@@ -42,6 +47,7 @@ from typing import NamedTuple
 from . import classify
 from .classify import Bot, clean_path, text, valid_id, valid_name
 from .geo import Geo, Geolocator
+from .intel import Intel, Intelligence, canonical, clock_elsewhere, verify
 
 DAY = 86400
 MAX_ITEMS = 50                 # per browser batch
@@ -49,6 +55,9 @@ MAX_CHUNK_BYTES = 2_000_000    # one recording chunk, as JSON, before gzip
 MAX_CHUNKS = 100_000
 MAX_PROPS = 2000               # an event's properties, as JSON
 TOP = 25
+BEACON_DNS = 0.8               # seconds a browser batch may wait on reverse DNS
+SERVER_DNS = 2.0               # ... a backend's batch of events
+LOG_DNS = 20.0                 # ... a CloudFront log file, all its addresses at once
 
 
 def now() -> datetime:
@@ -122,6 +131,8 @@ class Meta:
     country: str = ""
     asn: str = ""
     city: str = ""
+    region: str = ""
+    tz: str = ""             # the address's time zone, by CloudFront
     opted_out: bool = False  # Do Not Track or Global Privacy Control
 
 
@@ -185,23 +196,36 @@ class Store:
     """With no table (or, for recordings, no bucket) writes are dropped and reports are
     empty, so the API runs before anything is provisioned."""
 
-    def __init__(self, cfg, table=None, blobs=None, geo: Geolocator | None = None):
+    def __init__(self, cfg, table=None, blobs=None, geo: Geolocator | None = None,
+                 intel: Intelligence | None = None):
         self.cfg = cfg
         self.table = table
         self.blobs = blobs
         self.geo = geo or Geolocator([])
+        self.intel = intel or Intelligence()
         self._salt: tuple[str, str] | None = None
 
     def keep(self, what: str) -> int:
         return int(time.time()) + self.cfg.retention[what] * DAY
 
-    def locate(self, ip: str | None, country: str = "", asn: str = "", city: str = "") -> Geo:
+    def locate(self, ip: str | None, country: str = "", asn: str = "", city: str = "", region: str = "",
+               tz: str = "") -> Geo:
         """CloudFront's answer first (it knows the address best), the database for the rest."""
-        edge = Geo(country.upper()[:8], asn.upper().removeprefix("AS")[:12], "", city[:80])
+        edge = Geo(country.upper()[:8], asn.upper().removeprefix("AS")[:12], "", city[:80], region[:80], tz[:64])
         db = self.geo.lookup(ip) if ip else Geo()
         if edge.asn and db.asn and edge.asn != db.asn:
-            db = Geo(db.country, "", "", db.city)  # its network name belongs to another AS
+            db = Geo(db.country, "", "", db.city, db.region, db.tz)  # its network name belongs to another AS
+        if edge.country and db.country and edge.country != db.country:
+            db = Geo(db.country, db.asn, db.network)  # its place is in another country
         return edge.merge(db)
+
+    @staticmethod
+    def profile(geo: Geo, found: Intel) -> dict:
+        """What a stored record says about its address. Empty values are left out."""
+        out = {"country": geo.country, "asn": geo.asn, "network": geo.network, "city": geo.city}
+        extra = {"region": geo.region, "host": found.host or "", "net": found.net(geo.network),
+                 "svc": found.service(), "abuse": ",".join(found.abuse)}
+        return {**out, **{k: v for k, v in extra.items() if v}}
 
     # -- unique visitors
 
@@ -249,7 +273,11 @@ class Store:
         bot = classify.bot_of(ua)
         if not bot and batch.get("wd") is True:
             bot = Bot("webdriver", "automation")
-        geo = self.locate(meta.ip, meta.country, meta.asn, meta.city)
+        geo = self.locate(meta.ip, meta.country, meta.asn, meta.city, meta.region, meta.tz)
+        # From the ranges alone (no DNS), so anonymous views are counted by connection too.
+        net = self.intel.local(meta.ip).net(geo.network) or "isp"
+        zone = text(batch.get("tz"), 64)
+        elsewhere = clock_elsewhere(zone, geo.tz, at)
         browser, system = classify.browser_of(ua)
         device = classify.device_of(batch.get("w"))
         own = site.hosts
@@ -263,12 +291,20 @@ class Store:
         viewed = False
         W = web(site.id, day)
 
+        about: dict | None = None
+
         def who() -> dict:
+            nonlocal about
             if not consented:
                 return {}
+            if about is None:  # once a batch: the reverse DNS lookup is the slow part
+                about = self.profile(geo, self.intel.lookup(meta.ip, BEACON_DNS))
+                if zone:
+                    about["tz"] = zone
+                if elsewhere:
+                    about["tzx"] = 1
             return {"vid": vid, "sid": sid, "fp": fp or "", "uid": uid, "ip": text(meta.ip, 64),
-                    "ua": text(ua), "country": geo.country, "asn": geo.asn, "network": geo.network,
-                    "city": geo.city}
+                    "ua": text(ua), **about}
 
         for seq, item in enumerate(items[:MAX_ITEMS]):
             if not isinstance(item, dict):
@@ -287,8 +323,10 @@ class Store:
                 ref = classify.referrer_of(item.get("r"), own)
                 if not dup:
                     for sk in ("pv", f"path#{path}", f"ref#{ref}", f"dev#{device}",
-                               f"cty#{geo.country or '??'}", f"br#{browser}", f"os#{system}"):
+                               f"cty#{geo.country or '??'}", f"br#{browser}", f"os#{system}", f"net#{net}"):
                         counts[(W, sk)] += 1
+                    if elsewhere:
+                        counts[(W, "tzx")] += 1
                     viewed = True
                 stored += 1
                 if consented:
@@ -403,9 +441,9 @@ class Store:
         day = day_of(at)
         counts: Counter = Counter()
         logs = []
-        for seq, e in enumerate(events[:MAX_ITEMS]):
-            if not isinstance(e, dict) or not valid_name(e.get("name")):
-                continue
+        events = [e for e in events[:MAX_ITEMS] if isinstance(e, dict) and valid_name(e.get("name"))]
+        found = self.intel.lookup_many({text(e.get("ip"), 64) for e in events} - {""}, SERVER_DNS)
+        for seq, e in enumerate(events):
             props = e.get("props") if isinstance(e.get("props"), dict) else {}
             blob = json.dumps(props, separators=(",", ":"), default=str)
             ip, ua = text(e.get("ip"), 64) or None, text(e.get("ua"))
@@ -416,8 +454,8 @@ class Store:
                          "props": blob if len(blob) <= MAX_PROPS else '{"_truncated":true}',
                          "path": clean_path(e.get("path")) or "", "source": "server",
                          "uid": text(e.get("uid"), 120), "ip": ip or "", "ua": ua,
-                         "browser": classify.browser_of(ua)[0] if ua else "", "country": geo.country,
-                         "asn": geo.asn, "network": geo.network, "expires": self.keep("events")})
+                         "browser": classify.browser_of(ua)[0] if ua else "",
+                         **self.profile(geo, found.get(ip or "") or Intel()), "expires": self.keep("events")})
             stored += 1
         self.table.add_many(dict(counts), self.keep("counts"))
         self.table.put_many(logs)
@@ -444,11 +482,11 @@ class Store:
             at = now()
             start_day = data.get("sd") if data.get("sd") in days_back(3, at) else day_of(at)
             # The page view normally made the session already; this covers a lost beacon.
-            geo = self.locate(meta.ip, meta.country, meta.asn, meta.city)
+            geo = self.locate(meta.ip, meta.country, meta.asn, meta.city, meta.region, meta.tz)
             self.table.update(sessions_pk(site.id, start_day), session, set_={"rec": 1},
                               set_if_absent={"started": iso(at), "last": iso(at), "vid": visitor,
                                              "ip": text(meta.ip, 64), "ua": text(meta.user_agent),
-                                             "country": geo.country, "network": geo.network,
+                                             **self.profile(geo, self.intel.lookup(meta.ip, BEACON_DNS)),
                                              "path": clean_path(data.get("p"), site.exclude) or "",
                                              "expires": self.keep("recordings")})
         return True
@@ -478,17 +516,34 @@ class Store:
         counts: Counter = Counter()
         logs: list[dict] = []
         seen = skipped = 0
+        rows = []
         for line in lines:
             seen += 1
             site = self.cfg.site_for_host(line.host)
             if not site or line.path.startswith("/_c/") or classify.is_asset(line.path):
                 skipped += 1
                 continue
+            rows.append((site, line))
+        # Every address in the file at once, in parallel. A site that keeps addresses
+        # truncated gets no reverse DNS: the names often spell the address out.
+        found = self.intel.lookup_many({line.ip for site, line in rows if site.server_ip != "truncate"}, LOG_DNS)
+        has_ranges = self.intel.ranges is not None
+        for site, line in rows:
             day = day_of(line.at)
             S = srv(site.id, day)
-            bot = classify.bot_of(line.user_agent, line.path)
             geo = self.locate(line.ip, line.country, line.asn)
-            datacenter = classify.is_datacenter(geo.network)
+            about = found.get(line.ip) if site.server_ip != "truncate" else None
+            about = about or self.intel.local(line.ip)
+            bot = classify.bot_of(line.user_agent, line.path)
+            claimed = ver = ""
+            if bot:
+                ver = verify(bot.name, about, geo.asn, has_ranges)
+                if ver == "spoofed":
+                    claimed, bot = bot.name, Bot(f"{bot.name} (fake)", "impostor")
+            elif about.listed:
+                bot = Bot("Spamhaus DROP", "scanner")  # a network nobody should route
+            net = about.net(geo.network)
+            datacenter = net == "hosting"
             counts[(S, "req")] += 1
             counts[(S, f"ss#{line.status}")] += 1
             path = clean_path(line.path)
@@ -501,13 +556,26 @@ class Store:
                 counts[(S, f"sip#{line.ip}")] += 1
                 if geo.network:
                     counts[(S, f"sasn#{classify.dim(geo.network, 80)}")] += 1
+                if about.domain:
+                    counts[(S, f"sdom#{classify.dim(about.domain, 80)}")] += 1
+                if ver == "verified":
+                    counts[(S, f"sv#{bot.name}")] += 1
+                elif ver == "spoofed":
+                    counts[(S, f"sx#{claimed}")] += 1
             else:
                 counts[(S, "hum")] += 1
                 if path:
                     counts[(S, f"shp#{path}")] += 1
                 counts[(S, f"scty#{geo.country or '??'}")] += 1
+                counts[(S, f"snet#{net or 'isp'}")] += 1
+                if geo.network:
+                    counts[(S, f"shn#{classify.dim(geo.network, 80)}")] += 1
+                if about.domain:
+                    counts[(S, f"shd#{classify.dim(about.domain, 80)}")] += 1
                 if datacenter:
                     counts[(S, "dc")] += 1
+            if about.abuse:
+                counts[(S, "abuse")] += 1
             ip = line.ip
             if site.server_ip == "truncate":
                 ip = truncate_ip(ip)
@@ -517,8 +585,9 @@ class Store:
                 "query": classify.dim(redact_query(line.query), 300), "status": line.status,
                 "ref": classify.dim(line.referrer, 300), "ua": classify.dim(line.user_agent, 500),
                 "bytes": line.bytes, "edge": line.edge[:24], "ms": int(line.seconds * 1000),
-                "country": geo.country, "asn": geo.asn, "network": geo.network,
+                **self.profile(geo, about),
                 "bot": bot.name if bot else "", "cat": bot.category if bot else "",
+                **({"ver": ver} if ver else {}),
                 "dc": 1 if datacenter else 0, "expires": self.keep("server"),
             })
         self.table.add_many(dict(counts), self.keep("counts"))
@@ -544,7 +613,7 @@ class Store:
         totals: Counter = Counter()
         for day, w_items, s_items in zip(keys, webs, srvs):
             row = {"day": day, "pv": 0, "uv": 0, "ms": 0, "jsbot": 0, "ev": 0, "err": 0, "req": 0,
-                   "hum": 0, "bot": 0, "dc": 0}
+                   "hum": 0, "bot": 0, "dc": 0, "tzx": 0, "abuse": 0}
             for item in w_items + s_items:
                 sk = item["sk"]
                 if sk == "uv":
@@ -577,7 +646,12 @@ class Store:
             "bots": top("sb", 50), "categories": top("sc"), "statuses": top("ss"),
             "bot_paths": top("sp", 50), "bot_ips": top("sip", 50), "bot_networks": top("sasn", 30),
             "server_paths": top("shp", 50), "server_countries": top("scty"),
+            "connections": top("net"), "server_connections": top("snet"), "server_networks": top("shn", 30),
+            "server_domains": top("shd", 30), "bot_domains": top("sdom", 30), "verified": top("sv", 30),
+            "impostors": top("sx", 30),
         }
+        out["intel"] = {"ranges": self.intel.ranges.built if self.intel.ranges else "",
+                        "dns": self.intel.dns, "geo": [r.database_type for r in self.geo.readers]}
         info = {g["sk"]: g for g in groups}
         out["groups"] = [
             {"id": gid, "count": n, "total": info.get(gid, {}).get("n", n),
@@ -585,6 +659,32 @@ class Store:
                                                            "last", "last_path")}}
             for gid, n in sorted((dims.get("eg") or {}).items(), key=lambda kv: -kv[1])[:100]
         ]
+        return out
+
+    def about(self, ip: str, registry: bool = True) -> dict | None:
+        """Everything known about one address, for the console: place, network, reverse
+        DNS (confirmed forward), the lists that name it and, if asked, its registry."""
+        import ipaddress
+        from dataclasses import asdict
+
+        from . import intel as intel_module
+
+        ip = canonical(ip)
+        if not ip:
+            return None
+        addr = ipaddress.ip_address(ip)
+        geo = self.locate(ip)
+        found = self.intel.lookup(ip, 3.0)
+        confirmed = found.confirmed
+        if found.host and confirmed is None:
+            confirmed = self.intel.confirm(found.host, ip)
+        out = {"ip": ip, "version": addr.version, "global": addr.is_global, "geo": asdict(geo),
+               "host": found.host, "confirmed": confirmed, "domain": found.domain, "tags": list(found.tags),
+               "net": found.net(geo.network), "service": found.service(), "listed": found.listed,
+               "abuse": list(found.abuse), "dns": self.intel.dns,
+               "ranges": self.intel.ranges.built if self.intel.ranges else ""}
+        if registry and addr.is_global:
+            out["whois"] = intel_module.whois(ip)
         return out
 
     def log(self, site, kind: str, days: int, limit: int) -> list[dict]:

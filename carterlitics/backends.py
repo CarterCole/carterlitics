@@ -81,6 +81,10 @@ class MemoryTable:
             item = self.items.get(pk, {}).get(sk)
             return _copy(item) if item else None
 
+    def get_many(self, keys: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        with self.lock:
+            return {(pk, sk): _copy(self.items[pk][sk]) for pk, sk in keys if sk in self.items.get(pk, {})}
+
     def query(self, pk: str, newest_first: bool = False, limit: int | None = None) -> list[dict]:
         with self.lock:
             part = self.items.get(pk, {})
@@ -210,6 +214,22 @@ class DynamoTable:
     def get(self, pk: str, sk: str) -> dict | None:
         out = self.client.get_item(TableName=self.name, Key={"pk": {"S": pk}, "sk": {"S": sk}})
         return self._out(out["Item"]) if "Item" in out else None
+
+    def get_many(self, keys: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        """BatchGetItem, 100 keys a call, retrying what DynamoDB leaves unprocessed."""
+        out: dict[tuple[str, str], dict] = {}
+        unique = list(dict.fromkeys(keys))
+        for i in range(0, len(unique), 100):
+            pending = {self.name: {"Keys": [{"pk": {"S": pk}, "sk": {"S": sk}} for pk, sk in unique[i:i + 100]]}}
+            for _ in range(5):
+                res = self.client.batch_get_item(RequestItems=pending)
+                for item in res.get("Responses", {}).get(self.name, []):
+                    row = self._out(item)
+                    out[(row["pk"], row["sk"])] = row
+                pending = res.get("UnprocessedKeys") or {}
+                if not pending:
+                    break
+        return out
 
     def query(self, pk: str, newest_first: bool = False, limit: int | None = None) -> list[dict]:
         rows, start = [], None
