@@ -18,6 +18,8 @@
      data-record="off"     no session recording even with consent
      data-errors="off"     don't report errors
      data-exclude="/admin,/auth"   path prefixes to leave alone entirely
+     data-google="off"     ignore Google Analytics calls (see below)
+     data-datalayer="dataLayer"    the name gtag.js / GTM were given for their queue
 
    API, safe to call before the script loads with this stub in the page:
      <script>window.cl=window.cl||function(){(cl.q=cl.q||[]).push(arguments)}</script>
@@ -28,6 +30,23 @@
      cl("consent", "all" | "essential")         // what the banner buttons do
      cl("identify", "user-123")                 // tie a consented visitor to your user id
      window.carterlitics.flush()                // send what's queued now
+
+   Google Analytics calls are understood too, so a page written for Google keeps
+   working with or without Google's own script. Each of these becomes cl("track"),
+   named the way GA4 names it (the action), with the category, label and value as
+   event_category, event_label and value:
+
+     gtag("event", "sign_up", { method: "google" })                 // gtag.js (GA4)
+     dataLayer.push({ event: "sign_up", method: "google" })          // Tag Manager
+     ga("send", "event", "Videos", "play", "intro", 3)               // analytics.js
+     _gaq.push(["_trackEvent", "Videos", "play", "intro", 3])        // ga.js, the async snippet
+
+   gtag("event", "page_view", { page_path }), ga("send", "pageview", path) and
+   _gaq.push(["_trackPageview", path]) count a page view; a user_id / userId given to
+   gtag or ga is cl("identify"). Calls made before this script loads are picked up from
+   Google's own queues (dataLayer, ga.q, _gaq), so Google's snippet doubles as the stub.
+   event_callback / eventCallback / hitCallback run once the event is sent, or after
+   event_timeout (2 s), when Google's script isn't on the page to run them; never twice.
 */
 (function () {
   "use strict";
@@ -42,6 +61,8 @@
   var RRWEB = "__RRWEB__";
   var RECORD = opts.record !== "off";
   var ERRORS = opts.errors !== "off";
+  var GOOGLE = opts.google !== "off";
+  var LAYER = /^[A-Za-z_$][\w$]*$/.test(opts.datalayer || "") ? opts.datalayer : "dataLayer";
   var EXCLUDE = (opts.exclude || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean)
     .concat([BASE]);
 
@@ -198,13 +219,192 @@
     if (OPTED_OUT || typeof name !== "string" || !name) return Promise.resolve();
     var clean = {};
     if (props && typeof props === "object") {
-      Object.keys(props).slice(0, 30).forEach(function (k) {
+      Object.keys(props).filter(function (k) {
+        return props[k] !== undefined && typeof props[k] !== "function";
+      }).slice(0, 30).forEach(function (k) {
         var v = props[k];
         if (v === null || typeof v === "number" || typeof v === "boolean") clean[k] = v;
-        else clean[k] = String(v).slice(0, 300);
+        else clean[k] = (typeof v === "object" ? safe(v) : String(v)).slice(0, 300);
       });
     }
     return enqueue({ t: "ev", n: name.slice(0, 64), props: clean });
+  }
+
+  /* ---------------------------------------------------------------- Google's tracking calls */
+
+  var GA_SKIP = { event: 1, event_callback: 1, event_timeout: 1, eventCallback: 1, eventTimeout: 1,
+    send_to: 1, hitCallback: 1 };
+
+  function each(list, fn) {
+    Array.prototype.forEach.call(list, function (item) {
+      try { fn(item); } catch (e) { /* a page's odd call must never break its own push */ }
+    });
+  }
+
+  // What the collector takes as a name: letters, digits, _ . : - and inner spaces.
+  // "open/close" becomes "open_close"; "Add to cart!" becomes "Add to cart".
+  function gaName(value) {
+    if (typeof value !== "string" && typeof value !== "number") return "";
+    var bad = "[^A-Za-z0-9_.:\\- ]+";
+    return String(value).replace(new RegExp("^" + bad + "|" + bad + "$", "g"), "")
+      .replace(new RegExp(bad, "g"), "_").replace(/\s+/g, " ").trim().slice(0, 64).trim();
+  }
+
+  function gaPath(value) {
+    if (typeof value !== "string" || !value) return "";
+    try { return new URL(value, loc.href).pathname; } catch (e) { return ""; }
+  }
+
+  function gaProps(params) {
+    var out = {};
+    Object.keys(params || {}).forEach(function (k) {
+      if (!GA_SKIP[k] && k.indexOf("gtm.") !== 0) out[k] = params[k];
+    });
+    return out;
+  }
+
+  // An event in GA4's shape, from an old category / action / label / value.
+  function gaEvent(category, action, label, value, nonInteraction) {
+    var props = {};
+    if (category !== undefined && category !== null && category !== "") props.event_category = String(category);
+    if (label !== undefined && label !== null && label !== "") props.event_label = String(label);
+    if (value !== undefined && value !== null && value !== "" && isFinite(value)) props.value = Number(value);
+    if (nonInteraction === true || nonInteraction === 1) props.non_interaction = true;
+    var name = gaName(action);
+    return name ? track(name, props) : Promise.resolve();
+  }
+
+  // Google runs a callback once its hit is sent, and pages often navigate in it. Make it
+  // run at most once, in place, so Google (if it is here, or arrives later) shares the
+  // guard; run it ourselves when Google's script for that API isn't on the page.
+  function gaCallback(holder, key, sent, google, timeout) {
+    var fn = holder && holder[key];
+    if (typeof fn !== "function") return;
+    var called = false;
+    var once = function () {
+      if (called) return;
+      called = true;
+      fn.apply(this, arguments);
+    };
+    holder[key] = once;
+    if (google) return;
+    setTimeout(once, isFinite(timeout) && timeout > 0 ? Math.min(+timeout, 10000) : 2000);
+    sent.then(function () { once(); });
+    flush();
+  }
+
+  /* gtag.js and Tag Manager: gtag() pushes its `arguments`; GTM pushes { event, ... }. */
+  function fromLayer(entry) {
+    var google = Boolean(w.google_tag_manager);
+    if (Object.prototype.toString.call(entry) === "[object Arguments]") {
+      var command = entry[0], params = entry[2];
+      if (command === "event" && typeof entry[1] === "string") {
+        params = params && typeof params === "object" ? params : {};
+        var name = gaName(entry[1]), path = gaPath(params.page_path || params.page_location), sent;
+        // A page_view with no page is the one already counted; page() ignores a repeat.
+        if (name === "page_view") sent = path ? page(path) : Promise.resolve();
+        else sent = name ? track(name, gaProps(params)) : Promise.resolve();
+        gaCallback(params, "event_callback", sent, google, params.event_timeout);
+      } else if (command === "set" || command === "config") {
+        var fields = command === "set" ? (entry[1] === "user_id" ? { user_id: entry[2] } : entry[1]) : params;
+        if (fields && typeof fields === "object" && fields.user_id) api.identify(String(fields.user_id));
+      }
+    } else if (entry && typeof entry === "object" && !Array.isArray(entry) &&
+               typeof entry.event === "string" && entry.event.indexOf("gtm.") !== 0 && gaName(entry.event)) {
+      gaCallback(entry, "eventCallback", track(gaName(entry.event), gaProps(entry)), google, entry.eventTimeout);
+    }
+  }
+
+  /* analytics.js: ga("send", "event", category, action, label, value, fields), and friends. */
+  var gaState = { page: "" };
+
+  function fromGa(args) {
+    var command = args[0];
+    if (typeof command !== "string") return;   // ready callbacks are analytics.js's to run
+    var method = command.slice(command.lastIndexOf(".") + 1);   // "tracker2.send" -> "send"
+    var rest = Array.prototype.slice.call(args, 1);
+    var fields = rest.length && rest[rest.length - 1] && typeof rest[rest.length - 1] === "object" ? rest.pop() : null;
+    if (method === "set" || method === "create") {
+      var set = fields || {};
+      if (method === "set" && typeof rest[0] === "string") { set = {}; set[rest[0]] = rest[1]; }
+      if (typeof set.page === "string") gaState.page = set.page;
+      if (set.userId) api.identify(String(set.userId));
+      return;
+    }
+    if (method !== "send") return;
+    var hit = fields || {};
+    var type = rest[0] || hit.hitType, sent;
+    if (type === "event") {
+      sent = gaEvent(rest.length > 1 ? rest[1] : hit.eventCategory, rest.length > 2 ? rest[2] : hit.eventAction,
+        rest.length > 3 ? rest[3] : hit.eventLabel, rest.length > 4 ? rest[4] : hit.eventValue, hit.nonInteraction);
+    } else if (type === "pageview") {
+      var path = gaPath(rest[1] || hit.page || gaState.page);
+      sent = path ? page(path) : Promise.resolve();
+    } else {
+      return;
+    }
+    if (fields) gaCallback(fields, "hitCallback", sent, Boolean(w.gaplugins), 2000);
+  }
+
+  /* ga.js: _gaq.push(["_trackEvent", category, action, label, value, nonInteraction]). */
+  var gaqCallback = null;
+
+  function fromGaq(command) {
+    if (!Array.isArray(command) || typeof command[0] !== "string") return;
+    var method = command[0].slice(command[0].lastIndexOf(".") + 1);   // "t2._trackEvent"
+    var sent;
+    if (method === "_set" && command[1] === "hitCallback" && typeof command[2] === "function") {
+      gaqCallback = command;   // ga.js runs it after the next hit
+      return;
+    }
+    if (method === "_trackEvent") sent = gaEvent(command[1], command[2], command[3], command[4], command[5]);
+    else if (method === "_trackPageview") sent = gaPath(command[1]) ? page(gaPath(command[1])) : Promise.resolve();
+    else return;
+    if (gaqCallback) {
+      gaCallback(gaqCallback, 2, sent, Boolean(w._gat), 2000);
+      gaqCallback = null;
+    }
+  }
+
+  // Hear every later push to a queue, after whatever push did already (the array's own,
+  // or Google's, when its script has taken the queue over). Entries already in an array
+  // queue are handled first.
+  function tap(queue, handle) {
+    if (!queue || typeof queue.push !== "function") return;
+    if (Array.isArray(queue)) each(queue.slice(), handle);
+    var push = queue.push;
+    queue.push = function () {
+      var out = push.apply(queue, arguments);
+      each(arguments, handle);
+      return out;
+    };
+  }
+
+  function watchGoogle() {
+    if (!GOOGLE) return;
+    // gtag.js and GTM. Defining gtag() is what Google's snippet does; a later snippet keeps ours.
+    w[LAYER] = w[LAYER] || [];
+    tap(w[LAYER], fromLayer);
+    if (typeof w.gtag !== "function") w.gtag = function () { w[LAYER].push(arguments); };
+
+    // analytics.js. Its snippet's stub queues into ga.q for analytics.js; keep doing that, so
+    // analytics.js still gets every call if it loads, and hear each call on the way through.
+    var name = typeof w.GoogleAnalyticsObject === "string" ? w.GoogleAnalyticsObject : "ga";
+    var original = typeof w[name] === "function" ? w[name] : null;
+    var backlog = original && Array.isArray(original.q) ? original.q.slice() : [];
+    var ga = function () {
+      try { fromGa(arguments); } catch (e) { /* never break the page's call */ }
+      if (original) return original.apply(this, arguments);
+      (ga.q = ga.q || []).push(arguments);
+    };
+    if (original) Object.keys(original).forEach(function (k) { ga[k] = original[k]; });
+    else ga.l = Date.now();
+    w[name] = ga;
+    each(backlog, fromGa);
+
+    // ga.js: an array until ga.js loads and swaps in its own object; either has push().
+    w._gaq = w._gaq || [];
+    tap(w._gaq, fromGaq);
   }
 
   /* ---------------------------------------------------------------- errors */
@@ -465,6 +665,7 @@
   page();
   watchNavigation();
   pending.forEach(function (args) { w.cl.apply(null, args); });
+  watchGoogle();
 
   d.addEventListener("visibilitychange", function () {
     if (d.visibilityState === "hidden") {

@@ -39,6 +39,13 @@ aliases = ["www.cartercole.com"]
 exclude = ["/admin", "/auth", "/graphql"]
 dev_url = "http://localhost:4321"
 
+# Funnels go under their site, after its keys (README: Funnels). For example:
+#
+# [[site.funnel]]
+# name = "Reader to sign-up"
+# by = "session"             # or "visitor"
+# steps = ["/", "/blog", "/blog/*", "event:sign_up", "event:email_confirmed"]
+
 # ---------------------------------------------------------------- project sites
 
 [[site]]

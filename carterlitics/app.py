@@ -34,7 +34,7 @@ from pathlib import Path
 
 from . import auth, logs
 from .backends import DynamoTable, S3Blobs
-from .config import Config
+from .config import Config, Funnel
 from .geo import Geolocator
 from .store import LOG_KINDS, Meta, Store
 from .web import NO_STORE, Request, Response, from_lambda, no_content, plain, redirect, reply_json, to_lambda
@@ -262,6 +262,20 @@ class App:
             return self.big_json({"items": self.store.log(site, kind, days, self.clamp(q.get("limit"), 200, 1, 1000))})
         if path == "/sessions":
             return self.big_json({"items": self.store.sessions(site, self.clamp(q.get("days"), 7, 1, 30))})
+        if path == "/funnels":
+            # The site's own funnels, or, given `steps` (a JSON list), one to try out.
+            funnels = site.funnels
+            if q.get("steps"):
+                try:
+                    steps = json.loads(q["steps"])
+                except ValueError:
+                    return reply_json({"error": "steps is a JSON list"}, 400)
+                try:
+                    funnels = (Funnel.parse({"name": "Explore", "by": q.get("by", "session"), "steps": steps}),)
+                except ValueError as e:
+                    return reply_json({"error": str(e)}, 400)
+            return self.big_json({**self.store.funnels(site, funnels, self.clamp(q.get("days"), 30, 1, 90)),
+                                  "configured": [f.to_data() for f in site.funnels]})
         if path == "/error":
             found = self.store.error(site, q.get("id", ""))
             return self.big_json(found) if found else reply_json({"error": "not found"}, 404)

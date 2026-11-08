@@ -11,12 +11,13 @@
   var MOUNT = root.dataset.mount || "/_c";
   var API = MOUNT + "/api";
   var RANGES = [1, 7, 30, 90];
-  var TABS = ["overview", "traffic", "bots", "visitors", "events", "errors"];
+  var TABS = ["overview", "traffic", "bots", "visitors", "events", "funnels", "errors"];
   var params = new URLSearchParams(location.search);
   var state = {
     site: params.get("site") || "",
     days: RANGES.indexOf(+params.get("days")) >= 0 ? +params.get("days") : 7,
     tab: TABS.indexOf(location.hash.slice(1)) >= 0 ? location.hash.slice(1) : "overview",
+    explore: { steps: params.get("steps") || "", by: params.get("by") === "visitor" ? "visitor" : "session" },
     me: null,
     report: null,
     cache: {}
@@ -100,7 +101,11 @@
         location.replace(MOUNT + "/auth/login?next=" + encodeURIComponent(location.pathname + location.search + location.hash));
         return new Promise(function () {});
       }
-      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      if (!res.ok) {
+        return res.json().catch(function () { return {}; }).then(function (d) {
+          throw new Error(d.error || res.status + " " + res.statusText);
+        });
+      }
       return res.json();
     });
   }
@@ -414,6 +419,152 @@
     ];
   }
 
+  /* ---------------------------------------------------------------- funnels */
+
+  var FUNNEL_EXAMPLE = [
+    "[[site.funnel]]          # under the site's [[site]] table",
+    "name = \"Sign-up\"",
+    "by = \"session\"           # or \"visitor\": across sessions, by the visitor cookie",
+    "steps = [\"/\", \"/pricing\", \"event:begin_checkout\", \"event:sign_up\"]"
+  ].join("\n");
+
+  function share(a, b) { return b ? pct.format(a / b) : "—"; }
+  function seconds(s) { return s === null || s === undefined ? "—" : s < 1 ? "under 1s" : dur(s * 1000); }
+  function failed(holder) {
+    return function (e) { holder.replaceChildren(el("p", { class: "empty bad", text: e.message })); };
+  }
+
+  function funnelsOf(query) {
+    return cached("funnels:" + JSON.stringify(query || {}), function () {
+      return get("/funnels", Object.assign({ days: Math.min(state.days, 90) }, query || {}));
+    });
+  }
+
+  /* One bar per step, its length the share of step 1. Hover or focus a row for the numbers. */
+  function funnelFigure(f) {
+    var first = f.steps[0].count;
+    var unit = f.by === "visitor" ? "visitors" : "sessions";
+    var tip = el("div", { class: "tip", hidden: true });
+    var list = el("ol", { class: "funnel", "aria-label": f.name + ", " + unit + " per step" });
+    var figure = el("div", { class: "funnel-fig" }, list, tip);
+
+    function show(track, s, i) {
+      tip.replaceChildren(
+        el("div", { class: "tip-day", text: "Step " + (i + 1) + ": " + s.step }),
+        el("div", { class: "tip-row" }, el("strong", { text: num(s.count) }), el("span", { text: unit })),
+        el("div", { class: "tip-row" }, el("strong", { text: share(s.count, first) }), el("span", { text: "of step 1" })),
+        i ? el("div", { class: "tip-row" }, el("strong", { text: share(s.count, f.steps[i - 1].count) }),
+          el("span", { text: "of step " + i })) : null,
+        i ? el("div", { class: "tip-row" }, el("strong", { text: seconds(s.median_s) }),
+          el("span", { text: "median from step " + i })) : null);
+      tip.hidden = false;
+      var c = figure.getBoundingClientRect(), b = track.getBoundingClientRect();
+      var fill = track.firstChild ? track.firstChild.getBoundingClientRect().right : b.left;
+      var half = tip.offsetWidth / 2;
+      tip.style.left = Math.max(half, Math.min(c.width - half, fill - c.left)) + "px";
+      tip.style.top = (b.bottom - c.top + 6) + "px";
+    }
+    function hide() { tip.hidden = true; }
+
+    f.steps.forEach(function (s, i) {
+      var label = "Step " + (i + 1) + ", " + s.step + ": " + num(s.count) + " " + unit + ", " + share(s.count, first) + " of step 1";
+      var track = el("button", { type: "button", class: "funnel-track", "aria-label": label },
+        s.count ? el("span", { class: "funnel-fill", style: "width:" + (first ? s.count / first * 100 : 0) + "%" }) : null);
+      track.addEventListener("pointerenter", function () { show(track, s, i); });
+      track.addEventListener("pointerleave", hide);
+      track.addEventListener("focus", function () { show(track, s, i); });
+      track.addEventListener("blur", hide);
+      add(list, el("li", { class: "funnel-step" },
+        el("span", { class: "funnel-label" }, el("span", { class: "funnel-n", text: String(i + 1) }),
+          el("span", { class: "clip clip--wide", text: s.step, title: s.step })),
+        track,
+        el("span", { class: "funnel-num" }, el("strong", { text: num(s.count) }), el("span", { text: share(s.count, first) }))));
+      var next = f.steps[i + 1];
+      if (!next || !s.count) return;
+      var watch = s.dropped.filter(function (d) { return d.sid; }).slice(0, 5);
+      add(list, el("li", { class: "funnel-drop" },
+        el("span", { text: share(next.count, s.count) + " went on · " + num(s.count - next.count) + " stopped here" +
+          (next.median_s !== null ? " · median " + seconds(next.median_s) + " to the next step" : "") }),
+        watch.length && s.count > next.count ? el("span", null, " · watch ", watch.map(function (d, k) {
+          return [k ? ", " : "", replayLink(d.sid, d.sid.slice(0, 6))];
+        })) : null));
+    });
+
+    add(figure, el("details", { class: "table-view" }, el("summary", { text: "Table" }),
+      el("div", { class: "table-wrap" }, el("table", { class: "log" },
+        el("thead", null, el("tr", null, ["Step", "#" + unit.charAt(0).toUpperCase() + unit.slice(1), "#Of step 1",
+          "#Of previous", "#Median from previous"].map(function (h) {
+          return el("th", { class: h.charAt(0) === "#" ? "num" : null, text: h.replace(/^#/, "") });
+        }))),
+        el("tbody", null, f.steps.map(function (s, i) {
+          return el("tr", null, el("td", { text: (i + 1) + ". " + s.step }), el("td", { class: "num", text: num(s.count) }),
+            el("td", { class: "num", text: share(s.count, first) }),
+            el("td", { class: "num", text: i ? share(s.count, f.steps[i - 1].count) : "—" }),
+            el("td", { class: "num", text: i ? seconds(s.median_s) : "—" }));
+        }))))));
+    return figure;
+  }
+
+  function funnelSummary(f, d) {
+    var total = f.by === "visitor" ? d.visitors : d.sessions;
+    var unit = f.by === "visitor" ? "visitors" : "sessions";
+    return "By " + (f.by === "visitor" ? "visitor" : "session") + ": " + num(f.entered) + " of " + num(total) +
+      " consented " + unit + " reached step 1, and " + num(f.completed) + " (" + share(f.completed, f.entered) +
+      ") the last.";
+  }
+
+  function funnels() {
+    var mine = el("div", { class: "cards" }, el("p", { class: "empty", text: "Loading funnels…" }));
+    funnelsOf(null).then(function (d) {
+      if (!d.funnels.length) {
+        mine.replaceChildren(card("Funnels", "None are set up for " + state.site + " yet. Try one below, then add it " +
+          "to carterlitics.toml and deploy, and it shows here.", el("pre", { class: "stack", text: FUNNEL_EXAMPLE })));
+        return;
+      }
+      mine.replaceChildren.apply(mine, d.funnels.map(function (f) {
+        return card(f.name, funnelSummary(f, d), funnelFigure(f));
+      }));
+    }, failed(mine));
+
+    var result = el("div");
+    var area = el("textarea", { rows: "5", spellcheck: "false", "aria-label": "Funnel steps, one per line",
+      placeholder: "/\n/pricing\nevent:sign_up" });
+    area.value = state.explore.steps;
+    var by = el("select", { "aria-label": "Count by" },
+      el("option", { value: "session", text: "By session" }), el("option", { value: "visitor", text: "By visitor" }));
+    by.value = state.explore.by;
+
+    function explore() {
+      var steps = area.value.split("\n").map(function (s) { return s.trim(); }).filter(Boolean);
+      state.explore = { steps: steps.join("\n"), by: by.value };
+      if (steps.length) params.set("steps", state.explore.steps); else params.delete("steps");
+      params.set("by", by.value);
+      remember();
+      if (steps.length < 2) {
+        result.replaceChildren(el("p", { class: "empty", text: "Give at least two steps, one per line." }));
+        return;
+      }
+      result.replaceChildren(el("p", { class: "empty", text: "Counting…" }));
+      funnelsOf({ steps: JSON.stringify(steps), by: by.value }).then(function (d) {
+        var f = d.funnels[0];
+        result.replaceChildren(el("p", { class: "sub", text: funnelSummary(f, d) }), funnelFigure(f));
+      }, failed(result));
+    }
+
+    var form = el("form", { class: "explore", onsubmit: function (e) { e.preventDefault(); explore(); } },
+      area,
+      el("div", { class: "toolbar" }, el("label", { class: "field" }, by),
+        el("button", { type: "submit", class: "btn", text: "Count" }),
+        el("span", { class: "hint", text: "/path · /path/* · event:name · event:name?key=value" })));
+    if (state.explore.steps) explore();
+
+    return [
+      mine,
+      card("Try a funnel", "Steps in order, one per line. Counted over the consented sessions in this range; " +
+        "anonymous visits carry nothing that ties one page to the next.", [form, result])
+    ];
+  }
+
   function errorDetail(gid, cell) {
     cell.replaceChildren(el("p", { class: "empty", text: "Loading…" }));
     get("/error", { id: gid }).then(function (d) {
@@ -472,7 +623,8 @@
     ];
   }
 
-  var VIEWS = { overview: overview, traffic: traffic, bots: bots, visitors: visitors, events: events, errors: errors };
+  var VIEWS = { overview: overview, traffic: traffic, bots: bots, visitors: visitors, events: events, funnels: funnels,
+    errors: errors };
 
   /* ---------------------------------------------------------------- shell */
 

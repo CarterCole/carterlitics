@@ -84,6 +84,10 @@ def main() -> int:
     cfg = Config.load(args.config, dev=True, session_secret=secrets.token_hex(32),
                       server_secret="dev-server-secret")
     geo = Geolocator.from_env()
+    if args.demo:
+        from .demo import configure
+
+        cfg = configure(cfg)
     app = App(cfg, Store(cfg, MemoryTable(), MemoryBlobs(), geo))
     if args.demo:
         from .demo import fill

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tomllib
 import urllib.parse
 from dataclasses import dataclass, field
@@ -22,6 +23,98 @@ RETENTION = {          # days
 }
 
 
+MAX_STEPS = 10
+FUNNEL_BY = ("session", "visitor")
+EVENT_NAME = re.compile(r"[A-Za-z0-9_.:\- *]{1,64}")
+
+
+@dataclass(frozen=True)
+class Step:
+    """One funnel step, written as a string:
+
+        /pricing                  a page view of that page (`/pricing/`, `/pricing.html` too)
+        /blog/*                   any page under /blog/ (`*` matches anything, `/` included)
+        event:sign_up             an event of that name (`*` works here too)
+        event:click?target=buy    ... whose properties have these values (`&` for more)
+    """
+    text: str
+    kind: str                                  # "page" or "event"
+    pattern: re.Pattern
+    props: tuple[tuple[str, str], ...] = ()
+
+    @classmethod
+    def parse(cls, text) -> "Step":
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("a funnel step is a page path (/pricing) or an event (event:sign_up)")
+        text = text.strip()
+        if text.startswith("event:"):
+            name, _, query = text[len("event:"):].partition("?")
+            if not EVENT_NAME.fullmatch(name):
+                raise ValueError(f"funnel step {text!r}: an event name is letters, digits, _ . : - and spaces")
+            props = tuple(urllib.parse.parse_qsl(query, keep_blank_values=True))
+            return cls(text, "event", _glob(name), props)
+        if text.startswith("/") and "?" not in text and "#" not in text and len(text) <= 200:
+            path = text.rstrip("/") or "/"
+            if path.endswith("/index.html"):
+                path = path[: -len("index.html")].rstrip("/") or "/"
+            elif path.endswith(".html"):
+                path = path[:-5]
+            return cls(text, "page", _glob(path))
+        raise ValueError(f"funnel step {text!r}: start it with / for a page or event: for an event")
+
+    def matches(self, kind: str, value: str, props: dict | None = None) -> bool:
+        if kind != self.kind or not self.pattern.fullmatch(value or ""):
+            return False
+        props = props or {}
+        return all(k in props and _prop_text(props[k]) == v for k, v in self.props)
+
+
+def _glob(text: str) -> re.Pattern:
+    return re.compile(".*".join(re.escape(part) for part in text.split("*")))
+
+
+def _prop_text(value) -> str:
+    """A property as a step's `key=value` compares it: the string form JSON would give."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+@dataclass(frozen=True)
+class Funnel:
+    """Steps a visitor takes in order, counted over consented sessions (or visitors)."""
+    name: str
+    steps: tuple[Step, ...]
+    by: str = "session"
+
+    @classmethod
+    def parse(cls, data: dict, where: str = "") -> "Funnel":
+        if not isinstance(data, dict):
+            raise ValueError(f"{where}: a funnel is a table with name and steps")
+        name = str(data.get("name") or "").strip()
+        steps = data.get("steps")
+        if not name or len(name) > 80:
+            raise ValueError(f"{where}: a funnel needs a name (up to 80 characters)")
+        about = f"{where} funnel {name!r}: " if where else ""   # none for one typed in the console
+        if not isinstance(steps, list) or not 2 <= len(steps) <= MAX_STEPS:
+            raise ValueError(f"{about}give 2 to {MAX_STEPS} steps, in a list")
+        by = data.get("by", "session")
+        if by not in FUNNEL_BY:
+            raise ValueError(f"{about}by is 'session' or 'visitor'")
+        try:
+            parsed = tuple(Step.parse(s) for s in steps)
+        except ValueError as e:
+            raise ValueError(f"{about}{e}") from None
+        return cls(name, parsed, by)
+
+    def to_data(self) -> dict:
+        return {"name": self.name, "by": self.by, "steps": [s.text for s in self.steps]}
+
+
 @dataclass(frozen=True)
 class Site:
     id: str                          # "cartercole.net": the key everything is stored under
@@ -32,6 +125,7 @@ class Site:
     server_ip: str = "full"          # "full" or "truncate": IPs in the server request log
     dev_url: str = ""                # its local dev server, for links and the CSP
     client: bool = True              # its pages load c.js; false = server logs only
+    funnels: tuple[Funnel, ...] = () # [[site.funnel]]: the console's Funnels tab
 
     @property
     def host(self) -> str:
@@ -119,9 +213,13 @@ class Config:
                 aliases=tuple(s.get("aliases", ())), exclude=tuple(s.get("exclude", ())),
                 distribution=s.get("distribution", ""), server_ip=s.get("server_ip", "full"),
                 dev_url=s.get("dev_url", ""), client=bool(s.get("client", True)),
+                funnels=tuple(Funnel.parse(f, s["id"]) for f in s.get("funnel", ())),
             )
             if site.server_ip not in ("full", "truncate"):
                 raise ValueError(f"{site.id}: server_ip must be 'full' or 'truncate'")
+            names = [f.name for f in site.funnels]
+            if len(names) != len(set(names)):
+                raise ValueError(f"{site.id}: two funnels share a name")
             sites[site.id] = site
         retention = {**RETENTION, **{k: int(v) for k, v in data.get("retention", {}).items()}}
         unknown = set(retention) - set(RETENTION)
@@ -161,5 +259,6 @@ class Config:
             "auth": {"issuer": self.issuer, "admin_role": self.admin_role,
                      "admin_ids": sorted(self.admin_ids)},
             "site": [{"id": s.id, "url": s.url, "aliases": list(s.aliases), "exclude": list(s.exclude),
-                      "server_ip": s.server_ip} for s in self.sites.values()],
+                      "server_ip": s.server_ip, **({"funnel": [f.to_data() for f in s.funnels]} if s.funnels else {})}
+                     for s in self.sites.values()],
         }

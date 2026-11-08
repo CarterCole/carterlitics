@@ -8,9 +8,12 @@ import base64
 import gzip
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -18,9 +21,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from carterlitics import auth, classify, logs  # noqa: E402
+from carterlitics import store as store_module  # noqa: E402
 from carterlitics.app import App, lambda_handler  # noqa: E402
 from carterlitics.backends import MemoryBlobs, MemoryTable  # noqa: E402
-from carterlitics.config import Config  # noqa: E402
+from carterlitics.config import Config, Step  # noqa: E402
 from carterlitics.geo import Geolocator  # noqa: E402
 from carterlitics.store import Store, group_id, redact_query, top_frame, truncate_ip  # noqa: E402
 from carterlitics.web import Request, from_lambda  # noqa: E402
@@ -411,6 +415,240 @@ class LambdaAdapter(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=False), mock.patch("carterlitics.app._app", None):
             out = lambda_handler(event, None)
         self.assertEqual(out["statusCode"], 204)
+
+
+FUNNEL_DATA = {**DATA, "site": [
+    {**DATA["site"][0], "funnel": [
+        {"name": "Sign-up", "steps": ["/", "/pricing/", "event:sign_up?plan=pro"]},
+        {"name": "Returning", "by": "visitor", "steps": ["/", "/pricing"]},
+    ]},
+    DATA["site"][1],
+]}
+SID2 = "22222222-2222-4333-8444-555555555555"
+SID3 = "33333333-2222-4333-8444-555555555555"
+SID4 = "44444444-2222-4333-8444-555555555555"
+VID2 = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+
+class FunnelConfig(unittest.TestCase):
+    def test_steps(self):
+        page = Step.parse("/pricing/")
+        self.assertTrue(page.matches("page", "/pricing"))
+        self.assertFalse(page.matches("page", "/pricing/team"))
+        self.assertFalse(page.matches("event", "/pricing"))
+        self.assertTrue(Step.parse("/docs/index.html").matches("page", "/docs"))
+        under = Step.parse("/blog/*")
+        self.assertTrue(under.matches("page", "/blog/a/b"))
+        self.assertFalse(under.matches("page", "/blog"))
+        event = Step.parse("event:sign_up?plan=pro&trial=true")
+        self.assertTrue(event.matches("event", "sign_up", {"plan": "pro", "trial": True, "x": 1}))
+        self.assertFalse(event.matches("event", "sign_up", {"plan": "pro"}))
+        self.assertFalse(event.matches("event", "sign_up_now", {"plan": "pro", "trial": True}))
+        self.assertTrue(Step.parse("event:value?value=3").matches("event", "value", {"value": 3.0}))
+        self.assertTrue(Step.parse("event:video_*").matches("event", "video_play"))
+        for bad in ("pricing", "", "event:", "event:a/b", "/x?y=1", 7):
+            with self.assertRaises(ValueError, msg=bad):
+                Step.parse(bad)
+
+    def test_funnels(self):
+        cfg = Config.from_data(FUNNEL_DATA)
+        funnels = cfg.sites["a.example"].funnels
+        self.assertEqual([(f.name, f.by, len(f.steps)) for f in funnels], [("Sign-up", "session", 3), ("Returning", "visitor", 2)])
+        # Lambda gets them through the deploy script's JSON.
+        again = Config.from_data(json.loads(json.dumps(cfg.to_data())))
+        self.assertEqual(again.sites["a.example"].funnels, funnels)
+        self.assertEqual(again.sites["b.example"].funnels, ())
+        for bad in ({"name": "x", "steps": ["/"]}, {"steps": ["/", "/a"]}, {"name": "x", "steps": ["/", "a"]},
+                    {"name": "x", "by": "user", "steps": ["/", "/a"]}, {"name": "x", "steps": ["/"] * 11}):
+            with self.assertRaises(ValueError, msg=bad):
+                Config.from_data({"site": [{"id": "a.example", "funnel": [bad]}]})
+        with self.assertRaises(ValueError):
+            Config.from_data({"site": [{"id": "a.example", "funnel": [{"name": "x", "steps": ["/", "/a"]}] * 2}]})
+
+
+class Funnels(unittest.TestCase):
+    def setUp(self):
+        cfg = Config.from_data(FUNNEL_DATA, session_secret=SECRET, origin_secret="origin", server_secret="server")
+        self.app = App(cfg, Store(cfg, MemoryTable(), MemoryBlobs()))
+        self.call = Client(self.app)
+        self.call.sign_in()
+        self.start = store_module.now() - timedelta(hours=3)
+
+    def at(self, minute: int):
+        at = self.start + timedelta(minutes=minute)
+        return mock.patch.object(store_module, "now", lambda: at)
+
+    def send(self, minute, items, sid=SID, vid=VID, uid=None):
+        ids = {"sid": sid, "vid": vid, "sd": self.start.strftime("%Y-%m-%d"), **({"uid": uid} if uid else {})}
+        with self.at(minute):
+            self.call("POST", "/_c/i", {**(ids if sid else {}), "items": items})
+
+    def funnels(self, **query):
+        res = self.call("GET", "/_c/api/funnels", query={"site": "a.example", "days": "7", **query})
+        return res.status, body(res)
+
+    def test_steps_in_order(self):
+        pv = lambda p: {"t": "pv", "p": p}  # noqa: E731
+        pro = {"t": "ev", "n": "sign_up", "props": {"plan": "pro"}}
+        self.send(0, [pv("/")])                                   # SID: all three, a minute apart
+        self.send(1, [pv("/pricing")])
+        self.send(2, [pro])
+        self.send(0, [pv("/pricing"), pv("/")], sid=SID2)         # pricing before home: step 1 only
+        self.send(1, [{"t": "ev", "n": "sign_up", "props": {"plan": "free"}}], sid=SID2)
+        self.send(0, [pv("/"), pv("/pricing/"), pro], sid=SID3)  # one batch, in order
+        self.send(0, [pro, pv("/pricing"), pv("/")], sid=SID4)   # one batch, backwards: step 1 only
+        self.send(0, [pv("/"), pv("/pricing"), pro], sid=None)   # anonymous: not in any funnel
+        status, d = self.funnels()
+        self.assertEqual(status, 200)
+        signup = d["funnels"][0]
+        self.assertEqual(signup["name"], "Sign-up")
+        self.assertEqual([s["count"] for s in signup["steps"]], [4, 2, 2])
+        self.assertEqual((signup["entered"], signup["completed"], d["sessions"]), (4, 2, 4))
+        self.assertEqual(signup["steps"][1]["median_s"], 30.0)    # 60 s and 0 s
+        self.assertEqual({x["sid"] for x in signup["steps"][0]["dropped"]}, {SID2, SID4})
+        self.assertEqual(d["configured"][0]["steps"], ["/", "/pricing/", "event:sign_up?plan=pro"])
+
+    def test_by_visitor_spans_sessions(self):
+        self.send(0, [{"t": "pv", "p": "/"}], sid=SID)
+        self.send(30, [{"t": "pv", "p": "/pricing"}], sid=SID2)
+        self.send(0, [{"t": "pv", "p": "/pricing"}], sid=SID3, vid=VID2)
+        _, d = self.funnels()
+        returning = d["funnels"][1]
+        self.assertEqual([s["count"] for s in returning["steps"]], [1, 1])
+        self.assertEqual(d["visitors"], 2)
+        _, d = self.funnels(steps=json.dumps(["/", "/pricing"]), by="session")
+        self.assertEqual([s["count"] for s in d["funnels"][0]["steps"]], [1, 0])
+
+    def test_backend_events_join_the_users_session(self):
+        key = auth.server_key("server", "a.example")
+
+        def backend(minute, uid):
+            with self.at(minute):
+                self.call("POST", "/_c/server/events", {"events": [{"name": "paid", "uid": uid}]},
+                          headers={"x-carterlitics-key": key})
+
+        backend(0, "u1")                                           # before the session began
+        self.send(1, [{"t": "pv", "p": "/"}], uid="u1")
+        self.send(2, [{"t": "pv", "p": "/"}], sid=SID2, vid=VID2)  # never identified
+        backend(5, "u1")
+        backend(5, "u2")                                           # no session to join
+        # Had the minute-0 event joined, it would come before the page view: [1, 1].
+        _, d = self.funnels(steps=json.dumps(["event:paid", "/"]))
+        self.assertEqual([s["count"] for s in d["funnels"][0]["steps"]], [1, 0])
+        _, d = self.funnels(steps=json.dumps(["/", "event:paid"]))
+        self.assertEqual([s["count"] for s in d["funnels"][0]["steps"]], [2, 1])
+
+    def test_explore_needs_good_steps(self):
+        for steps in ("not json", json.dumps(["/"]), json.dumps(["/", "pricing"]), json.dumps({"a": 1})):
+            status, d = self.funnels(steps=steps)
+            self.assertEqual(status, 400, steps)
+            self.assertIn("error", d)
+        self.call.cookies.clear()
+        self.assertEqual(self.funnels()[0], 401)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class GoogleCalls(unittest.TestCase):
+    """c.js in a stub page (tests/client_harness.js): Google's tracking calls become events."""
+
+    def page(self, before="", after="", **spec):
+        out = subprocess.run(["node", str(ROOT / "tests" / "client_harness.js"),
+                              json.dumps({"before": before, "after": after, **spec})],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    @staticmethod
+    def events(out):
+        return [(i["n"], i["props"]) for i in out["items"] if i["t"] == "ev"]
+
+    def test_gtag_and_the_data_layer(self):
+        out = self.page(
+            before="""window.dataLayer = window.dataLayer || [];
+                      function gtag() { dataLayer.push(arguments); }
+                      gtag('js', new Date()); gtag('config', 'G-TEST');
+                      gtag('event', 'sign_up', { method: 'google', items: [{ id: 1 }],
+                                                 event_callback: function () { log.push('sent'); } });""",
+            after="""gtag('event', 'purchase', { value: 9.5, currency: 'USD', send_to: 'G-TEST' });
+                     gtag('event', 'page_view', { page_path: '/start' });
+                     gtag('event', 'page_view', { page_location: 'https://a.example/checkout?step=2' });
+                     dataLayer.push({ event: 'gtm.click' }, { event: 'newsletter', list: 'weekly' });
+                     dataLayer.push(['event', 'not_gtag']);
+                     gtag('event', '¡Add to cart!');""")
+        self.assertEqual(self.events(out), [
+            ("sign_up", {"method": "google", "items": '[{"id":1}]'}),
+            ("purchase", {"value": 9.5, "currency": "USD"}),
+            ("newsletter", {"list": "weekly"}),
+            ("Add to cart", {}),
+        ])
+        self.assertEqual([i["p"] for i in out["items"] if i["t"] == "pv"], ["/start", "/checkout"])
+        self.assertEqual(out["log"], ["sent"])
+        # And the collector takes every one of them.
+        call = Client(make())
+        self.assertEqual(call("POST", "/_c/i", {"items": out["items"]}).status, 204)
+        call.sign_in()
+        report = body(call("GET", "/_c/api/report", query={"site": "a.example", "days": "1"}))
+        self.assertEqual({e["name"] for e in report["top"]["events"]},
+                         {"sign_up", "purchase", "newsletter", "Add to cart"})
+
+    def test_analytics_js(self):
+        out = self.page(
+            before="""window.ga = window.ga || function () { (ga.q = ga.q || []).push(arguments); }; ga.l = +new Date;
+                      ga('create', 'UA-1-1', 'auto'); ga('send', 'pageview');
+                      ga('send', 'event', 'Videos', 'play', 'intro', 3);""",
+            after="""ga('send', { hitType: 'event', eventCategory: 'Outbound', eventAction: 'click',
+                                  eventLabel: 'https://x.example', hitCallback: function () { log.push('hit'); } });
+                     ga('t2.send', 'event', 'Q&A', 'open/close', { nonInteraction: true });
+                     ga('set', 'page', '/virtual'); ga('send', 'pageview');
+                     ga('require', 'ec'); ga('ec:addProduct', { id: 'p1' });""",
+            probe="ga.q.length")
+        self.assertEqual(self.events(out), [
+            ("play", {"event_category": "Videos", "event_label": "intro", "value": 3}),
+            ("click", {"event_category": "Outbound", "event_label": "https://x.example"}),
+            ("open_close", {"event_category": "Q&A", "non_interaction": True}),
+        ])
+        self.assertEqual([i["p"] for i in out["items"] if i["t"] == "pv"], ["/start", "/virtual"])
+        self.assertEqual(out["log"], ["hit"])
+        self.assertEqual(out["probe"], 9)   # every call still queued for analytics.js, should it load
+
+    def test_ga_js_async_queue(self):
+        out = self.page(
+            before="""var _gaq = _gaq || [];
+                      _gaq.push(['_setAccount', 'UA-1-1'], ['_trackPageview']);
+                      _gaq.push(['_trackEvent', 'Signup', 'submit', 'footer']);""",
+            after="""_gaq.push(['_set', 'hitCallback', function () { log.push('gaq'); }],
+                               ['b._trackEvent', 'Video', 'pause', undefined, 7, true]);
+                     _gaq.push(['_trackEvent', 'Video']);
+                     _gaq.push(function () { log.push('ga.js only'); });""")
+        self.assertEqual(self.events(out), [
+            ("submit", {"event_category": "Signup", "event_label": "footer"}),
+            ("pause", {"event_category": "Video", "value": 7, "non_interaction": True}),
+        ])
+        self.assertEqual(out["log"], ["gaq"])
+
+    def test_google_runs_its_own_callbacks(self):
+        out = self.page(
+            before="window.google_tag_manager = {}; window.dataLayer = []; function gtag() { dataLayer.push(arguments); }",
+            after="""gtag('event', 'x', { event_callback: function () { log.push('once'); } });
+                     var cb = dataLayer[dataLayer.length - 1][2].event_callback; cb(); cb();""")
+        self.assertEqual(self.events(out), [("x", {})])
+        self.assertEqual(out["log"], ["once"])
+
+    def test_off_and_opted_out(self):
+        out = self.page(dataset={"google": "off"},
+                        before="window.dataLayer = []; function gtag() { dataLayer.push(arguments); }",
+                        after="gtag('event', 'x', {});", probe="typeof window.ga + ' ' + typeof window._gaq")
+        self.assertEqual((self.events(out), out["probe"]), ([], "undefined undefined"))
+        # Do Not Track: nothing is sent, but the page's callback still runs (it may navigate).
+        out = self.page(dnt=True, after="gtag('event', 'x', { event_callback: function () { log.push('go'); } });")
+        self.assertEqual((out["items"], out["log"]), ([], ["go"]))
+
+    def test_user_id_identifies_a_consented_visitor(self):
+        out = self.page(cookies={"consent": "all"},
+                        after="gtag('config', 'G-TEST', { user_id: 'user-9' }); gtag('event', 'x');")
+        self.assertEqual(out["envelopes"][-1]["uid"], "user-9")
+        out = self.page(after="gtag('config', 'G-TEST', { user_id: 'user-9' }); gtag('event', 'x');")
+        self.assertNotIn("uid", out["envelopes"][-1])
 
 
 @unittest.skipUnless(os.environ.get("GEO_MMDB"), "set GEO_MMDB to test against a real database")

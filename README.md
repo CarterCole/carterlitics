@@ -11,11 +11,15 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
 - **Client side, one script.** `/_c/c.js` counts page views (SPA navigations too),
   engaged time, unique visitors (cookieless, a daily-salted hash), custom events
   (`cl("track", …)`, awaitable), and JavaScript errors: uncaught, unhandled rejections,
-  failed resources, CSP violations, grouped by bug.
+  failed resources, CSP violations, grouped by bug. Google Analytics calls (`gtag()`,
+  `dataLayer.push()`, `ga()`, `_gaq.push()`) are understood too, so a page written for
+  Google works unchanged.
 - **With consent, more.** A visitor cookie, a session, a device fingerprint, the IP and
   user agent per page view, and an rrweb session recording you can replay.
+- **Funnels.** Steps in order (pages, events, a backend's events), counted over consented
+  sessions or visitors, with drop-off per step and replays of the sessions that stopped.
 - **One console** at `/_c/admin/`: overview, traffic, bots, visitors and sessions,
-  events, errors, replays, for every site.
+  events, funnels, errors, replays, for every site.
 
 Stdlib Python on Lambda (no dependencies beyond the runtime's boto3), one DynamoDB table,
 two S3 buckets. No build step for the browser side.
@@ -30,14 +34,14 @@ carterlitics/        the collector (a Python package; Lambda handler carterlitic
   auth.py            console sign-in: OpenID Connect + PKCE, admins only; server keys
   config.py          sites, retention, secrets
   backends.py        DynamoDB and S3, and in-memory twins for tests and dev
-  dev.py, demo.py    the local server, and 30 days of fake traffic for it
+  dev.py, demo.py    the local server, and 30 days of fake traffic (and funnels) for it
   static/
     c.js             the client
     console.*        the console; replay.* the player page
     vendor/          rrweb 2.2.0 recorder and player (MIT)
 carterlitics.toml    the sites, retention, sign-in, and [aws] names
 infra/deploy.py      provision, ship, route, enable logging (AWS CLI, idempotent)
-tests/               python3 -m unittest discover tests
+tests/               python3 -m unittest discover tests (client_harness.js: c.js under node)
 ```
 
 ## How it fits together
@@ -121,7 +125,9 @@ flagged "datacenter" rather than called a bot, since it may be a VPN.
 
 Script options (attributes on the tag): `data-mode="consent"` (default) · `"full"`
 (identify without asking: an internal tool) · `"anonymous"` (never identify, no
-banner); `data-record="off"`; `data-errors="off"`; `data-exclude="/admin,/auth"`.
+banner); `data-record="off"`; `data-errors="off"`; `data-exclude="/admin,/auth"`;
+`data-google="off"` (ignore Google Analytics calls); `data-datalayer="name"` (gtag.js or
+GTM was given another name for its queue).
 
 ### From JavaScript
 
@@ -138,6 +144,79 @@ cl("consent", "all");                                    // what the banner's bu
 cl("identify", "user-123");                              // tie a consented visitor to your user id
 carterlitics.flush();                                    // send what's queued now
 ```
+
+### Google Analytics calls
+
+A page written for Google Analytics needs no changes: c.js hears Google's calls, whether
+or not Google's own script is still on the page, and Google (if it is) sees them too.
+Each event becomes a carterlitics event named the way GA4 names it, the action, with the
+older category, label and value as GA4's `event_category`, `event_label` and `value`:
+
+```js
+gtag("event", "sign_up", { method: "google" });            // gtag.js (GA4)
+dataLayer.push({ event: "sign_up", method: "google" });     // Tag Manager; gtm.* events are skipped
+ga("send", "event", "Videos", "play", "intro", 3);          // analytics.js -> play {event_category, event_label, value}
+_gaq.push(["_trackEvent", "Videos", "play", "intro", 3]);   // ga.js, the "asynchronous" snippet: the same
+```
+
+- **Page views.** `gtag("event", "page_view", { page_path })`, `ga("send", "pageview", path)`
+  and `_gaq.push(["_trackPageview", path])` count one, unless it's the page already
+  counted (c.js counts every page and `pushState` itself, so a bare `page_view` adds nothing).
+- **User ids.** A `user_id` given to `gtag("config" | "set", …)` or a `userId` to
+  `ga("create" | "set", …)` is `cl("identify", …)`: it applies only after consent.
+- **Calls made before c.js loads** are read from Google's own queues (`dataLayer`, `ga.q`,
+  `_gaq`), so Google's snippet doubles as the stub. Without it, c.js defines `gtag()`,
+  `ga()` and `_gaq` itself; `data-google="off"` stops all of this.
+- **Callbacks.** `event_callback`, `eventCallback` and `hitCallback` (often a navigation)
+  run once the event is sent, or after `event_timeout` (2 s by default), when Google's
+  script for that API isn't on the page. When it is, Google runs them. Never twice.
+- **Names.** Event names are letters, digits, `_ . : -` and spaces, up to 64 characters;
+  anything else becomes `_` inside a name and is dropped at its ends (`open/close` ->
+  `open_close`). Object and array parameters (GA4's `items`) are kept as JSON text.
+- **Not carried over:** Google's own automatic events (enhanced measurement, scrolls,
+  outbound clicks), `config` page views (c.js counts its own), consent mode, ecommerce
+  plugin calls (`ga("ec:…")`), and functions pushed onto `_gaq` or `ga()`.
+
+### Funnels
+
+A funnel is steps in order. Each site lists its own in `carterlitics.toml`, under the
+site's `[[site]]` table:
+
+```toml
+[[site.funnel]]
+name = "Sign-up"
+by = "session"            # or "visitor": across sessions, by the visitor cookie
+steps = ["/", "/pricing", "event:begin_checkout", "event:sign_up?plan=pro"]
+```
+
+| Step | Matches |
+|---|---|
+| `/pricing` | a page view of `/pricing` (`/pricing/` and `/pricing.html` count as it) |
+| `/blog/*` | a page view of anything under `/blog/`; `*` matches anything, `/` included |
+| `event:sign_up` | an event of that name, from the page or from the site's backend; `*` works here too |
+| `event:sign_up?plan=pro&trial=true` | ... whose properties have these values |
+
+A new or changed funnel goes live with `infra/deploy.py provision`, which hands the
+Lambda its configuration (`code` ships only the code).
+
+The Funnels tab shows, for each, how many sessions (or visitors) reached each step, the
+share that went on, the median time between steps, and links to replay recent sessions
+that stopped at a step. Below them, *Try a funnel* counts any steps you type, without a
+deploy; the URL keeps them, so a link shares one.
+
+How a journey is matched: the first page view or event that matches step 1, then the
+first one after it that matches step 2, and so on; whatever else happens in between
+doesn't matter. Items in one batch from c.js keep the order they happened in.
+
+- **Consented visitors only.** Funnels are read from the page-view and event logs, and
+  only a consented visit carries a session there. An anonymous page view isn't logged one
+  by one at all, and an anonymous event has nothing to tie it to the page before it. On
+  a site in `anonymous` mode, funnels stay empty.
+- **Backend events join by user id.** An event POSTed to `/_c/server/events` with a `uid`
+  joins the latest session (or visitor) that had sent that user id (`cl("identify")`)
+  and had begun by then.
+- **Cost.** Opening the tab reads that site's page-view and event logs for the range (up
+  to 90 days, two queries per day) and counts in the Lambda; nothing is precomputed.
 
 Events and errors are batched for a second, then sent with `fetch(keepalive)`, or
 `sendBeacon` when the page is going away.
@@ -166,7 +245,8 @@ sites' own files. Visitor-supplied strings reach the page only through `textCont
 
 ```bash
 python3 -m carterlitics.dev --demo         # http://127.0.0.1:8795/_c/admin/, 30 days of fake data
-python3 -m unittest discover tests         # GEO_MMDB=path/to/file.mmdb also tests the geo reader
+python3 -m unittest discover tests         # GEO_MMDB=path/to/file.mmdb also tests the geo reader;
+                                           # with node on PATH, c.js runs in a stub page too
 ```
 
 The dev server keeps everything in memory, signs you straight in as an administrator,

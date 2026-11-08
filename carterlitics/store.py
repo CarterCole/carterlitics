@@ -31,11 +31,13 @@ import hashlib
 import json
 import re
 import secrets
+import statistics
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 from . import classify
 from .classify import Bot, clean_path, text, valid_id, valid_name
@@ -63,9 +65,12 @@ def days_back(days: int, today: datetime | None = None) -> list[str]:
     return [day_of(today - timedelta(days=d)) for d in range(days - 1, -1, -1)]
 
 
-def stamp(at: datetime) -> str:
-    """A sort key that sorts by time, unique enough to never collide."""
-    return f"{at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23]}Z#{secrets.token_hex(3)}"
+def stamp(at: datetime, seq: int | None = None) -> str:
+    """A sort key that sorts by time, unique enough to never collide. `seq` keeps the
+    items of one batch in the order they happened, though they share a millisecond:
+    a page view, then the click on it, is the order a funnel needs."""
+    order = f"{seq:02d}" if seq is not None else ""
+    return f"{at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23]}Z#{order}{secrets.token_hex(3)}"
 
 
 def iso(at: datetime) -> str:
@@ -265,7 +270,7 @@ class Store:
                     "ua": text(ua), "country": geo.country, "asn": geo.asn, "network": geo.network,
                     "city": geo.city}
 
-        for item in items[:MAX_ITEMS]:
+        for seq, item in enumerate(items[:MAX_ITEMS]):
             if not isinstance(item, dict):
                 continue
             kind = item.get("t")
@@ -287,7 +292,7 @@ class Store:
                     viewed = True
                 stored += 1
                 if consented:
-                    logs.append({"pk": log_pk(site.id, day, "pv"), "sk": stamp(at), "path": path,
+                    logs.append({"pk": log_pk(site.id, day, "pv"), "sk": stamp(at, seq), "path": path,
                                  "ref": text(item.get("r"), 300), "browser": browser, "os": system,
                                  "device": device, **who(), "expires": self.keep("visits")})
                     session["pages"] += 1
@@ -321,7 +326,7 @@ class Store:
                     blob = json.dumps({"_truncated": True})
                 counts[(W, "ev")] += 1
                 counts[(W, f"ev#{name}")] += 1
-                logs.append({"pk": log_pk(site.id, day, "ev"), "sk": stamp(at), "name": name,
+                logs.append({"pk": log_pk(site.id, day, "ev"), "sk": stamp(at, seq), "name": name,
                              "props": blob, "path": path or "", "browser": browser,
                              "country": geo.country, "source": "browser", **who(),
                              "expires": self.keep("events")})
@@ -341,9 +346,9 @@ class Store:
                               "country": geo.country, **who()}
                 if not consented:
                     occurrence["ua"] = text(ua)  # diagnostics need it; no identifier goes with it
-                logs.append({"pk": occurrences_pk(site.id, gid), "sk": stamp(at), **occurrence,
+                logs.append({"pk": occurrences_pk(site.id, gid), "sk": stamp(at, seq), **occurrence,
                              "expires": self.keep("errors")})
-                logs.append({"pk": log_pk(site.id, day, "err"), "sk": stamp(at), "gid": gid,
+                logs.append({"pk": log_pk(site.id, day, "err"), "sk": stamp(at, seq), "gid": gid,
                              **occurrence, "expires": self.keep("errors")})
                 groups.append((gid, {**err, "path": path or ""}))
                 session["errors"] += 1
@@ -398,7 +403,7 @@ class Store:
         day = day_of(at)
         counts: Counter = Counter()
         logs = []
-        for e in events[:MAX_ITEMS]:
+        for seq, e in enumerate(events[:MAX_ITEMS]):
             if not isinstance(e, dict) or not valid_name(e.get("name")):
                 continue
             props = e.get("props") if isinstance(e.get("props"), dict) else {}
@@ -407,7 +412,7 @@ class Store:
             geo = self.locate(ip)
             counts[(web(site.id, day), "ev")] += 1
             counts[(web(site.id, day), f"ev#{e['name']}")] += 1
-            logs.append({"pk": log_pk(site.id, day, "ev"), "sk": stamp(at), "name": e["name"],
+            logs.append({"pk": log_pk(site.id, day, "ev"), "sk": stamp(at, seq), "name": e["name"],
                          "props": blob if len(blob) <= MAX_PROPS else '{"_truncated":true}',
                          "path": clean_path(e.get("path")) or "", "source": "server",
                          "uid": text(e.get("uid"), 120), "ip": ip or "", "ua": ua,
@@ -612,6 +617,120 @@ class Store:
         return {"group": {**public(group), "id": gid},
                 "occurrences": [public(i) for i in
                                 self.table.query(occurrences_pk(site.id, gid), newest_first=True, limit=limit)]}
+
+    # -- funnels
+
+    def funnels(self, site, funnels, days: int) -> dict:
+        """Each funnel over the last `days` days, from the page-view and event logs.
+
+        Only consented visitors carry a session there, so only they are counted: an
+        anonymous page view isn't logged at all, and an anonymous event has nothing to
+        tie it to the page before it. An event from the site's backend joins the
+        latest session (or visitor) that the same user id had begun before it."""
+        out = {"days": days, "funnels": [], "sessions": 0, "visitors": 0}
+        hits: list[Hit] = []
+        if self.table and funnels:
+            kinds = sorted({"pv" if s.kind == "page" else "ev" for f in funnels for s in f.steps})
+            parts = [(d, k) for d in days_back(days) for k in kinds]
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                found = list(pool.map(lambda p: self.table.query(log_pk(site.id, p[0], p[1])), parts))
+            for (_, kind), items in zip(parts, found):
+                hits.extend(filter(None, (Hit.of(kind, i) for i in items)))
+            hits.sort(key=lambda h: h.sk)
+        out["sessions"] = len({h.sid for h in hits if h.sid})
+        out["visitors"] = len({h.vid for h in hits if h.vid})
+        out["funnels"] = [funnel_report(f, hits) for f in funnels]
+        return out
+
+
+# ---------------------------------------------------------------- funnels
+
+
+class Hit(NamedTuple):
+    """A page view or an event, as a funnel sees it."""
+    sk: str            # the log's sort key: time, then order within a batch
+    kind: str          # "page" or "event"
+    value: str         # the path, or the event's name
+    props: dict
+    sid: str
+    vid: str
+    uid: str
+
+    @property
+    def at(self) -> str:
+        return self.sk.split("#", 1)[0]
+
+    @classmethod
+    def of(cls, kind: str, item: dict) -> "Hit | None":
+        ids = (item.get("sid") or "", item.get("vid") or "", item.get("uid") or "")
+        if not any(ids):
+            return None   # anonymous: nothing ties it to anything else
+        if kind == "pv":
+            return cls(item["sk"], "page", item.get("path") or "", {}, *ids)
+        props = item.get("props")
+        try:
+            props = json.loads(props) if isinstance(props, str) else {}
+        except ValueError:
+            props = {}
+        return cls(item["sk"], "event", item.get("name") or "", props if isinstance(props, dict) else {}, *ids)
+
+
+def _seconds(a: str, b: str) -> float:
+    return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()
+
+
+def funnel_report(funnel, hits: list[Hit], sample: int = 8) -> dict:
+    """How many journeys (sessions, or visitors) reached each step of `funnel`, in order.
+
+    `hits` must be sorted by time. A journey's steps are matched greedily: the first
+    hit that matches step 1, then the first after it that matches step 2, and so on,
+    which finds the furthest step it reached. Other hits in between don't matter."""
+    by_session = funnel.by == "session"
+    journeys: dict[str, list[Hit]] = {}
+    users: dict[str, set[str]] = {}
+    backend: list[Hit] = []
+    for h in hits:
+        key = h.sid if by_session else h.vid
+        if key:
+            journeys.setdefault(key, []).append(h)
+            if h.uid:
+                users.setdefault(h.uid, set()).add(key)
+        elif h.uid:
+            backend.append(h)
+    for h in backend:
+        # The user's latest journey that had started by then.
+        started = [(journeys[k][0].sk, k) for k in users.get(h.uid, ()) if journeys[k][0].sk <= h.sk]
+        if started:
+            journeys[max(started)[1]].append(h)
+    n = len(funnel.steps)
+    reached = [0] * n
+    gaps: list[list[float]] = [[] for _ in range(n)]
+    stopped: list[list[tuple[str, str, str]]] = [[] for _ in range(n)]
+    for key, path in journeys.items():
+        path.sort(key=lambda h: h.sk)
+        times: list[str] = []
+        for h in path:
+            if funnel.steps[len(times)].matches(h.kind, h.value, h.props):
+                times.append(h.at)
+                if len(times) == n:
+                    break
+        if not times:
+            continue
+        for i in range(len(times)):
+            reached[i] += 1
+            if i:
+                gaps[i].append(_seconds(times[i - 1], times[i]))
+        if len(times) < n:
+            sid = key if by_session else next((h.sid for h in reversed(path) if h.sid), "")
+            stopped[len(times) - 1].append((path[-1].at, key, sid))
+    steps = []
+    for i, step in enumerate(funnel.steps):
+        recent = sorted(stopped[i], reverse=True)[:sample]
+        steps.append({"step": step.text, "kind": step.kind, "count": reached[i],
+                      "median_s": round(statistics.median(gaps[i]), 1) if gaps[i] else None,
+                      "dropped": [{"at": at, "key": key, "sid": sid} for at, key, sid in recent]})
+    return {"name": funnel.name, "by": funnel.by, "steps": steps, "entered": reached[0],
+            "completed": reached[-1], "journeys": len(journeys)}
 
 
 def public(item: dict) -> dict:

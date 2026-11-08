@@ -3,12 +3,15 @@ every part of the console without deploying anything. Deterministic, so screensh
 compare. Everything goes through the real Store methods, with the clock moved back."""
 from __future__ import annotations
 
+import dataclasses
 import random
+import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from . import store as store_module
+from .config import Funnel
 from .store import LogLine, Meta
 
 PEOPLE = [
@@ -38,6 +41,14 @@ COUNTRIES = ["US", "US", "US", "GB", "DE", "CA", "FR", "NL", "IN", "JP", "AU", "
 NETWORKS = [("7922", "Comcast Cable Communications, LLC"), ("701", "Verizon Business"),
             ("2856", "British Telecommunications PLC"), ("3320", "Deutsche Telekom AG"),
             ("16509", "Amazon.com, Inc.")]
+# For sites with no funnels of their own. Some consented visitors walk the first one,
+# dropping off along the way; `email_confirmed` comes from the site's backend.
+FUNNELS = {
+    "cartercole.com": [{"name": "Reader to sign-up",
+                        "steps": ["/", "/blog", "/blog/*", "event:sign_up", "event:email_confirmed"]}],
+    "cartercole.net": [{"name": "Project to source", "steps": ["/", "/rollopolis", "event:outbound?target=github.com"]}],
+}
+GO_ON = (0.74, 0.55, 0.42, 0.8, 0.8)   # the share of a step's visitors who take the next one
 ERRORS = [
     ("error", "TypeError", "Cannot read properties of undefined (reading 'width')",
      "TypeError: Cannot read properties of undefined (reading 'width')\n    at layout (https://{host}/app-3f9a1c2e.js:112:18)\n    at render (https://{host}/app-3f9a1c2e.js:80:5)"),
@@ -45,6 +56,13 @@ ERRORS = [
      "Error: Failed to fetch\n    at load (https://{host}/modal-77ab12cd.js:41:11)"),
     ("resource", "", "Failed to load <img> https://{host}/img/rollopolis/title-1440.webp", ""),
 ]
+
+
+def configure(cfg):
+    """The config with the demo's funnels on the sites that have none."""
+    sites = {k: dataclasses.replace(s, funnels=tuple(Funnel.parse(f, k) for f in FUNNELS[k]))
+             if k in FUNNELS and not s.funnels else s for k, s in cfg.sites.items()}
+    return dataclasses.replace(cfg, sites=sites)
 
 
 def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
@@ -78,7 +96,12 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                            "fp": f"{rng.getrandbits(128):032x}"} if consent else {}
                     ref = rng.choice(REFERRERS)
                     width = rng.choice([390, 414, 820, 1280, 1440, 1728])
-                    for n in range(rng.choice([1, 1, 1, 2, 3, 5])):
+                    walks = consent and bool(site.funnels) and rng.random() < 0.55
+                    if walks:
+                        for when, path in _journey(store, site, rng, at, now, ids, meta, width, ref):
+                            lines.append(LogLine(when, site.host, ip, "GET", path, "", 200, ref or "", ua,
+                                                 edge="Hit", seconds=0.004))
+                    for n in range(0 if walks else rng.choice([1, 1, 1, 2, 3, 5])):
                         path = rng.choice(paths)
                         items = [{"t": "pv", "p": path, "r": ref if n == 0 else f"{site.url}/",
                                   **({"new": True} if n == 0 and consent else {})},
@@ -105,6 +128,41 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                 lines.append(LogLine(at, site.host, net.format(rng.randrange(1, 250)), "GET", path, "",
                                      404 if path in PROBES else 200, "", ua, edge="Miss" if path in PROBES else "Hit"))
             store.ingest_log(lines)
+
+
+def _journey(store, site, rng, at, now, ids, meta, width, ref) -> list[tuple[datetime, str]]:
+    """One consented visit along the site's first funnel, as far as it gets. Returns
+    the pages it requested, for the CloudFront log."""
+    steps = [s.text for s in site.funnels[0].steps]
+    taken = steps[:1]
+    for step, go in zip(steps[1:], GO_ON):
+        if rng.random() >= go:
+            break
+        taken.append(step)
+    gaps = [rng.randrange(8, 240) for _ in taken]
+    start = min(at, now - timedelta(seconds=sum(gaps) + 60))
+    uid, path, pages = f"user-{rng.getrandbits(32):08x}", "/", []
+    for k, step in enumerate(taken):
+        when = start + timedelta(seconds=sum(gaps[:k + 1]))
+        with mock.patch.object(store_module, "now", lambda when=when: when):
+            if step.startswith("event:"):
+                name, _, query = step[len("event:"):].partition("?")
+                props = dict(urllib.parse.parse_qsl(query)) or {"method": rng.choice(["email", "google"])}
+                if name == "email_confirmed":
+                    store.server_events(site, [{"name": name, "uid": uid, "ip": meta.ip, "ua": meta.user_agent,
+                                                "path": "/auth/confirm"}], meta)
+                else:
+                    # Signing up identifies the visitor, so the backend's event can join the session.
+                    who = {"uid": uid} if name == "sign_up" else {}
+                    store.ingest(site, {"w": width, **ids, **who,
+                                        "items": [{"t": "ev", "n": name, "props": props, "p": path}]}, meta)
+            else:
+                path = step.replace("*", rng.choice(["hello-world", "relay-ssr", "notes-on-sqlite"]))
+                store.ingest(site, {"w": width, **ids, "items": [
+                    {"t": "pv", "p": path, "r": ref if k == 0 else f"{site.url}/", **({"new": True} if k == 0 else {})},
+                    {"t": "leave", "p": path, "ms": gaps[k] * 1000}]}, meta)
+                pages.append((when, path))
+    return pages
 
 
 def _recording(at: datetime, site) -> list:
