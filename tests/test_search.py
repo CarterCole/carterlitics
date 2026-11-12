@@ -173,6 +173,16 @@ class Report(unittest.TestCase):
             self.sc.report(SITES["blog.a.example"], 7, now=NOW)
         self.assertGreater(len(self.fake.calls), n)
 
+    def test_no_access_yet_isnt_kept(self):
+        """Access given in Search Console shows on the next look, not once a cache runs out."""
+        granted, self.fake.properties = self.fake.properties, {}
+        r = self.sc.report(SITES["blog.a.example"], 7, now=NOW)
+        self.assertEqual((r["properties"], r["sources"], r["totals"]), ([], [], None))
+        self.fake.properties = granted
+        r = self.sc.report(SITES["blog.a.example"], 7, now=NOW)
+        self.assertEqual([s["property"] for s in r["sources"]], ["sc-domain:a.example", "sc-domain:b.example"])
+        self.assertEqual(r["totals"]["clicks"], 4)
+
     def test_no_property(self):
         r = self.sc.report(SITES["c.example"], 7, now=NOW)
         self.assertEqual((r["sources"], r["totals"], r["hosts"]), ([], None, ["c.example"]))

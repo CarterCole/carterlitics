@@ -286,7 +286,8 @@ class SearchConsole:
     # -- what the account can see
 
     def properties(self) -> list[dict]:
-        """Every property the account can read: [{site_url, permission}], newest list."""
+        """Every property the account can read: [{site_url, permission}], newest list.
+        None isn't kept, so access just given in Search Console shows at once."""
         at, props = self._properties
         if time.time() - at < PROPERTIES_TTL and at:
             return props
@@ -294,7 +295,8 @@ class SearchConsole:
         props = sorted(({"site_url": e["siteUrl"], "permission": e.get("permissionLevel", "")}
                         for e in got.get("siteEntry", []) if e.get("permissionLevel") != "siteUnverifiedUser"),
                        key=lambda p: p["site_url"])
-        self._properties = (time.time(), props)
+        if props:
+            self._properties = (time.time(), props)
         return props
 
     def _query(self, prop: str, body: dict) -> list[dict]:
@@ -324,8 +326,9 @@ class SearchConsole:
         if cached is not None and time.time() - at < REPORT_TTL:
             return cached
         found = self._report(site, days, now)
-        with self._lock:
-            self._reports[key] = (time.time(), found)
+        if found["sources"]:  # a site with no property yet may have one on the next look
+            with self._lock:
+                self._reports[key] = (time.time(), found)
         return found
 
     def _report(self, site, days: int, now: datetime | None) -> dict:

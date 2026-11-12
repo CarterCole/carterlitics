@@ -1216,9 +1216,12 @@ def check_function() -> None:
     aws("lambda", "invoke", "--function-name", FUNCTION, "--cli-binary-format", "raw-in-base64-out",
         "--payload", json.dumps({"task": "search-console"}), str(out))
     got = json.loads(out.read_text() or "{}")
-    if got.get("ok"):
+    if got.get("ok") and got["properties"]:
         log("function", f"{FUNCTION} signs in as {got['account']} and reads " +
             ", ".join(p["site_url"] for p in got["properties"]))
+    elif got.get("ok"):
+        log("function", f"{FUNCTION} signs in as {got['account']} but reads no properties: "
+            "give it access to each one (README: Search Console)")
     else:
         raise Fail(f"{FUNCTION} can't read Search Console: {got.get('error') or got.get('errorMessage') or got}")
 
