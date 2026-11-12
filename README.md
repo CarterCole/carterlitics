@@ -12,8 +12,10 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   A request that says it's Googlebot (or Bingbot, GPTBot, Applebot, …) is checked
   against the crawler's published ranges and forward-confirmed DNS, so fakes show up.
 - **Client side, one script.** `/_c/c.js` counts page views (SPA navigations too),
-  engaged time, unique visitors (cookieless, a daily-salted hash), custom events
-  (`cl("track", …)`, awaitable), and JavaScript errors: uncaught, unhandled rejections,
+  engaged time, unique visitors and visits (cookieless, a daily-salted hash), with bounce
+  rates, landing and exit pages, where visits came from (sources, channels and UTM
+  campaigns), custom events (`cl("track", …)`, awaitable), and
+  JavaScript errors: uncaught, unhandled rejections,
   failed resources, CSP violations, grouped by bug. Google Analytics calls (`gtag()`,
   `dataLayer.push()`, `ga()`, `_gaq.push()`) are understood too, so a page written for
   Google works unchanged.
@@ -21,7 +23,10 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   user agent per page view, and an rrweb session recording you can replay.
 - **Funnels.** Steps in order (pages, events, a backend's events), counted over consented
   sessions or visitors, with drop-off per step and replays of the sessions that stopped.
-- **One console** at `/_c/admin/`: overview, traffic, bots, visitors and sessions,
+- **Google Search.** Clicks, impressions, CTR and position from Search Console, by day,
+  query, page, country and device, with sitemaps, for each site's own hosts. A Google
+  service account reads it, and the collector reaches that account with no stored key.
+- **One console** at `/_c/admin/`: overview, traffic, search, bots, visitors and sessions,
   events, funnels, errors, replays, for every site. Click any address for everything
   known about it, its registry record (RDAP) included.
 
@@ -32,10 +37,11 @@ two S3 buckets. No build step for the browser side.
 carterlitics/        the collector (a Python package; Lambda handler carterlitics.app.lambda_handler)
   app.py             routes: beacons, static files, the console and its API, S3 log events
   store.py           every read and write, and the key layout (see its docstring)
-  classify.py        bots, browsers, page paths, referrers, datacenter networks
+  classify.py        bots, browsers, page paths, referrers and sources, datacenter networks
   logs.py            CloudFront access logs (v2 JSON or W3C) -> records
   geo.py             a pure-Python .mmdb reader: IPinfo Lite, GeoLite2 Country/City/ASN
   intel.py           what an address is: reverse DNS, published ranges, crawler checks, RDAP
+  google.py          Search Console, as a service account: AWS -> Google federation, the reports
   auth.py            console sign-in: OpenID Connect + PKCE, admins only; server keys
   config.py          sites, retention, secrets
   backends.py        DynamoDB and S3, and in-memory twins for tests and dev
@@ -76,11 +82,12 @@ country and ASN, and blockers that target third-party analytics hosts don't appl
 | | When | What | Kept |
 |---|---|---|---|
 | Server requests | always | IP, user agent, method, path, query, status, referrer, country, network, reverse DNS name, kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
-| Page counters | always, unless DNT/GPC | daily counts per page, referrer, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; bots that run JS are counted apart | 400 days |
+| Page counters | always, unless DNT/GPC | daily counts per page, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; bots that run JS are counted apart | 400 days |
 | Unique visitors | always, unless DNT/GPC | `sha256(daily salt, site, IP, UA)`; the salt is random and deleted after 2 days, so hashes can't be reversed afterwards | 400 days (as a count) |
+| Visits | always, unless DNT/GPC | daily counts of visits, bounces, landing and exit pages, and where visits came from: source, channel, campaign. The visit in progress is one item per visitor hash: when it was last seen, how many page views and events, its first and latest page, its source; no address or user agent (`v\|<site>\|<hash>`) | 400 days (as counts); the item a day |
 | Events | always, unless DNT/GPC | name, properties (≤ 2 KB), page | 180 days |
 | Errors | always | message, type, stack, source, page, user agent; no identifier unless consented | 90 days |
-| Visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view | 400 days |
+| Consented visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view | 400 days |
 | Address names | with the above | an address's reverse DNS name, as a cache (`ip\|<address>`) | 7 days |
 | Recordings | consent only | rrweb: DOM, mouse, scroll; inputs masked, `[data-private]` blocked, `[data-mask]` text masked | 30 days |
 
@@ -89,6 +96,63 @@ TTL or a bucket lifecycle rule. A site with `server_ip = "truncate"` keeps serve
 addresses at /24 (IPv4) and /48 (IPv6). Query strings in the request log have the values
 of credential-like parameters (`code`, `state`, `token`, signatures, …) replaced, since
 OAuth callbacks carry them.
+
+### Visits, bounces and exits
+
+A **visit** is one visitor's page views and events with no gap longer than 30 minutes.
+Visits are counted on the collector from the same daily hash as unique visitors, so they
+need no cookie and count everyone who isn't opted out, consented or not. Every tab of a
+browser is part of the same visit. A visit ends early at midnight UTC (the salt
+changes) and when the visitor's address does (a phone leaving Wi-Fi).
+
+- **Bounce rate**: the share of visits with one page view or event. An event counts as
+  the visitor doing something, so opening a modal or clicking a link out isn't a bounce;
+  an event with `non_interaction: true` (Google's flag, which c.js carries over) doesn't
+  count, nor does leaving the page. Per landing page too.
+- **Exit pages**: where each visit was last seen, and the **exit rate**, the share of a
+  page's views that were a visit's last. Rates use only the days visits were counted,
+  so the days before this was deployed don't pull them down.
+- **Pages per visit**: page views over visits, on the Overview's Visits tile.
+
+The counters are kept true as a visit goes on, rather than worked out afterwards: a visit
+counts as a bounce until its second page view or event, and as an exit from the last page
+it was seen on. A report is still a handful of queries.
+
+**Consented sessions** (the Visitors tab, recordings, funnels) are one tab's, kept in
+`sessionStorage`, and end the same way: after 30 minutes without a page view or event,
+the tab's next one starts a new session, and a running recording carries on under it from
+a fresh snapshot of the page. They are per tab rather than a cookie because each is one
+recording. Each session row shows the page it landed on, the page it left from, and where
+it came from.
+
+### Where visits came from
+
+A visit is counted by where it came from when it begins, from its first page view's
+referrer and the campaign tags on its address:
+
+- **Source**: the link's `utm_source` (or `ref`), otherwise the site it was on, grouped by
+  who that is: google.co.uk, images.google.com and the Google app are all *Google*,
+  mail.google.com is *Gmail*, t.co is *X*. A site `classify.SOURCES` doesn't know is its own
+  host, and no referrer is *Direct*. A `utm_source` that names a known source (`google`,
+  `hn`, `chatgpt.com`, which ChatGPT adds to its links) counts as that source.
+- **Channel**: the kind of source, Google Analytics' default grouping simplified, with AI
+  assistants apart: Search, Social, Email, AI assistants, Referral, Direct, and Paid search,
+  Paid social or Paid other when `utm_medium` says paid (`cpc`, `ppc`, `paid…`, `display`)
+  or the address carries an ad network's click id (`gclid`, `msclkid`, `twclid`, …;
+  `fbclid` is on every link Facebook opens, so it isn't one). For a source it doesn't
+  know, `utm_medium=email` or `social` decides.
+- **Campaign**: `utm_campaign`.
+
+```
+https://cartercole.com/posts/x?utm_source=newsletter&utm_medium=email&utm_campaign=november-notes
+```
+
+Tags are trimmed and lower-cased, so `Newsletter` and `newsletter` count once. c.js sends
+only these four tags and the name of a click id, never its value. Each source, channel and
+campaign has a bounce rate, on the Overview. A visit that restarts at midnight UTC or on a
+new address (above) counts as Direct, since its next page's referrer is the site itself.
+Visits are counted this way from the deploy that added it; when a range starts earlier, the
+cards say from when. The page-view referrer counts kept before then are no longer shown.
 
 ## The sites
 
@@ -176,7 +240,21 @@ Script options (attributes on the tag): `data-mode="consent"` (default) · `"ful
 (identify without asking: an internal tool) · `"anonymous"` (never identify, no
 banner); `data-record="off"`; `data-errors="off"`; `data-exclude="/admin,/auth"`;
 `data-google="off"` (ignore Google Analytics calls); `data-datalayer="name"` (gtag.js or
-GTM was given another name for its queue).
+GTM was given another name for its queue); `data-consent-version="2"` (see below).
+
+**When Accept comes to cover more**, raise `data-consent-version` (it starts at 1).
+Visitors who accepted under an earlier version see the banner again, and until they
+choose they're anonymous. Their visitor cookie is kept, so accepting again continues
+where they were. "Anonymous only" stands, since nothing changes for those visitors. The
+`consent` cookie records the version it was given under (`all.2`). cartercole.com is at
+2: Accept now also covers a signed-in visitor's account ID.
+
+Every consented record (session, page view, event, error) keeps the version it was
+accepted under (`cv`), so you can show which policy a visitor agreed to. Each version's
+policy should stay published. Set `consent_docs = "/privacy/v{version}"` on the site and
+the console's sessions link to it. cartercole.com keeps its versions in
+`frontend/src/lib/consent.ts`, which also supplies the banner's text and the script's
+`data-consent-version`, and publishes each at `/privacy/v<n>`.
 
 ### From JavaScript
 
@@ -187,12 +265,53 @@ GTM was given another name for its queue).
 
 ```js
 await cl("track", "download", { file: "mosaic.zip" });  // resolves once it's sent
+cl("track", "seen", { non_interaction: true });         // counted, but not as the visitor doing something
 cl("error", err, { where: "checkout" });                // a caught error, reported anyway
 cl("page");                                              // a page view by hand (pushState is automatic)
 cl("consent", "all");                                    // what the banner's buttons do
 cl("identify", "user-123");                              // tie a consented visitor to your user id
+cl("identify", null);                                    // signed out: forget it
+const who = await cl("who");                             // what the collector makes of this visitor
 carterlitics.flush();                                    // send what's queued now
 ```
+
+`cl("identify")` only applies to a visitor who accepted. An id given before that is
+kept in memory and used if they accept on that page. It lasts for the tab's session, so
+call it with `null` when they sign out. cartercole.com sends its `provider:id` account
+ID from `frontend/src/lib/account.ts`.
+
+### What the collector makes of a visitor
+
+The bot and connection checks the console shows are there for the page too, when it asks:
+
+```js
+cl("who", function (who) {   // works through the stub; once loaded, cl("who") is also a Promise
+  if (!who) return;          // the collector couldn't be reached
+  if (who.bot && who.bot.verified !== true) hideTheForm();   // a bot, or a crawler that isn't who it says
+  if (who.net === "tor" || who.listed || who.abuse.length) askForMore();
+});
+```
+
+```js
+{
+  bot: null,                 // or { name: "Googlebot", category: "search", verified: true },
+                             // verified: true / false (an impostor) / null (can't be checked)
+  net: "vpn",                // isp · hosting · vpn · relay (iCloud Private Relay) · tor · crawler
+  service: "Mullvad",        // the most specific name the lists give, or ""
+  listed: false,             // on Spamhaus DROP (then bot is "Spamhaus DROP" too)
+  abuse: [],                 // the attack lists that name the address: "blocklist.de", "DShield"
+  elsewhere: true,           // the browser's clock keeps another time than the address's (null: unknown)
+  country: "DE", asn: "39351", network: "31173 Services AB"
+}
+```
+
+It's `GET /_c/who`, sent only when the page asks and once per page load. Nothing is
+stored or counted, so it answers with Do Not Track too. The address and its reverse DNS
+name aren't in the answer. The address is only looked up in DNS when the user agent
+claims a crawler that its address alone can't prove (Yandex, Baidu, a Googlebot outside
+Google's published ranges). A bot that doesn't run JavaScript never asks, so this
+catches the ones that do: headless browsers (`navigator.webdriver`), crawlers that
+render pages, and scripts on hosting networks or proxies.
 
 ### Google Analytics calls
 
@@ -280,6 +399,55 @@ curl -X POST https://cartercole.com/_c/server/events \
 
 The key is derived per site from one secret, so a leaked key only speaks for its own site.
 
+## Search Console
+
+The Search tab shows what Google's search does for a site: clicks, impressions,
+click-through rate and average position per day, and the queries, pages, countries and
+devices behind them, with the sitemaps submitted for its hosts and when Google last read
+them. It comes from Search Console's API, asked when you open the tab and kept a quarter
+of an hour.
+
+- **One account reads it all.** A Google service account (`[google]` in
+  `carterlitics.toml`: carterlitics@carterlitics.iam.gserviceaccount.com) needs read access
+  to one *domain property* per domain, `sc-domain:cartercole.net` and
+  `sc-domain:cartercole.com`, and every site under them is covered.
+- **Each site is its own hosts.** A domain property counts every host under the domain,
+  so a site's numbers are filtered to its pages (`mosaic.cartercole.net` is mosaic's
+  alone, `cartercole.net` leaves the subdomains out). A site under two domains
+  (resume.cartercole.net and .com) adds both together. A catch-all (`*.cartercole.net`)
+  has no pages of its own, so it shows none. Google counts by page when filtered, so
+  these totals can be a little above the property's own in Search Console.
+- **No key.** On Lambda the collector signs in to Google as its own AWS role, through a
+  workload identity pool whose one provider admits only that role in this AWS account,
+  and then acts as the service account (`GOOGLE_AUDIENCE`). Nothing secret is stored. The
+  dev server acts as it through gcloud's application default credentials, which the
+  person who ran `search-console` may do; `--demo` makes its numbers up.
+- **Google is behind.** Its numbers arrive two or three days late and are counted in
+  Pacific time. The tab says what its newest day is.
+
+Setting it up, once (the Google steps run as gcloud's application default credentials,
+`gcloud auth application-default login`, with rights to create projects in the
+organization):
+
+```bash
+AWS_PROFILE=carter-admin infra/deploy.py search-console --dry-run   # what it would do
+AWS_PROFILE=carter-admin infra/deploy.py search-console    # project, account, pool, provider, who may act as it
+AWS_PROFILE=carter-admin infra/deploy.py provision         # hands the function GOOGLE_AUDIENCE and the account
+```
+
+Then give the account read access to each domain property, one of two ways:
+
+- **In Search Console** (no DNS change, read only): the property's *Settings > Users and
+  permissions > Add user*, the account's address, permission *Restricted*.
+- **Through DNS** (it becomes an owner): `infra/deploy.py search-console --verify-dns`
+  adds its `google-site-verification` value to the domain's apex TXT record in Route 53,
+  beside the values already there, verifies it, and adds the property to its Search
+  Console. Every domain a site is under, with a zone in this account, gets this.
+
+`search-console` ends by listing the properties the account reads and which property
+each site's numbers come from, and asks the function itself (`aws lambda invoke` with
+`{"task": "search-console"}`) whether it can sign in and read them.
+
 ## The console
 
 `https://cartercole.net/_c/admin/` (the `console` site; `/_c/admin/` on any other site
@@ -326,6 +494,7 @@ infra/deploy.py routes cartercole.net --drop '/api/*' '/auth/*'   # replaces the
 infra/deploy.py routes all                      # /_c/* on every site with client = true
 infra/deploy.py logging all                     # CloudFront access logs -> collector, every site
 infra/deploy.py grant-deploy                    # let CI and site-publisher run `code`
+infra/deploy.py search-console                  # Search Console's service account (README: Search Console)
 ```
 
 Then deploy each site (its `deploy.sh`) so its pages load `/_c/c.js`. After that,
@@ -365,6 +534,6 @@ now load `/_c/c.js`, and the code is gone from both repositories.
 
 ## Cost
 
-At personal-site traffic, all inside free tiers or cents: a page view is about ten
-DynamoDB writes on demand, a log file is one Lambda run, and a recording is an S3 PUT per
+At personal-site traffic, all inside free tiers or cents: a page view is about a dozen
+DynamoDB writes on demand (one or two of them move its visit on), a log file is one Lambda run, and a recording is an S3 PUT per
 5 seconds of activity, gzipped. The function is 512 MB, arm64.

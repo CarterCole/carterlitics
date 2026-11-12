@@ -7,7 +7,8 @@
 
    Only after the visitor accepts (the consent banner, or cl("consent", "all")): a
    visitor cookie, a session id, a device fingerprint, and a session recording (rrweb,
-   typed text masked, [data-private] blanked, [data-mask] text masked).
+   typed text masked, [data-private] blanked, [data-mask] text masked). A session is one
+   tab's, in sessionStorage, and ends after 30 minutes without a page view or event.
 
    Do Not Track and Global Privacy Control are a standing "no": nothing is identified
    or recorded, page views and events aren't sent, and the banner never shows. Error
@@ -15,6 +16,8 @@
 
    Options, as attributes on the script tag:
      data-mode="consent"   consent (default) · full (identify without asking) · anonymous
+     data-consent-version="2"      raise it when Accept comes to cover more: visitors who
+                           accepted an earlier version see the banner again
      data-record="off"     no session recording even with consent
      data-errors="off"     don't report errors
      data-exclude="/admin,/auth"   path prefixes to leave alone entirely
@@ -29,7 +32,16 @@
      cl("page")                                 // count a page view by hand
      cl("consent", "all" | "essential")         // what the banner buttons do
      cl("identify", "user-123")                 // tie a consented visitor to your user id
+     cl("identify", null)                       // signed out: forget it
+     cl("who", function (who) { … })            // what the collector makes of this visitor
      window.carterlitics.flush()                // send what's queued now
+
+   cl("who") asks the collector once a page and is a Promise once loaded; the callback
+   works through the stub too. It gets null if the collector can't be reached, else:
+     { bot: null | { name: "Googlebot", category: "search", verified: true | false | null },
+       net: "isp" | "hosting" | "vpn" | "relay" | "tor" | "crawler",
+       service: "Mullvad", listed: false, abuse: [], elsewhere: false,
+       country: "US", asn: "7922", network: "Comcast" }
 
    Google Analytics calls are understood too, so a page written for Google keeps
    working with or without Google's own script. Each of these becomes cl("track"),
@@ -63,6 +75,9 @@
   var ERRORS = opts.errors !== "off";
   var GOOGLE = opts.google !== "off";
   var LAYER = /^[A-Za-z_$][\w$]*$/.test(opts.datalayer || "") ? opts.datalayer : "dataLayer";
+  // What Accept means, by the site's privacy policy. Raised when it comes to cover more:
+  // visitors who accepted an earlier version are asked again. "Anonymous only" stands.
+  var CONSENT_VERSION = /^[1-9]\d{0,5}$/.test(opts.consentVersion || "") ? parseInt(opts.consentVersion, 10) : 1;
   var EXCLUDE = (opts.exclude || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean)
     .concat([BASE]);
 
@@ -74,11 +89,13 @@
   var MAX_ITEMS = 50;
   var MAX_ERRORS = 25;
   var MAX_CHUNKS = 400;
+  var IDLE = 30 * 60 * 1000;    // without a page view or event, a session ends (store.py's IDLE)
 
   var queue = [];
   var waiting = [];
   var timer = null;
   var ident = null;             // { vid, sid, sd, fp, uid, fresh } once consented
+  var wanted = null;            // the page's user id, given before consent: in memory only
   var current = null;           // the path being viewed
   var lastUrl = d.referrer || "";
   var visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
@@ -142,6 +159,8 @@
       e.sd = ident.sd;
       if (ident.fp) e.fp = ident.fp;
       if (ident.uid) e.uid = ident.uid;
+      var cv = accepted();
+      if (cv) e.cv = cv;
     }
     return e;
   }
@@ -168,8 +187,16 @@
   function enqueue(item) {
     if (!item.p) item.p = loc.pathname;
     queue.push(item);
-    if (!timer) timer = setTimeout(flush, 1000);
-    return new Promise(function (resolve) { waiting.push(resolve); });
+    var sent = new Promise(function (resolve) { waiting.push(resolve); });
+    if (item.new) {
+      // A session's first item makes its record (browser, device, referrer): send it before
+      // a recording chunk gets there and makes a bare one.
+      clearTimeout(timer);
+      timer = setTimeout(flush, 0);
+    } else if (!timer) {
+      timer = setTimeout(flush, 1000);
+    }
+    return sent;
   }
 
   /* ---------------------------------------------------------------- page views */
@@ -190,6 +217,25 @@
     engaged = 0;
   }
 
+  // Campaign tags on the address, for where a visit came from (classify.source_of), and
+  // which ad network's click id is there, if one is: its name only, never its value.
+  var TAGS = ["utm_source", "utm_medium", "utm_campaign", "ref"];
+  var CLICK_IDS = ["gclid", "gbraid", "wbraid", "msclkid", "fbclid", "igshid", "twclid", "ttclid", "li_fat_id",
+    "rdt_cid", "yclid"];
+
+  function tags() {
+    var params, out = null;
+    try { params = new URL(loc.href).searchParams; } catch (e) { return null; }
+    each(TAGS, function (k) {
+      var v = params.get(k);
+      if (v) (out = out || {})[k] = v.slice(0, 100);
+    });
+    each(CLICK_IDS, function (k) {
+      if (!(out && out.click) && params.has(k)) (out = out || {}).click = k;
+    });
+    return out;
+  }
+
   function page(path) {
     path = typeof path === "string" ? path : loc.pathname;
     if (path === current) return Promise.resolve();
@@ -199,12 +245,9 @@
     lastUrl = loc.href;
     visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
     if (!counting()) return Promise.resolve();
-    var item = { t: "pv", p: path, r: referrer || null };
-    if (ident && ident.fresh) {
-      item.new = true;
-      ident.fresh = false;
-    }
-    return enqueue(item);
+    var item = { t: "pv", p: path, r: referrer || null }, u = tags();
+    if (u) item.u = u;
+    return enqueue(interaction(item));
   }
 
   function watchNavigation() {
@@ -234,7 +277,9 @@
         else clean[k] = (typeof v === "object" ? safe(v) : String(v)).slice(0, 300);
       });
     }
-    return enqueue({ t: "ev", n: name.slice(0, 64), props: clean });
+    var item = { t: "ev", n: name.slice(0, 64), props: clean };
+    // Google's non_interaction: it happened, but the visitor didn't do it.
+    return enqueue(clean.non_interaction === true ? item : interaction(item));
   }
 
   /* ---------------------------------------------------------------- Google's tracking calls */
@@ -461,6 +506,29 @@
     try { return typeof value === "string" ? value : JSON.stringify(value); } catch (e) { return String(value); }
   }
 
+  /* ---------------------------------------------------------------- what the collector makes of this visitor */
+
+  var asked = null;
+
+  // A bot (and whether a crawler is the real one), the kind of connection (VPN, Tor,
+  // iCloud Private Relay, a datacenter), the lists that name the address. Asked only
+  // when the page wants it, once a page; nothing is stored or counted, so it works with
+  // Do Not Track too. null when the collector can't be reached, and asked again next time.
+  function who(callback) {
+    if (!asked) {
+      var query = [ZONE ? "tz=" + encodeURIComponent(ZONE) : "", nav.webdriver ? "wd=1" : ""].filter(Boolean).join("&");
+      asked = fetch(BASE + "/who" + (query ? "?" + query : ""), { credentials: "omit", cache: "no-store" }).then(function (res) {
+        if (!res.ok) throw new Error("who: " + res.status);
+        return res.json();
+      }).then(null, function () {
+        asked = null;
+        return null;
+      });
+    }
+    if (typeof callback === "function") asked.then(callback);
+    return asked;
+  }
+
   /* ---------------------------------------------------------------- identity (consent only) */
 
   function today() { return new Date().toISOString().slice(0, 10); }
@@ -495,22 +563,60 @@
     // Set again on every visit, so the 400-day clock keeps restarting.
     cookie("vid", vid, 60 * 60 * 24 * 400);
     var sid = session("cl_sid"), sd = session("cl_sd"), fresh = false;
-    if (!sid || !UUID.test(sid) || !/^\d{4}-\d{2}-\d{2}$/.test(sd || "")) {
+    if (!sid || !UUID.test(sid) || !/^\d{4}-\d{2}-\d{2}$/.test(sd || "") || idle()) {
       sid = crypto.randomUUID();
       sd = today();
       fresh = true;
       session("cl_sid", sid);
       session("cl_sd", sd);
       session("cl_seq", "0");
+      session("cl_at", String(Date.now()));
     }
-    ident = { vid: vid, sid: sid, sd: sd, fresh: fresh, uid: session("cl_uid") || "" };
+    var uid = wanted !== null ? wanted : session("cl_uid") || "";
+    session("cl_uid", uid || null);
+    ident = { vid: vid, sid: sid, sd: sd, fresh: fresh, uid: uid };
     if (crypto.subtle) fingerprint().then(function (fp) { ident && (ident.fp = fp); }, function () {});
     return true;
   }
 
+  // `cl_at` is the session's latest page view or event. None (a session from before
+  // sessions ended) counts as long ago.
+  function idle() {
+    var at = parseInt(session("cl_at"), 10);
+    return !(at > 0) || Date.now() - at > IDLE;
+  }
+
+  // A page view or an event, which keeps a session going; after IDLE without one, the
+  // tab starts another. The first item of a session says so (`new`).
+  function interaction(item) {
+    if (!ident) return item;
+    if (session("cl_at") !== null && idle()) rotate();
+    session("cl_at", String(Date.now()));
+    if (ident.fresh) {
+      item.new = true;
+      ident.fresh = false;
+    }
+    return item;
+  }
+
+  function rotate() {
+    flush();   // what's queued, and recorded, is the old session's
+    ship();
+    ident.sid = crypto.randomUUID();
+    ident.sd = today();
+    ident.fresh = true;
+    session("cl_sid", ident.sid);
+    session("cl_sd", ident.sd);
+    session("cl_seq", "0");
+    // The recording goes on under the new session, from a fresh snapshot of the page.
+    if (recorder && recorder.stop && w.rrweb && w.rrweb.record.takeFullSnapshot) {
+      try { w.rrweb.record.takeFullSnapshot(true); } catch (e) { /* the next page load starts one */ }
+    }
+  }
+
   function forget() {
     cookie("vid", "", 0);
-    ["cl_sid", "cl_sd", "cl_seq", "cl_uid"].forEach(function (k) { session(k, null); });
+    ["cl_sid", "cl_sd", "cl_seq", "cl_uid", "cl_at"].forEach(function (k) { session(k, null); });
     ident = null;
   }
 
@@ -579,9 +685,22 @@
 
   var banner = d.querySelector("[data-consent]");
 
+  // The cookie holds the choice and, past version 1, the version it was made under: "all.2".
+  function stored() {
+    var m = /^(all|essential)(?:\.(\d{1,6}))?$/.exec(cookie("consent") || "");
+    return m ? { value: m[1], version: m[2] ? parseInt(m[2], 10) : 1 } : null;
+  }
+
   function choice() {
-    var value = cookie("consent");
-    return value === "all" || value === "essential" ? value : null;
+    var got = stored();
+    if (!got || (got.value === "all" && got.version < CONSENT_VERSION)) return null;
+    return got.value;
+  }
+
+  // The version of the Accept the visitor gave, kept with what they send (0: none, as in full mode).
+  function accepted() {
+    var got = stored();
+    return got && got.value === "all" ? got.version : 0;
   }
 
   function apply(value) {
@@ -589,12 +708,7 @@
       // Consent given on this page: its view was already counted, so log it once more
       // for the session only (`dup`), then start recording.
       if (current !== null && counting()) {
-        var item = { t: "pv", p: current, r: d.referrer || null, dup: true };
-        if (ident.fresh) {
-          item.new = true;
-          ident.fresh = false;
-        }
-        enqueue(item);
+        enqueue(interaction({ t: "pv", p: current, r: d.referrer || null, dup: true }));
       }
       record();
     } else if (value !== "all") {
@@ -606,7 +720,7 @@
     if (value === undefined) return MODE === "full" ? "all" : choice();
     if (value !== "all" && value !== "essential") return choice();
     var wasRecording = Boolean(recorder);
-    cookie("consent", value, 60 * 60 * 24 * 365);
+    cookie("consent", CONSENT_VERSION > 1 ? value + "." + CONSENT_VERSION : value, 60 * 60 * 24 * 365);
     if (banner) banner.hidden = true;
     // A recorder that is already running can't be unloaded; a fresh page stops it.
     if (value === "essential" && wasRecording) {
@@ -645,12 +759,17 @@
     page: page,
     error: function (err, context) { return report("manual", err, { context: context }); },
     consent: consent,
+    // "" or null forgets it (signing out). Before consent it waits, in memory, and applies
+    // only if the visitor accepts on this page.
     identify: function (uid) {
-      if (!ident || typeof uid !== "string") return false;
-      ident.uid = uid.slice(0, 120);
-      session("cl_uid", ident.uid);
+      if (uid !== null && typeof uid !== "string") return false;
+      wanted = uid ? uid.slice(0, 120) : "";
+      if (!ident) return false;
+      ident.uid = wanted;
+      session("cl_uid", wanted || null);
       return true;
     },
+    who: who,
     flush: function () { return flush(false); }
   };
   w.carterlitics = api;

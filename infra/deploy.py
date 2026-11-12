@@ -11,6 +11,11 @@ on each site's CloudFront distribution.
     infra/deploy.py register-client [--force] an OIDC client at the issuer, for the console
     infra/deploy.py server-key SITE           the key SITE's backend sends to /_c/server/events
     infra/deploy.py grant-deploy [--dry-run]  let the CI role and publishing user run `code`
+    infra/deploy.py search-console [--dry-run] a Google service account that reads Search Console:
+                                              its project and AWS federation for the function;
+                                              which properties it reads, and which sites it can't
+          [--verify-dns]                      ...and make it a verified owner of each site's domain
+                                              through a TXT record in Route 53
     infra/deploy.py geo                       GeoLite2 City + ASN into geo/ (MAXMIND_ACCOUNT_ID and
                                               MAXMIND_LICENSE_KEY), or IPinfo Lite (IPINFO_TOKEN)
     infra/deploy.py intel                     published IP ranges -> geo/ranges.bin: crawlers, clouds,
@@ -25,6 +30,9 @@ anything and say so; a call AWS refuses always stops, naming who made it.
 Secrets live in SSM Parameter Store under [aws].params and reach the function as
 environment variables. They go to the CLI in files readable only by you, never on a
 command line.
+
+`search-console` also drives Google Cloud, as gcloud's application default credentials
+(`gcloud auth application-default login`): [google] in carterlitics.toml says where.
 """
 from __future__ import annotations
 
@@ -46,6 +54,7 @@ import tempfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -59,6 +68,7 @@ STATE = HERE / ".state"
 CONFIG = ROOT / "carterlitics.toml"
 
 sys.path.insert(0, str(ROOT))
+from carterlitics import google  # noqa: E402
 from carterlitics.auth import server_key  # noqa: E402
 from carterlitics.config import Config  # noqa: E402
 from carterlitics.intel import Ranges, build_ranges  # noqa: E402
@@ -447,7 +457,10 @@ def environment(dry: bool) -> dict:
         "OIDC_CLIENT_ID": client_id or "",
         "OIDC_CLIENT_SECRET": client_secret or "",
         "ADMIN_IDS": param("admin-ids") or "",
+        "GOOGLE_AUDIENCE": param("google-audience") or "",
     }
+    if CFG.google_account and not env["GOOGLE_AUDIENCE"]:
+        log("search", "no Google federation yet: the Search tab stays off until `search-console`")
     size = sum(len(k) + len(v) for k, v in env.items())
     if size > 4000:
         raise Fail(f"environment is {size} bytes; Lambda allows 4 KB. Trim carterlitics.toml.")
@@ -859,6 +872,386 @@ def grant_deploy(acct: str, dry: bool) -> None:
     log("deploy", f"{', '.join(n for _, n in who)} may update {FUNCTION}'s code, nothing else")
 
 
+# ---------------------------------------------------------------- search console
+
+GOOGLE_CFG = RAW.get("google", {})
+GOOGLE_PROJECT = GOOGLE_CFG.get("project", "")
+GOOGLE_POOL = GOOGLE_CFG.get("pool", "carterlitics")
+GOOGLE_PROVIDER = GOOGLE_CFG.get("provider", "aws-lambda")  # 4 to 32 characters
+GOOGLE_SERVICES = ["iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com",
+                   "searchconsole.googleapis.com", "siteverification.googleapis.com"]
+CRM = "https://cloudresourcemanager.googleapis.com/v3"
+USAGE = "https://serviceusage.googleapis.com/v1"
+IAM = "https://iam.googleapis.com/v1"
+SITE_VERIFICATION = "https://www.googleapis.com/siteVerification/v1"
+NO_PROJECT = "000000000000"     # a dry run's project number, before the project exists
+
+
+@functools.cache
+def gcloud_token() -> str:
+    token, _ = google.from_gcloud()
+    return token
+
+
+TURNED_ON: set[str] = set()     # APIs this run turned on, which Google may not admit to for a minute
+
+
+def gapi(method: str, url: str, body=None, missing: tuple[int, ...] = (), quota: bool = True):
+    """A Google Cloud call as whoever gcloud's application default credentials are. A
+    status in `missing` returns None: the thing isn't there.
+
+    `quota` bills the call to the project, which works only for APIs turned on in it, so
+    the calls that make the project and turn its APIs on go without (quota=False). An
+    API this run just turned on can still be refused as off for a minute or two, so such
+    a call is tried again."""
+    headers = {"x-goog-user-project": GOOGLE_PROJECT} if quota else {}
+    host = urllib.parse.urlsplit(url).hostname
+    for attempt in range(13):
+        try:
+            return google.call(method, url, gcloud_token(), body=body, headers=headers, timeout=60)
+        except google.GoogleError as e:
+            if (quota and e.status == 403 and host in TURNED_ON and attempt < 12
+                    and "has not been used in project" in str(e)):
+                if not attempt:
+                    log("google", f"waiting for {host}, just turned on, to answer")
+                time.sleep(10)
+                continue
+            if e.status in missing:
+                return None
+            raise Fail(f"Google refused {method} {url.split('?')[0]} ({e.status}): {e}") from None
+
+
+def wait_op(base: str, op: dict, what: str, quota: bool = True) -> dict:
+    """Until a long-running Google operation is done; its response."""
+    for _ in range(90):
+        if op.get("done"):
+            if op.get("error"):
+                raise Fail(f"{what} failed: {op['error'].get('message')}")
+            return op.get("response", {})
+        time.sleep(2)
+        op = gapi("GET", f"{base}/{op['name']}", quota=quota)
+    raise Fail(f"timed out waiting for {what}")
+
+
+def ensure_google_project(dry: bool) -> str:
+    """The project that holds the service account and the pool; its number."""
+    if not GOOGLE_PROJECT:
+        raise Fail("add a [google] table with `project` (and `organization`, to create it) to carterlitics.toml")
+    got = gapi("GET", f"{CRM}/projects/{GOOGLE_PROJECT}", missing=(403, 404), quota=False)
+    if got and got.get("state") == "ACTIVE":
+        log("google", f"project {GOOGLE_PROJECT} exists")
+        return got["name"].split("/")[1]
+    if got:
+        raise Fail(f"project {GOOGLE_PROJECT} is {got.get('state')}: restore it, or name another in [google].project")
+    org = str(GOOGLE_CFG.get("organization", ""))
+    if dry:
+        log("google", f"would create project {GOOGLE_PROJECT} in organizations/{org or '?'}")
+        return NO_PROJECT
+    if not org:
+        raise Fail(f"no project {GOOGLE_PROJECT} that you can see: set [google].organization to create it there")
+    try:
+        op = google.call("POST", f"{CRM}/projects", gcloud_token(), timeout=60, body={
+            "projectId": GOOGLE_PROJECT, "displayName": "carterlitics", "parent": f"organizations/{org}"})
+    except google.GoogleError as e:
+        if e.status == 409:
+            raise Fail(f"the project id {GOOGLE_PROJECT} is taken: name another in [google].project") from None
+        raise Fail(f"creating project {GOOGLE_PROJECT}: {e}") from None
+    number = wait_op(CRM, op, f"creating project {GOOGLE_PROJECT}", quota=False)["name"].split("/")[1]
+    log("google", f"created project {GOOGLE_PROJECT} ({number})")
+    return number
+
+
+def ensure_google_services(number: str, dry: bool) -> str:
+    """The project number for the steps after: in a dry run with IAM still off they can't
+    look inside the project, so they get NO_PROJECT and say what they would make."""
+    if number == NO_PROJECT:
+        log("google", "would turn on " + ", ".join(GOOGLE_SERVICES))
+        return number
+    got = gapi("GET", f"{USAGE}/projects/{number}/services?filter=state:ENABLED&pageSize=200", quota=False) or {}
+    on = {x["config"]["name"] for x in got.get("services", [])}
+    off = [x for x in GOOGLE_SERVICES if x not in on]
+    if not off:
+        log("google", "APIs on: " + ", ".join(x.split(".")[0] for x in GOOGLE_SERVICES))
+        return number
+    if dry:
+        log("google", "would turn on " + ", ".join(off))
+        return NO_PROJECT if "iam.googleapis.com" in off else number
+    op = gapi("POST", f"{USAGE}/projects/{number}/services:batchEnable", {"serviceIds": off}, quota=False)
+    wait_op(USAGE, op, "turning on " + ", ".join(off), quota=False)
+    TURNED_ON.update(off)
+    log("google", "turned on " + ", ".join(off))
+    return number
+
+
+def ensure_service_account(dry: bool) -> bool:
+    """True once it exists (in a dry run, if it already did)."""
+    account = CFG.google_account
+    if gapi("GET", f"{IAM}/projects/{GOOGLE_PROJECT}/serviceAccounts/{account}", missing=(403, 404)):
+        log("google", f"service account {account} exists")
+        return True
+    if dry:
+        log("google", f"would create service account {account}")
+        return False
+    gapi("POST", f"{IAM}/projects/{GOOGLE_PROJECT}/serviceAccounts", {
+        "accountId": account.split("@")[0], "serviceAccount": {
+            "displayName": "carterlitics", "description": "Reads Search Console for the carterlitics collector"}})
+    log("google", f"created service account {account}")
+    return True
+
+
+def ensure_pool(number: str, acct: str, dry: bool) -> str:
+    """A workload identity pool with one provider: this AWS account, and in it only the
+    function's role. The audience the function names when it signs in."""
+    pool = f"projects/{number}/locations/global/workloadIdentityPools/{GOOGLE_POOL}"
+    got = None if number == NO_PROJECT else gapi("GET", f"{IAM}/{pool}", missing=(404,))
+    if got and got.get("state") == "DELETED":
+        if dry:
+            log("google", f"would restore the deleted pool {GOOGLE_POOL}")
+        else:
+            wait_op(IAM, gapi("POST", f"{IAM}/{pool}:undelete", {}), f"restoring pool {GOOGLE_POOL}")
+            log("google", f"restored the deleted pool {GOOGLE_POOL}")
+    elif got:
+        log("google", f"workload identity pool {GOOGLE_POOL} exists")
+    elif dry:
+        log("google", f"would create workload identity pool {GOOGLE_POOL}")
+    else:
+        op = gapi("POST", f"{IAM}/projects/{number}/locations/global/workloadIdentityPools"
+                          f"?workloadIdentityPoolId={GOOGLE_POOL}",
+                  {"displayName": "carterlitics", "description": f"The {FUNCTION} function's AWS role"})
+        wait_op(IAM, op, f"creating pool {GOOGLE_POOL}")
+        log("google", f"created workload identity pool {GOOGLE_POOL}")
+    provider = {
+        "displayName": f"AWS {acct}", "aws": {"accountId": acct},
+        "attributeMapping": {"google.subject": "assertion.arn",
+                             "attribute.aws_role": "assertion.arn.extract('assumed-role/{role}/')"},
+        "attributeCondition": f"assertion.arn.startsWith('arn:aws:sts::{acct}:assumed-role/{ROLE}/')",
+    }
+    path = f"{pool}/providers/{GOOGLE_PROVIDER}"
+    # IAM says 403 "denied (or it may not exist)" for a provider that isn't there; were
+    # it really denied, creating it below would say so.
+    got = None if number == NO_PROJECT else gapi("GET", f"{IAM}/{path}", missing=(403, 404))
+    if got and all(got.get(k) == v for k, v in provider.items() if k != "displayName"):
+        log("google", f"provider {GOOGLE_PROVIDER}: only {ROLE} in AWS account {acct}")
+    elif dry:
+        log("google", f"would {'update' if got else 'create'} provider {GOOGLE_PROVIDER}: only {ROLE} in AWS account {acct}")
+    elif got:
+        wait_op(IAM, gapi("PATCH", f"{IAM}/{path}?updateMask=aws,attributeMapping,attributeCondition,displayName",
+                          provider), f"updating provider {GOOGLE_PROVIDER}")
+        log("google", f"updated provider {GOOGLE_PROVIDER}: only {ROLE} in AWS account {acct}")
+    else:
+        op = gapi("POST", f"{IAM}/{pool}/providers?workloadIdentityPoolProviderId={GOOGLE_PROVIDER}", provider)
+        wait_op(IAM, op, f"creating provider {GOOGLE_PROVIDER}")
+        log("google", f"created provider {GOOGLE_PROVIDER}: only {ROLE} in AWS account {acct}")
+    return f"//iam.googleapis.com/{path}"
+
+
+def ensure_account_policy(number: str, me: str, dry: bool) -> None:
+    """Who may act as the service account: the function's role (through the pool), and you
+    (so this script and the dev server can)."""
+    account = CFG.google_account
+    url = f"{IAM}/projects/{GOOGLE_PROJECT}/serviceAccounts/{account}"
+    wanted = {
+        "roles/iam.workloadIdentityUser":
+            f"principalSet://iam.googleapis.com/projects/{number}/locations/global/workloadIdentityPools/"
+            f"{GOOGLE_POOL}/attribute.aws_role/{ROLE}",
+        "roles/iam.serviceAccountTokenCreator": f"user:{me}",
+    }
+    policy = {} if number == NO_PROJECT else gapi("POST", f"{url}:getIamPolicy", {}, missing=(403, 404)) or {}
+    bindings = policy.setdefault("bindings", [])
+    changed = []
+    for role, member in wanted.items():
+        b = next((b for b in bindings if b["role"] == role and not b.get("condition")), None)
+        if b is None:
+            b = {"role": role, "members": []}
+            bindings.append(b)
+        if member not in b["members"]:
+            b["members"].append(member)
+            changed.append(f"{member.split('/')[-1] if member.startswith('principalSet') else member} as {role}")
+    if not changed:
+        log("google", f"{ROLE} (through the pool) and {me} may act as the service account")
+    elif dry:
+        log("google", "would let " + "; ".join(changed))
+    else:
+        gapi("POST", f"{url}:setIamPolicy", {"policy": policy})
+        log("google", "let " + "; ".join(changed))
+
+
+def zones_for_sites() -> dict[str, str]:
+    """Route 53 zones the sites' hosts are under: domain -> zone id. Those are the
+    domains whose DNS we hold, so the ones the service account can verify."""
+    zones = {z["Name"].rstrip(".").lower(): z["Id"].split("/")[-1]
+             for z in aws("route53", "list-hosted-zones")["HostedZones"] if not z["Config"].get("PrivateZone")}
+    found = {}
+    for site in CFG.sites.values():
+        for host in google.hosts_of(site):
+            under = [d for d in zones if host == d or host.endswith("." + d)]
+            if under:
+                d = max(under, key=len)
+                found[d] = zones[d]
+    return dict(sorted(found.items()))
+
+
+def add_txt(domain: str, zone: str, value: str, dry: bool) -> bool:
+    """Add a TXT value at the domain's apex, keeping the values already there. True if it
+    had to be added."""
+    sets = aws("route53", "list-resource-record-sets", "--hosted-zone-id", zone, "--start-record-name", domain,
+               "--start-record-type", "TXT", "--max-items", "1")["ResourceRecordSets"]
+    current = next((r for r in sets if r["Name"].rstrip(".").lower() == domain and r["Type"] == "TXT"), None)
+    values = [r["Value"] for r in current["ResourceRecords"]] if current else []
+    quoted = json.dumps(value)
+    if quoted in values:
+        return False
+    if dry:
+        log("dns", f"would add TXT {quoted} at {domain}, beside its {len(values)} other value(s)")
+        return True
+    change = {"Comment": "carterlitics: Search Console verification for its service account", "Changes": [{
+        "Action": "UPSERT", "ResourceRecordSet": {
+            "Name": f"{domain}.", "Type": "TXT", "TTL": current["TTL"] if current else 300,
+            "ResourceRecords": [{"Value": v} for v in values + [quoted]]}}]}
+    got = aws("route53", "change-resource-record-sets", "--hosted-zone-id", zone, "--change-batch", json.dumps(change))
+    aws("route53", "wait", "resource-record-sets-changed", "--id", got["ChangeInfo"]["Id"])
+    log("dns", f"added TXT {quoted} at {domain}, beside its {len(values)} other value(s)")
+    return True
+
+
+def as_account(tokens: google.Tokens, method: str, url: str, scope: str, body=None) -> dict:
+    """A call as the service account. Being allowed to act as it can take a minute to
+    reach every Google server after the grant, and so can an API just turned on, so
+    those refusals are retried for a while."""
+    for attempt in range(13):
+        try:
+            return tokens.request(method, url, scope, body)
+        except google.GoogleError as e:
+            waiting = e.status == 403 and attempt < 12 and (
+                "getAccessToken" in str(e) or (TURNED_ON and "has not been used in project" in str(e)))
+            if not waiting:
+                raise Fail(f"as {tokens.account}, {method} {url.split('?')[0]}: {e}") from None
+            if attempt == 0:
+                log("google", "waiting for the grant and the APIs to take effect…")
+            time.sleep(10)
+    raise AssertionError
+
+
+def verify_domains(tokens: google.Tokens, dry: bool) -> None:
+    """Each domain: the service account a verified owner (DNS TXT), and its domain
+    property in the account's Search Console. Changes DNS, so only with --verify-dns."""
+    zones = zones_for_sites()
+    if not zones:
+        log("verify", "no site is under a Route 53 zone of this account: nothing to verify")
+        return
+    owned = {urllib.parse.unquote(r["id"]) for r in
+             as_account(tokens, "GET", f"{SITE_VERIFICATION}/webResource", google.VERIFY).get("items", [])}
+    properties = {e["siteUrl"]: e.get("permissionLevel") for e in
+                  as_account(tokens, "GET", f"{google.API}/sites", google.READ).get("siteEntry", [])}
+    for domain, zone in zones.items():
+        site = {"type": "INET_DOMAIN", "identifier": domain}
+        if f"dns://{domain}" in owned:
+            log("verify", f"{domain}: the service account is a verified owner")
+        else:
+            token = as_account(tokens, "POST", f"{SITE_VERIFICATION}/token", google.VERIFY,
+                               {"site": site, "verificationMethod": "DNS_TXT"})["token"]
+            add_txt(domain, zone, token, dry)
+            if dry:
+                log("verify", f"would verify {domain} through that record")
+            else:
+                verify_one(tokens, domain, site)
+        prop = f"sc-domain:{domain}"
+        if properties.get(prop) in ("siteOwner", "siteFullUser", "siteRestrictedUser"):
+            log("search", f"{prop}: in the account's Search Console ({properties[prop]})")
+        elif dry:
+            log("search", f"would add {prop} to the account's Search Console")
+        else:
+            as_account(tokens, "PUT", f"{google.API}/sites/{urllib.parse.quote(prop, safe='')}", google.WRITE)
+            log("search", f"added {prop} to the account's Search Console")
+
+
+def verify_one(tokens: google.Tokens, domain: str, site: dict) -> None:
+    """Google reads the record through its own resolvers, which may still hold the zone's
+    old answer for its TTL: try for six minutes."""
+    for attempt in range(25):
+        try:
+            tokens.request("POST", f"{SITE_VERIFICATION}/webResource?verificationMethod=DNS_TXT", google.VERIFY,
+                           {"site": site})
+            log("verify", f"{domain}: verified; the service account is an owner")
+            return
+        except google.GoogleError as e:
+            if e.status != 400 or attempt == 24:
+                raise Fail(f"verifying {domain}: {e}. The TXT record stays; re-run `search-console` later.") from None
+            if attempt == 0:
+                log("verify", f"{domain}: waiting for Google to see the new TXT record…")
+            time.sleep(15)
+
+
+def show_properties(tokens: google.Tokens) -> None:
+    """What the account reads, which property each site's numbers come from, and, for the
+    sites none covers, how to give it one."""
+    got = as_account(tokens, "GET", f"{google.API}/sites", google.READ).get("siteEntry", [])
+    props = sorted(e["siteUrl"] for e in got if e.get("permissionLevel") != "siteUnverifiedUser")
+    log("search", f"{tokens.account} reads {len(props)} propert{'y' if len(props) == 1 else 'ies'}: "
+        + (", ".join(f"{e['siteUrl']} ({e.get('permissionLevel')})" for e in got if e["siteUrl"] in props)
+           or "none"))
+    for site in CFG.sites.values():
+        hosts = google.hosts_of(site)
+        if not hosts:
+            continue
+        covered = google.plan(site, props)
+        missing = [h for h in hosts if not any(h in hs for _, hs in covered)]
+        log("site", f"{site.id:<26} " + ("; ".join(f"{p} ({', '.join(hs)})" for p, hs in covered) or "no property")
+            + (f"; none for {', '.join(missing)}" if missing and covered else ""))
+    uncovered = [d for d in zones_for_sites() if not google.property_for(d, props)]
+    for domain in uncovered:
+        log("todo", f"sc-domain:{domain}: in Search Console, Settings > Users and permissions > Add user: "
+            f"{tokens.account}, Restricted (read only). Or re-run with --verify-dns to verify it "
+            "through a TXT record (owner)")
+
+
+def check_function() -> None:
+    """Ask the deployed function which properties it can read, as itself."""
+    env = (aws("lambda", "get-function-configuration", "--function-name", FUNCTION,
+               missing=("ResourceNotFoundException",)) or {}).get("Environment", {}).get("Variables", {})
+    if not env.get("GOOGLE_AUDIENCE"):
+        log("function", f"{FUNCTION} doesn't know the pool yet: run `infra/deploy.py provision`")
+        return
+    out = Path(tempfile.mkdtemp()) / "out.json"
+    aws("lambda", "invoke", "--function-name", FUNCTION, "--cli-binary-format", "raw-in-base64-out",
+        "--payload", json.dumps({"task": "search-console"}), str(out))
+    got = json.loads(out.read_text() or "{}")
+    if got.get("ok"):
+        log("function", f"{FUNCTION} signs in as {got['account']} and reads " +
+            ", ".join(p["site_url"] for p in got["properties"]))
+    else:
+        raise Fail(f"{FUNCTION} can't read Search Console: {got.get('error') or got.get('errorMessage') or got}")
+
+
+def search_console(acct: str, dry: bool, verify_dns: bool) -> None:
+    if not CFG.google_account:
+        raise Fail("add a [google] table with `project` to carterlitics.toml")
+    me = google.call("GET", f"https://oauth2.googleapis.com/tokeninfo?access_token={gcloud_token()}").get("email", "")
+    if not me:
+        raise Fail("gcloud's application default credentials name no user (a service account can't run this)")
+    log("google", f"as {me}")
+    number = ensure_google_services(ensure_google_project(dry), dry)
+    exists = ensure_service_account(dry)
+    audience = ensure_pool(number, acct, dry)
+    ensure_account_policy(number, me, dry)
+    if param("google-audience") == audience:
+        log("secret", f"{PARAMS}/google-audience is the provider")
+    elif dry:
+        log("secret", f"would set {PARAMS}/google-audience to {audience}")
+    else:
+        put_param("google-audience", audience)
+        log("secret", f"set {PARAMS}/google-audience: `provision` hands it to the function")
+    if not exists:
+        log("search", "the service account doesn't exist yet, so it reads nothing to list")
+        return
+    tokens = google.Tokens(CFG.google_account, google.from_gcloud)
+    if verify_dns:
+        verify_domains(tokens, dry)
+    show_properties(tokens)
+    if not dry:
+        check_function()
+
+
 MAXMIND = "https://download.maxmind.com/geoip/databases/{}/download?suffix=tar.gz"
 
 
@@ -1082,12 +1475,14 @@ def fetch_intel() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["code", "provision", "routes", "logging", "register-client",
-                                        "server-key", "grant-deploy", "geo", "intel"])
+                                        "server-key", "grant-deploy", "search-console", "geo", "intel"])
     ap.add_argument("site", nargs="?", help="routes, logging: a site id from carterlitics.toml, or all; server-key: a site")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rollback", action="store_true", help="routes: restore the config from before")
     ap.add_argument("--drop", nargs="*", default=[], help="routes: behaviors to remove, e.g. '/api/*'")
     ap.add_argument("--force", action="store_true", help="register-client: register again")
+    ap.add_argument("--verify-dns", action="store_true",
+                    help="search-console: verify each site's domain through a TXT record in Route 53")
     args = ap.parse_args()
     try:
         if args.command in ("routes", "logging", "server-key") and not args.site:
@@ -1106,6 +1501,8 @@ def main() -> int:
             print_server_key(args.site)
         elif args.command == "grant-deploy":
             grant_deploy(account(), args.dry_run)
+        elif args.command == "search-console":
+            search_console(account(), args.dry_run, args.verify_dns)
         elif args.command == "geo":
             fetch_geo()
         elif args.command == "intel":

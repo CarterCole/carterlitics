@@ -3,17 +3,21 @@
     GET  /_c/c.js                   the client: page views, events, errors, consent, recording
     GET  /_c/s/<file>               static files, content-hashed and immutable
     POST /_c/i                      a batch from c.js: page views, leaves, events, errors
+    GET  /_c/who                    what the collector makes of this visitor, for the page:
+                                    a bot (checked, if a crawler), VPN, Tor, relay, hosting
     POST /_c/r                      a chunk of a consented session recording
     POST /_c/server/events          events from a site's own backend (x-carterlitics-key)
     GET  /_c/admin/                 the console (on the console site; others redirect there)
     GET  /_c/admin/replay           one session recording, played back
     GET  /_c/api/*                  the console's data, for a signed-in administrator
-                                    (/api/ip?ip=…: one address, registry included)
+                                    (/api/ip?ip=…: one address, registry included;
+                                    /api/search: Google Search Console, `google.py`)
     GET  /_c/auth/login|callback    sign-in at the OpenID Connect issuer
     POST /_c/auth/logout
 
 and, not over HTTP, S3 notifications for new CloudFront access log files, which it
-reads and counts (`logs.py`).
+reads and counts (`logs.py`), and `{"task": "search-console"}` from `aws lambda invoke`,
+which answers with the Search Console properties the function itself can read.
 
 CloudFront adds two headers to every request it sends here: `x-origin-verify`, a
 secret, so the Function URL is useless on its own, and `x-carterlitics-site`, which
@@ -37,6 +41,7 @@ from . import auth, logs
 from .backends import DynamoTable, S3Blobs
 from .config import Config, Funnel
 from .geo import Geolocator
+from .google import GoogleError, SearchConsole, plan
 from .intel import Intelligence
 from .store import LOG_KINDS, Meta, Store
 from .web import NO_STORE, Request, Response, from_lambda, no_content, plain, redirect, reply_json, to_lambda
@@ -96,9 +101,10 @@ class Assets:
 
 
 class App:
-    def __init__(self, cfg: Config, store: Store):
+    def __init__(self, cfg: Config, store: Store, search: SearchConsole | None = None):
         self.cfg = cfg
         self.store = store
+        self.search = search
         self.assets = Assets(cfg.mount)
 
     # -- helpers
@@ -184,6 +190,13 @@ class App:
             self.store.ingest(site, data, self.meta(req))
             return no_content()
 
+        if route == ("GET", "/who"):
+            # The page asking what the collector makes of its visitor. Kept nowhere, so it
+            # answers with Do Not Track too.
+            if not self.site_of(req):
+                return plain(404, "unknown site")
+            return reply_json(self.store.who(self.meta(req), req.query.get("tz", ""), req.query.get("wd") == "1"))
+
         if route == ("POST", "/r"):
             site = self.site_of(req)
             if not site:
@@ -249,7 +262,8 @@ class App:
             return plain(405, "GET only")
         if path == "/me":
             return reply_json({"user": user, "console": cfg.console,
-                               "sites": [{"id": s.id, "url": s.url} for s in cfg.sites.values()],
+                               "sites": [{"id": s.id, "url": s.url, "consent_docs": s.consent_docs_url}
+                                         for s in cfg.sites.values()],
                                "retention": cfg.retention})
         site = cfg.sites.get(req.query.get("site", "")) or cfg.console_site
         if not site:
@@ -279,6 +293,8 @@ class App:
                     return reply_json({"error": str(e)}, 400)
             return self.big_json({**self.store.funnels(site, funnels, self.clamp(q.get("days"), 30, 1, 90)),
                                   "configured": [f.to_data() for f in site.funnels]})
+        if path == "/search":
+            return self.big_json(self.search_report(site, self.clamp(q.get("days"), 30, 1, 480)))
         if path == "/ip":
             # One address, everything known: place, network, reverse DNS, lists, registry.
             found = self.store.about(q.get("ip", ""), registry=q.get("whois") != "0")
@@ -293,6 +309,25 @@ class App:
             return Response(200, gzip.compress(events.encode(), compresslevel=6), {
                 "Content-Type": "application/json; charset=utf-8", "Content-Encoding": "gzip", **NO_STORE})
         return reply_json({"error": "not found"}, 404)
+
+    def search_report(self, site, days: int) -> dict:
+        """The site in Google's search results, or why there's nothing to show."""
+        if not self.search:
+            why = ("no service account: add [google] to carterlitics.toml and run infra/deploy.py search-console"
+                   if not self.cfg.google_account else
+                   "the function can't sign in to Google yet: run infra/deploy.py search-console, then provision")
+            return {"connected": False, "reason": why, "account": self.cfg.google_account}
+        try:
+            found = self.search.report(site, days)
+        except GoogleError as e:
+            print(json.dumps({"event": "search_console_failed", "status": e.status, "error": str(e)[:300]}))
+            return {"connected": False, "reason": f"Google said: {e}", "account": self.search.account}
+        props = [p["site_url"] for p in found["properties"]]
+        covers: dict[str, list[str]] = {}
+        for other in self.cfg.sites.values():
+            for prop, _ in plan(other, props):
+                covers.setdefault(prop, []).append(other.id)
+        return {**found, "covers": covers}
 
     # -- S3 notifications
 
@@ -319,7 +354,7 @@ def build_from_env() -> App:
     table = DynamoTable(table) if table else None
     store = Store(cfg, table, S3Blobs(bucket) if bucket else None, Geolocator.from_env(),
                   Intelligence.from_env(table))
-    return App(cfg, store)
+    return App(cfg, store, SearchConsole.from_env(cfg.google_account))
 
 
 def _s3_read(bucket: str, key: str) -> bytes:
@@ -334,6 +369,14 @@ def lambda_handler(event, context):
         _app = build_from_env()
     if isinstance(event, dict) and event.get("Records"):
         return _app.ingest_s3(event, _s3_read)
+    if isinstance(event, dict) and event.get("task") == "search-console":
+        # Only `aws lambda invoke` can send this: a Function URL event keeps the request in `body`.
+        if not _app.search:
+            return {"ok": False, "error": _app.search_report(None, 1)["reason"]}
+        try:
+            return {"ok": True, "account": _app.search.account, "properties": _app.search.properties()}
+        except GoogleError as e:
+            return {"ok": False, "account": _app.search.account, "error": str(e)}
     try:
         res = _app.handle(from_lambda(event))
     except Exception:  # noqa: BLE001 - one bad request must not look like an outage

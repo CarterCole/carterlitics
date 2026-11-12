@@ -55,6 +55,9 @@ url = "https://cartercole.com"
 aliases = ["www.cartercole.com"]
 exclude = ["/admin", "/auth", "/graphql"]
 dev_url = "http://localhost:4321"
+# Each consent version's privacy policy (the site's frontend/src/lib/consent.ts), linked
+# from the console's sessions by the version each one was accepted under.
+consent_docs = "/privacy/v{version}"
 
 # Events from the site's frontend/src/lib/track.ts: post_read {slug} once the end of a
 # post is in view, outbound {host, kind, href}, and sign-in as events, since /auth/*
@@ -134,6 +137,20 @@ id = "*.cartercole.com"
 url = "https://cartercole.com"
 aliases = ["*.cartercole.com"]
 client = false
+
+# ---------------------------------------------------------------- Search Console
+
+# A Google service account reads Search Console for every site (README: Search Console).
+# The function signs in to it as its AWS role, through a workload identity pool, so no
+# key exists. `infra/deploy.py search-console` makes all of it; the account then needs
+# read access to each domain property (sc-domain:cartercole.net, sc-domain:cartercole.com),
+# added in Search Console or, with --verify-dns, by a TXT record in Route 53.
+[google]
+project = "carterlitics"
+organization = "1020282400884"     # cartercole.com's: where `search-console` creates the project
+service_account = "carterlitics"   # carterlitics@<project>.iam.gserviceaccount.com
+pool = "carterlitics"
+provider = "aws-lambda"
 
 [aws]
 region = "us-east-1"

@@ -111,6 +111,8 @@ main.is-loading { opacity: 0.55; transition: opacity 0.15s; }
   min-width: 0;
 }
 .card + .card, .grid + .card, .card + .grid, .grid + .grid { margin-top: 16px; }
+.grid > .card { margin-top: 0; }      /* the grid's gap spaces them */
+.lede { color: var(--muted); font-size: 12.5px; margin: -4px 0 16px; }
 .card h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
 .card .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
@@ -274,6 +276,7 @@ pre.stack {
 }
 .explore + div { margin-top: 6px; }
 .hint { color: var(--muted); font: 12px var(--mono); }
+.more { margin-top: 6px; padding-left: 6px; }
 
 /* replay */
 .player { margin-top: 12px; display: flow-root; }

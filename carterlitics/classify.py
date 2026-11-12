@@ -360,6 +360,185 @@ def referrer_of(url, own_hosts: frozenset[str]) -> str:
     return host
 
 
+# ---------------------------------------------------------------- sources
+
+# (kind, display name, hosts). A referrer matches a host exactly or as a subdomain of
+# it, the most specific first, so mail.google.com is Gmail and images.google.com Google.
+# A host ending ".*" is that name under any country domain: google.co.uk, google.com.au.
+# Hosts like com.google.android.gm are Android apps (`android-app://…` referrers). Each
+# host, and the name in lower case, also name the source when a link's utm_source does.
+SOURCES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("email", "Gmail", ("mail.google.com", "inbox.google.com", "com.google.android.gm")),
+    ("email", "Outlook", ("outlook.live.com", "outlook.office.com", "outlook.office365.com", "com.microsoft.office.outlook")),
+    ("email", "Yahoo Mail", ("mail.yahoo.com",)),
+    ("email", "Proton Mail", ("mail.proton.me", "mail.protonmail.com")),
+    ("email", "Fastmail", ("fastmail.com",)),
+    ("ai", "ChatGPT", ("chatgpt.com", "chat.openai.com", "com.openai.chatgpt")),
+    ("ai", "Claude", ("claude.ai", "com.anthropic.claude")),
+    ("ai", "Perplexity", ("perplexity.ai",)),
+    ("ai", "Gemini", ("gemini.google.com", "bard.google.com")),
+    ("ai", "Copilot", ("copilot.microsoft.com", "edgeservices.bing.com")),
+    ("ai", "DeepSeek", ("chat.deepseek.com",)),
+    ("ai", "Grok", ("grok.com",)),
+    ("ai", "Le Chat", ("chat.mistral.ai",)),
+    ("ai", "Meta AI", ("meta.ai",)),
+    ("ai", "Phind", ("phind.com",)),
+    ("search", "Google News", ("news.google.com",)),
+    ("search", "Google", ("google.*", "com.google.android.googlequicksearchbox")),
+    ("search", "Bing", ("bing.com",)),
+    ("search", "DuckDuckGo", ("duckduckgo.com",)),
+    ("search", "Yahoo", ("search.yahoo.com", "search.yahoo.co.jp")),
+    ("search", "Yandex", ("yandex.*", "ya.ru")),
+    ("search", "Baidu", ("baidu.com",)),
+    ("search", "Ecosia", ("ecosia.org",)),
+    ("search", "Brave Search", ("search.brave.com",)),
+    ("search", "Kagi", ("kagi.com",)),
+    ("search", "Startpage", ("startpage.com",)),
+    ("search", "Qwant", ("qwant.com",)),
+    ("search", "Naver", ("naver.com",)),
+    ("search", "Seznam", ("seznam.cz",)),
+    ("search", "Mojeek", ("mojeek.com",)),
+    ("search", "Ask", ("ask.com",)),
+    ("social", "X", ("t.co", "x.com", "twitter.com", "com.twitter.android")),
+    ("social", "Facebook", ("facebook.com", "fb.com", "fb.me", "com.facebook.katana")),
+    ("social", "Instagram", ("instagram.com", "com.instagram.android")),
+    ("social", "Threads", ("threads.net", "threads.com")),
+    ("social", "LinkedIn", ("linkedin.com", "lnkd.in", "com.linkedin.android")),
+    ("social", "Reddit", ("reddit.com", "com.reddit.frontpage")),
+    ("social", "Hacker News", ("news.ycombinator.com", "hn.algolia.com")),
+    ("social", "Lobsters", ("lobste.rs",)),
+    ("social", "Bluesky", ("bsky.app",)),
+    ("social", "Mastodon", ("mastodon.social", "mastodon.online", "mastodon.world", "hachyderm.io", "fosstodon.org",
+                            "infosec.exchange", "mstdn.social", "mas.to", "techhub.social")),
+    ("social", "YouTube", ("youtube.com", "youtu.be", "com.google.android.youtube")),
+    ("social", "TikTok", ("tiktok.com",)),
+    ("social", "Pinterest", ("pinterest.*",)),
+    ("social", "Discord", ("discord.com", "discordapp.com")),
+    ("social", "Slack", ("slack.com", "com.slack")),
+    ("social", "Telegram", ("t.me", "telegram.org", "org.telegram.messenger")),
+    ("social", "WhatsApp", ("whatsapp.com",)),
+    ("referral", "GitHub", ("github.com", "com.github.android")),
+    ("referral", "Stack Overflow", ("stackoverflow.com",)),
+)
+
+# Names people give a source in utm_source that aren't a host or the display name.
+SOURCE_ALIASES = {"hn": "Hacker News", "hackernews": "Hacker News", "ycombinator": "Hacker News",
+                  "twitter": "X", "fb": "Facebook", "ig": "Instagram", "bsky": "Bluesky", "yt": "YouTube",
+                  "openai": "ChatGPT", "lobsters": "Lobsters", "so": "Stack Overflow"}
+
+# Ad networks' click ids on a landing page's address, and whose they are. c.js sends
+# which one is there (never its value). fbclid and igshid are added to every link those
+# apps open, paid or not, so only the others say a visit came from an ad.
+CLICK_IDS = {"gclid": "Google", "gbraid": "Google", "wbraid": "Google", "msclkid": "Bing",
+             "fbclid": "Facebook", "igshid": "Instagram", "twclid": "X", "ttclid": "TikTok",
+             "li_fat_id": "LinkedIn", "rdt_cid": "Reddit", "yclid": "Yandex"}
+PAID_CLICKS = frozenset(CLICK_IDS) - {"fbclid", "igshid"}
+
+# utm_medium values, Google Analytics' way: what makes a visit paid, email or social.
+PAID_MEDIUM = re.compile(r"^(.*cp.*|ppc|retargeting|paid.*|display|banner|interstitial)$")
+EMAIL_WORDS = frozenset({"email", "e-mail", "e_mail", "e mail", "newsletter"})
+SOCIAL_MEDIUM = frozenset({"social", "social-network", "social-media", "sm", "social network", "social media"})
+
+CHANNELS = ("Direct", "Search", "Paid search", "Social", "Paid social", "Paid other", "AI assistants", "Email",
+            "Referral", "Other")
+
+
+def _source_tables():
+    hosts: dict[str, tuple[str, str]] = {}
+    wild: list[tuple[re.Pattern, tuple[str, str]]] = []
+    for kind, name, patterns in SOURCES:
+        for h in patterns:
+            if h.endswith(".*"):
+                wild.append((re.compile(rf"{re.escape(h[:-2])}\.(com?\.)?[a-z]{{2,3}}"), (kind, name)))
+            else:
+                hosts.setdefault(h, (kind, name))
+    names = {name.lower(): (kind, name) for kind, name, _ in SOURCES}
+    names.update({alias: names[name.lower()] for alias, name in SOURCE_ALIASES.items()})
+    return hosts, wild, names
+
+
+SOURCE_HOSTS, SOURCE_WILD, SOURCE_NAMES = _source_tables()
+
+
+def known_source(host: str) -> tuple[str, str] | None:
+    """(kind, name) for a host in SOURCES, or one of its subdomains."""
+    labels = host.split(".")
+    for i in range(len(labels) - 1):
+        tail = ".".join(labels[i:])
+        if tail in SOURCE_HOSTS:
+            return SOURCE_HOSTS[tail]
+        for pattern, found in SOURCE_WILD:
+            if pattern.fullmatch(tail):
+                return found
+    return None
+
+
+@dataclass(frozen=True)
+class Source:
+    """Where a visit came from. `name` is a known source (Google, Hacker News), a
+    referring host, a link's own utm_source, or Direct; `channel` is one of CHANNELS."""
+    name: str
+    channel: str
+    campaign: str = ""
+
+
+DIRECT = Source("Direct", "Direct")
+
+
+def _tag(value) -> str:
+    """A campaign tag as counted: trimmed, lower case, printable, at most 100 characters."""
+    if not isinstance(value, str):
+        return ""
+    return dim(" ".join(value.split()).lower(), 100)
+
+
+def source_of(referrer, tags, own_hosts: frozenset[str]) -> Source:
+    """A visit's source and channel, from its landing page's referrer and the campaign
+    tags c.js read off its address (`utm_source`, `utm_medium`, `utm_campaign`, `ref`,
+    and `click`, the name of an ad click id). A link's utm_source wins over its referrer,
+    as in Google Analytics; a source both name (utm_source=google) is counted as one."""
+    tags = tags if isinstance(tags, dict) else {}
+    medium, campaign = _tag(tags.get("utm_medium")), _tag(tags.get("utm_campaign"))
+    click = tags.get("click") if tags.get("click") in CLICK_IDS else ""
+    tagged = _tag(tags.get("utm_source")) or _tag(tags.get("ref"))
+    host = host_of(referrer)
+    if host in own_hosts:
+        host = None
+    by_host = (known_source(host) or ("referral", host)) if host else None
+    if tagged:
+        found = SOURCE_NAMES.get(tagged) or (known_source(tagged) if "." in tagged else None)
+        # An unknown name on a link from a real site (?ref=producthunt from producthunt.com) is a referral.
+        kind, name = found or ((by_host[0], tagged) if by_host else ("campaign", tagged))
+    elif by_host:
+        kind, name = by_host
+    elif click:
+        kind, name = SOURCE_NAMES[CLICK_IDS[click].lower()]
+    elif medium or campaign:
+        kind, name = "campaign", "(not set)"  # tagged, but with no utm_source
+    else:
+        kind, name = "direct", "Direct"
+    return Source(name, channel_of(kind, medium, name.lower(), click in PAID_CLICKS), campaign)
+
+
+def channel_of(kind: str, medium: str, name: str = "", paid: bool = False) -> str:
+    """Google Analytics' default channel grouping, simplified, with AI assistants apart."""
+    if paid or PAID_MEDIUM.match(medium):
+        return {"search": "Paid search", "social": "Paid social"}.get(kind, "Paid other")
+    if kind == "email" or medium in EMAIL_WORDS or name in EMAIL_WORDS:
+        return "Email"
+    if kind == "social" or medium in SOCIAL_MEDIUM:
+        return "Social"
+    if kind == "search" or medium == "organic":
+        return "Search"
+    if kind == "ai":
+        return "AI assistants"
+    if kind == "referral" or medium == "referral":
+        return "Referral"
+    if kind == "direct" and not medium:
+        return "Direct"
+    return "Other"
+
+
 # ---------------------------------------------------------------- identifiers
 
 

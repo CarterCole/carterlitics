@@ -76,6 +76,29 @@ class MemoryTable:
                 item.setdefault(k, v)
             return True
 
+    def update_if_recent(self, pk: str, sk: str, field: str, since: int, add: dict | None = None,
+                         set_: dict | None = None) -> dict | None:
+        """Update the item only if it exists and its `field` is at least `since`. The item
+        as it was before, or None (and no change) when there is no such item."""
+        with self.lock:
+            item = self._item(pk, sk, create=False)
+            if item is None or item.get(field, 0) < since:
+                return None
+            before = _copy(item)
+            for k, v in (add or {}).items():
+                item[k] = item.get(k, 0) + v
+            item.update(set_ or {})
+            return before
+
+    def put_unless_recent(self, item: dict, field: str, since: int) -> bool:
+        """Put the item unless one is there whose `field` is at least `since`."""
+        with self.lock:
+            there = self.items.get(item["pk"], {}).get(item["sk"])
+            if there is not None and there.get(field, 0) >= since:
+                return False
+            self.items.setdefault(item["pk"], {})[item["sk"]] = dict(item)
+            return True
+
     def get(self, pk: str, sk: str) -> dict | None:
         with self.lock:
             item = self.items.get(pk, {}).get(sk)
@@ -186,8 +209,8 @@ class DynamoTable:
         except self.client.exceptions.ConditionalCheckFailedException:
             return False
 
-    def update(self, pk: str, sk: str, add: dict | None = None, set_: dict | None = None,
-               set_if_absent: dict | None = None, must_exist: bool = False) -> bool:
+    def _update_args(self, pk: str, sk: str, add: dict | None, set_: dict | None,
+                     set_if_absent: dict | None = None) -> dict:
         names, values, adds, sets = {}, {}, [], []
         for i, (k, v) in enumerate((add or {}).items()):
             names[f"#a{i}"], values[f":a{i}"] = k, _to_ddb(v)
@@ -200,13 +223,40 @@ class DynamoTable:
             sets.append(f"#f{i} = if_not_exists(#f{i}, :f{i})")
         expr = " ".join(filter(None, [f"SET {', '.join(sets)}" if sets else "",
                                       f"ADD {', '.join(adds)}" if adds else ""]))
-        args = {"TableName": self.name, "Key": {"pk": {"S": pk}, "sk": {"S": sk}},
+        return {"TableName": self.name, "Key": {"pk": {"S": pk}, "sk": {"S": sk}},
                 "UpdateExpression": expr, "ExpressionAttributeNames": names,
                 "ExpressionAttributeValues": values}
+
+    def update(self, pk: str, sk: str, add: dict | None = None, set_: dict | None = None,
+               set_if_absent: dict | None = None, must_exist: bool = False) -> bool:
+        args = self._update_args(pk, sk, add, set_, set_if_absent)
         if must_exist:
             args["ConditionExpression"] = "attribute_exists(pk)"
         try:
             self.client.update_item(**args)
+            return True
+        except self.client.exceptions.ConditionalCheckFailedException:
+            return False
+
+    def update_if_recent(self, pk: str, sk: str, field: str, since: int, add: dict | None = None,
+                         set_: dict | None = None) -> dict | None:
+        args = self._update_args(pk, sk, add, set_)
+        args["ExpressionAttributeNames"]["#since"] = field
+        args["ExpressionAttributeValues"][":since"] = {"N": str(since)}
+        args["ConditionExpression"] = "attribute_exists(pk) AND #since >= :since"
+        args["ReturnValues"] = "ALL_OLD"
+        try:
+            out = self.client.update_item(**args)
+        except self.client.exceptions.ConditionalCheckFailedException:
+            return None
+        return self._out(out.get("Attributes") or {})
+
+    def put_unless_recent(self, item: dict, field: str, since: int) -> bool:
+        try:
+            self.client.put_item(TableName=self.name, Item={k: _to_ddb(v) for k, v in item.items()},
+                                 ConditionExpression="attribute_not_exists(pk) OR #since < :since",
+                                 ExpressionAttributeNames={"#since": field},
+                                 ExpressionAttributeValues={":since": {"N": str(since)}})
             return True
         except self.client.exceptions.ConditionalCheckFailedException:
             return False

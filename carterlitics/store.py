@@ -6,6 +6,7 @@ never see each other's data. The layout:
     c|<site>|<day>|web   <dim>#<value>  n        browser counters, one item per value
     c|<site>|<day>|srv   <dim>#<value>  n        server (CloudFront log) counters
     c|<site>|<day>|web   uv             h = {…}  that day's visitor hashes (a string set)
+    v|<site>|<hash>      -              …        a visitor hash's visit in progress, for a day
     ip|<address>         -              host     its reverse DNS name, cached a week (intel.py)
     l|<site>|<day>|<k>   <ts>#<rand>    …        logs: pv (consented page views), ev, err,
                                                  hum and bot (server requests)
@@ -28,6 +29,17 @@ crawler's own range) and, for a request claiming to be a crawler, whether it is 
 Unique visitors are counted the way Plausible does it: a hash of a random daily salt,
 the site, the IP address and the user agent. The salt is thrown away after two days, so
 a hash can't be traced back to an address once the day is over, and no cookie is used.
+
+Visits are counted from the same hash, so they need no cookie either: a visitor's page
+views and events with no gap longer than IDLE. Each hash's visit in progress is one
+item (when it was last seen, how many page views and events, its first and latest
+page), and the day's counters are kept true as it goes: `ses` visits, `entry#<path>`
+where they began, `bnc` (and `bnc#<entry>`) those with one page view or event so far,
+`exit#<path>` where each was last seen. A visit's second page view or event takes it
+out of `bnc`; a move to another page moves its `exit#`. The hash changes at midnight UTC, so
+a visit does too. Where a visit came from is counted when it begins, from its first page
+view's referrer and campaign tags (classify.source_of): `src#<source>`, `ch#<channel>`,
+`cmp#<utm_campaign>`, each with a bounce counter (`bsrc#`, `bch#`, `bcmp#`) kept like `bnc#`.
 """
 from __future__ import annotations
 
@@ -47,7 +59,7 @@ from typing import NamedTuple
 from . import classify
 from .classify import Bot, clean_path, text, valid_id, valid_name
 from .geo import Geo, Geolocator
-from .intel import Intel, Intelligence, canonical, clock_elsewhere, verify
+from .intel import PROOFS, Intel, Intelligence, canonical, clock_elsewhere, verify
 
 DAY = 86400
 MAX_ITEMS = 50                 # per browser batch
@@ -58,6 +70,7 @@ TOP = 25
 BEACON_DNS = 0.8               # seconds a browser batch may wait on reverse DNS
 SERVER_DNS = 2.0               # ... a backend's batch of events
 LOG_DNS = 20.0                 # ... a CloudFront log file, all its addresses at once
+IDLE = 30 * 60                 # seconds without a page view or event that end a visit (c.js: the same)
 
 
 def now() -> datetime:
@@ -103,6 +116,10 @@ def log_pk(site: str, day: str, kind: str) -> str:
 
 def sessions_pk(site: str, day: str) -> str:
     return f"s|{site}|{day}"
+
+
+def visit_pk(site: str, visitor: str) -> str:
+    return f"v|{site}|{visitor}"
 
 
 def groups_pk(site: str) -> str:
@@ -265,6 +282,10 @@ class Store:
         if not consented:
             sid = vid = fp = None
         uid = text(batch.get("uid"), 120) if consented else ""
+        # The consent version the visitor accepted (c.js's data-consent-version): which
+        # version of the site's policy their records were collected under.
+        cv = batch.get("cv") if consented else 0
+        cv = cv if isinstance(cv, int) and not isinstance(cv, bool) and 0 < cv < 1_000_000 else 0
         start_day = batch.get("sd") if consented and isinstance(batch.get("sd"), str) else day
         if start_day not in days_back(3, at):
             start_day = day
@@ -286,6 +307,9 @@ class Store:
         logs: list[dict] = []
         session: Counter = Counter()
         new_session: dict | None = None
+        exit_path = ""           # the consented session's latest page in this batch
+        steps: list[str] = []    # the page views and events that move a visit on: their paths
+        origin: classify.Source | None = None   # the batch's first page view's source, if it begins a visit
         groups: list[tuple[str, dict]] = []
         stored = 0
         viewed = False
@@ -304,7 +328,15 @@ class Store:
                 if elsewhere:
                     about["tzx"] = 1
             return {"vid": vid, "sid": sid, "fp": fp or "", "uid": uid, "ip": text(meta.ip, 64),
-                    "ua": text(ua), **about}
+                    "ua": text(ua), **({"cv": cv} if cv else {}), **about}
+
+        def begin(path: str, ref, source: classify.Source) -> dict:
+            """A consented session's record, from the item that began it (`new`)."""
+            return {"pk": sessions_pk(site.id, start_day), "sk": sid, "started": iso(at), "last": iso(at),
+                    "path": path, "exit": path, "ref": classify.referrer_of(ref, own),
+                    "src": source.name, "ch": source.channel, **({"cmp": source.campaign} if source.campaign else {}),
+                    "browser": browser, "os": system, "device": device, **who(),
+                    "pages": 0, "events": 0, "errors": 0, "ms": 0, "expires": self.keep("recordings")}
 
         for seq, item in enumerate(items[:MAX_ITEMS]):
             if not isinstance(item, dict):
@@ -320,27 +352,25 @@ class Store:
                 if bot:
                     counts[(W, "jsbot")] += 1
                     continue
-                ref = classify.referrer_of(item.get("r"), own)
+                source = classify.source_of(item.get("r"), item.get("u"), own)
                 if not dup:
-                    for sk in ("pv", f"path#{path}", f"ref#{ref}", f"dev#{device}",
+                    origin = origin or source
+                    for sk in ("pv", f"path#{path}", f"dev#{device}",
                                f"cty#{geo.country or '??'}", f"br#{browser}", f"os#{system}", f"net#{net}"):
                         counts[(W, sk)] += 1
                     if elsewhere:
                         counts[(W, "tzx")] += 1
                     viewed = True
+                    steps.append(path)
                 stored += 1
                 if consented:
                     logs.append({"pk": log_pk(site.id, day, "pv"), "sk": stamp(at, seq), "path": path,
                                  "ref": text(item.get("r"), 300), "browser": browser, "os": system,
                                  "device": device, **who(), "expires": self.keep("visits")})
                     session["pages"] += 1
-                    if item.get("new") is True:
-                        new_session = {"pk": sessions_pk(site.id, start_day), "sk": sid,
-                                       "started": iso(at), "last": iso(at), "path": path,
-                                       "ref": classify.referrer_of(item.get("r"), own),
-                                       "browser": browser, "os": system, "device": device, **who(),
-                                       "pages": 0, "events": 0, "errors": 0, "ms": 0,
-                                       "expires": self.keep("recordings")}
+                    exit_path = path
+                    if item.get("new") is True and new_session is None:
+                        new_session = begin(path, item.get("r"), source)
 
             elif kind == "leave":
                 if meta.opted_out or bot or not path:
@@ -370,6 +400,14 @@ class Store:
                              "expires": self.keep("events")})
                 session["events"] += 1
                 stored += 1
+                # Google's non_interaction: the event happened, the visitor didn't do anything.
+                if props.get("non_interaction") is not True:
+                    steps.append(path or "")
+                if consented:
+                    exit_path = path or exit_path
+                    # A session the visitor came back to with a click, not a page view.
+                    if item.get("new") is True and new_session is None:
+                        new_session = begin(path or "", None, classify.DIRECT)
 
             elif kind == "err":
                 if bot:
@@ -392,14 +430,17 @@ class Store:
                 session["errors"] += 1
                 stored += 1
 
-        if viewed:
-            try:
-                self.table.add_to_set(W, "uv", "h", {self.visitor_hash(site.id, day, meta.ip, ua)},
-                                      self.keep("counts"))
-            except Exception as e:  # noqa: BLE001 - a full set must not lose the page view
-                print(json.dumps({"event": "uv_set_failed", "site": site.id, "error": str(e)[:200]}))
+        if steps or viewed:
+            visitor = self.visitor_hash(site.id, day, meta.ip, ua)
+            if steps:
+                counts.update(self.visit(site.id, W, visitor, at, steps, origin or classify.DIRECT))
+            if viewed:
+                try:
+                    self.table.add_to_set(W, "uv", "h", {visitor}, self.keep("counts"))
+                except Exception as e:  # noqa: BLE001 - a full set must not lose the page view
+                    print(json.dumps({"event": "uv_set_failed", "site": site.id, "error": str(e)[:200]}))
 
-        self.table.add_many(dict(counts), self.keep("counts"))
+        self.table.add_many({k: n for k, n in counts.items() if n}, self.keep("counts"))
         if logs:
             self.table.put_many(logs)
         for gid, err in groups:
@@ -413,8 +454,61 @@ class Store:
                 self.table.put_new(new_session)
             if session:
                 self.table.update(sessions_pk(site.id, start_day), sid, add=dict(session),
-                                  set_={"last": iso(at), **({"uid": uid} if uid else {})}, must_exist=True)
+                                  set_={"last": iso(at), **({"exit": exit_path} if exit_path else {}),
+                                        **({"uid": uid} if uid else {}), **({"cv": cv} if cv else {})},
+                                  must_exist=True)
         return {"stored": stored}
+
+    def visit(self, site_id: str, W: str, visitor: str, at: datetime, steps: list[str],
+              source: classify.Source | None = None) -> Counter:
+        """Move a visitor's visit on by `steps`, the paths of a batch's page views and
+        events in order ('' for an event on no counted page), and return what that does
+        to the day's counters (`W`). More than IDLE since the visit was last seen, or no
+        visit yet: this begins one, from `source` (`src#`, `ch#`, `cmp#`, and while it is
+        a bounce, `bsrc#`, `bch#`, `bcmp#`)."""
+        pk, t = visit_pk(site_id, visitor), int(at.timestamp())
+        tags = {k: v for k, v in (("src", source.name), ("ch", source.channel), ("cmp", source.campaign))
+                if v} if source else {}
+        since = t - IDLE
+        first = next((p for p in steps if p), "")
+        last = next((p for p in reversed(steps) if p), "")
+        out: Counter = Counter()
+        for _ in range(2):  # lost a race with another request from the same visitor: once more
+            before = self.table.update_if_recent(pk, "-", "last", since, add={"n": len(steps)},
+                                                 set_={"last": t, **({"exit": last} if last else {})})
+            if before is not None:
+                if before.get("n") == 1:  # it had been a bounce
+                    out[(W, "bnc")] -= 1
+                    if before.get("entry"):
+                        out[(W, f"bnc#{before['entry']}")] -= 1
+                    for k in ("src", "ch", "cmp"):
+                        if before.get(k):
+                            out[(W, f"b{k}#{before[k]}")] -= 1
+                old = before.get("exit") or ""
+                if last and last != old:
+                    if old:
+                        out[(W, f"exit#{old}")] -= 1
+                    out[(W, f"exit#{last}")] += 1
+                return out
+            item = {"pk": pk, "sk": "-", "last": t, "n": len(steps), "entry": first, "exit": last, **tags,
+                    "expires": int(time.time()) + DAY}
+            if self.table.put_unless_recent(item, "last", since):
+                bounce = len(steps) == 1
+                out[(W, "ses")] += 1
+                if bounce:
+                    out[(W, "bnc")] += 1
+                if first:
+                    out[(W, f"entry#{first}")] += 1
+                    if bounce:
+                        out[(W, f"bnc#{first}")] += 1
+                if last:
+                    out[(W, f"exit#{last}")] += 1
+                for k, v in tags.items():
+                    out[(W, f"{k}#{v}")] += 1
+                    if bounce:
+                        out[(W, f"b{k}#{v}")] += 1
+                return out
+        return out
 
     @staticmethod
     def _error(item: dict) -> dict | None:
@@ -429,6 +523,42 @@ class Store:
         return {"kind": kind, "name": text(item.get("name"), 80), "message": message,
                 "stack": text(item.get("st"), 4000), "src": text(item.get("src"), 300),
                 "line": num(item.get("ln")), "col": num(item.get("col"))}
+
+    # -- what the collector makes of a visitor, for the page that asks (c.js's cl("who"))
+
+    def who(self, meta: Meta, zone: str = "", webdriver: bool = False) -> dict:
+        """The verdict on one request, for the page that made it: a bot (and, for a
+        crawler that can be checked, whether it is the real one), the kind of connection,
+        the lists that name the address, and whether the browser's clock (`zone`) keeps
+        another time than the address's. Nothing is stored or counted.
+
+        Only a request that says it is a crawler checked by its name gets a reverse DNS
+        lookup, and only when its address hasn't already proved it: a person's address
+        is never looked up for this."""
+        ua = meta.user_agent or ""
+        geo = self.locate(meta.ip, meta.country, meta.asn, meta.city, meta.region, meta.tz)
+        about = self.intel.local(meta.ip)
+        has_ranges = self.intel.ranges is not None
+        bot = classify.bot_of(ua)
+        verified = None
+        if bot:
+            ver = verify(bot.name, about, geo.asn, has_ranges)
+            proof = PROOFS.get(bot.name)
+            if ver != "verified" and proof and proof.hosts:
+                about = self.intel.lookup(meta.ip, BEACON_DNS)
+                ver = verify(bot.name, about, geo.asn, has_ranges)
+            verified = {"verified": True, "spoofed": False}.get(ver)
+        elif webdriver:
+            bot = Bot("webdriver", "automation")
+        elif about.listed:
+            bot = Bot("Spamhaus DROP", "scanner")  # as the server logs count it
+        return {
+            "bot": {"name": bot.name, "category": bot.category, "verified": verified} if bot else None,
+            "net": about.net(geo.network) or "isp", "service": about.service(),
+            "listed": about.listed, "abuse": list(about.abuse),
+            "elsewhere": clock_elsewhere(zone, geo.tz, now()),
+            "country": geo.country, "asn": geo.asn, "network": geo.network,
+        }
 
     # -- events from a site's own server
 
@@ -599,8 +729,9 @@ class Store:
     def report(self, site, days: int) -> dict:
         """Everything the console's dashboards show, for one site over `days` days."""
         keys = days_back(days)
+        # sources_from: the first day in range whose visits were counted by source.
         out = {"site": site.id, "configured": self.table is not None, "days": days, "series": [],
-               "totals": {}, "top": {}, "groups": []}
+               "totals": {}, "top": {}, "groups": [], "sources_from": ""}
         if not self.table:
             return out
         with ThreadPoolExecutor(max_workers=16) as pool:
@@ -613,7 +744,11 @@ class Store:
         totals: Counter = Counter()
         for day, w_items, s_items in zip(keys, webs, srvs):
             row = {"day": day, "pv": 0, "uv": 0, "ms": 0, "jsbot": 0, "ev": 0, "err": 0, "req": 0,
-                   "hum": 0, "bot": 0, "dc": 0, "tzx": 0, "abuse": 0}
+                   "hum": 0, "bot": 0, "dc": 0, "tzx": 0, "abuse": 0, "ses": 0, "bnc": 0, "vpv": 0}
+            # Only days that counted visits (from the deploy that added them on) go into exit rates.
+            visits = any(item["sk"] == "ses" for item in w_items)
+            if not out["sources_from"] and any(item["sk"].startswith("ch#") for item in w_items):
+                out["sources_from"] = day
             for item in w_items + s_items:
                 sk = item["sk"]
                 if sk == "uv":
@@ -625,23 +760,50 @@ class Store:
                     continue
                 kind, value = sk.split("#", 1)
                 dims.setdefault(kind, Counter())[value] += item.get("n", 0)
+                if visits and kind == "path":
+                    dims.setdefault("vpath", Counter())[value] += item.get("n", 0)
+            if visits:
+                row["vpv"] = row["pv"]
             for k, v in row.items():
                 if k != "day":
                     totals[k] += v
             out["series"].append(row)
 
         def top(kind: str, n: int = TOP) -> list[dict]:
-            rows = sorted((dims.get(kind) or {}).items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+            rows = sorted((kv for kv in (dims.get(kind) or {}).items() if kv[1] > 0),
+                          key=lambda kv: (-kv[1], kv[0]))[:n]
             return [{"name": k, "value": v} for k, v in rows]
 
+        def share(a: int, b: int) -> float | None:
+            # At most 1: a visit that began with a click on a page viewed the day before
+            # exits from it without a view of it that day.
+            return round(min(a / b, 1.0), 4) if b else None
+
+        def visits_by(kind: str) -> list[dict]:
+            """Visits by where they came from, with the share that bounced."""
+            rows, bounced = top(kind), dims.get(f"b{kind}") or Counter()
+            for row in rows:
+                row["bounce_rate"] = share(bounced[row["name"]], row["value"])
+            return rows
+
+        views, exits, bounces = (dims.get(k) or Counter() for k in ("vpath", "exit", "bnc"))
         paths = top("path", 50)
         for row in paths:
             # Engaged time per view: visible time only, summed over every leave.
             ms = dims.get("ms", {}).get(row["name"], 0)
             row["avg_ms"] = round(ms / row["value"]) if ms and row["value"] else None
+            row["exit_rate"] = share(exits[row["name"]], views[row["name"]])
+        entries = top("entry", 50)
+        for row in entries:
+            row["bounce_rate"] = share(bounces[row["name"]], row["value"])
+        leaving = top("exit", 50)
+        for row in leaving:
+            row["exit_rate"] = share(row["value"], views[row["name"]])
         out["totals"] = dict(totals)
         out["top"] = {
-            "paths": paths, "referrers": top("ref"), "devices": top("dev"), "countries": top("cty"),
+            "paths": paths, "entries": entries, "exits": leaving,
+            "sources": visits_by("src"), "channels": visits_by("ch"), "campaigns": visits_by("cmp"),
+            "devices": top("dev"), "countries": top("cty"),
             "browsers": top("br"), "systems": top("os"), "events": top("ev", 50),
             "bots": top("sb", 50), "categories": top("sc"), "statuses": top("ss"),
             "bot_paths": top("sp", 50), "bot_ips": top("sip", 50), "bot_networks": top("sasn", 30),

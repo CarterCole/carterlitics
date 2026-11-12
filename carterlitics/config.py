@@ -115,6 +115,16 @@ class Funnel:
         return {"name": self.name, "by": self.by, "steps": [s.text for s in self.steps]}
 
 
+def google_account(google: dict) -> str:
+    """The service account's address: given whole (`account`), or made from `project` and
+    `service_account` (its name, "carterlitics" unless set)."""
+    if google.get("account"):
+        return str(google["account"])
+    if google.get("project"):
+        return f"{google.get('service_account', 'carterlitics')}@{google['project']}.iam.gserviceaccount.com"
+    return ""
+
+
 @dataclass(frozen=True)
 class Site:
     id: str                          # "cartercole.net": the key everything is stored under
@@ -126,6 +136,12 @@ class Site:
     dev_url: str = ""                # its local dev server, for links and the CSP
     client: bool = True              # its pages load c.js; false = server logs only
     funnels: tuple[Funnel, ...] = () # [[site.funnel]]: the console's Funnels tab
+    consent_docs: str = ""           # "/privacy/v{version}": each consent version's policy, for the console
+
+    @property
+    def consent_docs_url(self) -> str:
+        """`consent_docs` on the site: "https://cartercole.com/privacy/v{version}", or ""."""
+        return self.url.rstrip("/") + self.consent_docs if self.consent_docs else ""
 
     @property
     def host(self) -> str:
@@ -161,6 +177,8 @@ class Config:
     client_secret: str = ""
     admin_role: str = "god"
     admin_ids: frozenset[str] = frozenset()
+    # Search Console: the service account that reads it ([google] in carterlitics.toml)
+    google_account: str = ""
     # secrets
     origin_secret: str = ""           # CloudFront sends it; requests without it are refused
     session_secret: str = ""          # signs the console's session cookie
@@ -214,9 +232,12 @@ class Config:
                 distribution=s.get("distribution", ""), server_ip=s.get("server_ip", "full"),
                 dev_url=s.get("dev_url", ""), client=bool(s.get("client", True)),
                 funnels=tuple(Funnel.parse(f, s["id"]) for f in s.get("funnel", ())),
+                consent_docs=s.get("consent_docs", ""),
             )
             if site.server_ip not in ("full", "truncate"):
                 raise ValueError(f"{site.id}: server_ip must be 'full' or 'truncate'")
+            if site.consent_docs and not (site.consent_docs.startswith("/") and "{version}" in site.consent_docs):
+                raise ValueError(f"{site.id}: consent_docs is a path with {{version}} in it, like /privacy/v{{version}}")
             names = [f.name for f in site.funnels]
             if len(names) != len(set(names)):
                 raise ValueError(f"{site.id}: two funnels share a name")
@@ -230,7 +251,8 @@ class Config:
             sites=sites, console=data.get("console", ""), mount=data.get("mount", "/_c").rstrip("/"),
             retention=retention, issuer=auth.get("issuer", "").rstrip("/"),
             admin_role=auth.get("admin_role", "god"),
-            admin_ids=frozenset(auth.get("admin_ids", ())), **overrides,
+            admin_ids=frozenset(auth.get("admin_ids", ())),
+            google_account=google_account(data.get("google", {})), **overrides,
         )
 
     @classmethod
@@ -258,7 +280,9 @@ class Config:
             "console": self.console, "mount": self.mount, "retention": self.retention,
             "auth": {"issuer": self.issuer, "admin_role": self.admin_role,
                      "admin_ids": sorted(self.admin_ids)},
+            **({"google": {"account": self.google_account}} if self.google_account else {}),
             "site": [{"id": s.id, "url": s.url, "aliases": list(s.aliases), "exclude": list(s.exclude),
-                      "server_ip": s.server_ip, **({"funnel": [f.to_data() for f in s.funnels]} if s.funnels else {})}
+                      "server_ip": s.server_ip, **({"consent_docs": s.consent_docs} if s.consent_docs else {}),
+                      **({"funnel": [f.to_data() for f in s.funnels]} if s.funnels else {})}
                      for s in self.sites.values()],
         }

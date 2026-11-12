@@ -8,7 +8,9 @@ CloudFront does in production, so beacons, the console and replays all work on t
 site's own origin. Sign-in is a shortcut: /_c/auth/login makes you the administrator.
 Set GEO_MMDB to a .mmdb file (or several, comma-separated) for country and network.
 Set INTEL_RANGES to geo/ranges.bin (`infra/deploy.py intel`) for the published ranges;
-reverse DNS is on unless INTEL_DNS=off. The demo uses neither: it makes its own.
+reverse DNS is on unless INTEL_DNS=off. The Search tab asks Google as the [google]
+service account, through gcloud's application default credentials. The demo uses none
+of these: it makes its own.
 
     POST /_c/dev/logs   CloudFront log text (W3C or JSON lines), counted as if S3 had
                         delivered it: the way to see the server-side reports locally.
@@ -28,6 +30,7 @@ from .app import App
 from .backends import MemoryBlobs, MemoryTable
 from .config import Config
 from .geo import Geolocator
+from .google import SearchConsole
 from .intel import Intelligence
 from .store import Store
 from .web import Request
@@ -93,7 +96,13 @@ def main() -> int:
         cfg = configure(cfg)
     table = MemoryTable()
     intel = Intelligence.from_env(table)
-    app = App(cfg, Store(cfg, table, MemoryBlobs(), geo, intel))
+    if args.demo:
+        from .demo import search_console
+
+        search = search_console(cfg)
+    else:
+        search = SearchConsole.from_env(cfg.google_account)   # gcloud acts as the service account
+    app = App(cfg, Store(cfg, table, MemoryBlobs(), geo, intel), search)
     if args.demo:
         from .demo import fill
 

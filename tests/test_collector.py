@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -155,6 +156,43 @@ class Classify(unittest.TestCase):
         self.assertEqual(classify.referrer_of("https://www.a.example/blog", own), "direct")
         self.assertEqual(classify.referrer_of(None, own), "direct")
 
+    def test_sources(self):
+        own = frozenset({"a.example"})
+
+        def of(referrer, **tags):
+            s = classify.source_of(referrer, tags, own)
+            return s.name, s.channel, s.campaign
+
+        self.assertEqual(of(None), ("Direct", "Direct", ""))
+        self.assertEqual(of("https://www.a.example/blog"), ("Direct", "Direct", ""))
+        # Grouped by who it is, the most specific host first.
+        self.assertEqual(of("https://www.google.co.uk/"), ("Google", "Search", ""))
+        self.assertEqual(of("android-app://com.google.android.googlequicksearchbox/"), ("Google", "Search", ""))
+        self.assertEqual(of("https://mail.google.com/mail/u/0/"), ("Gmail", "Email", ""))
+        self.assertEqual(of("https://gemini.google.com/app"), ("Gemini", "AI assistants", ""))
+        self.assertEqual(of("https://l.facebook.com/l.php"), ("Facebook", "Social", ""))
+        self.assertEqual(of("https://t.co/abc"), ("X", "Social", ""))
+        self.assertEqual(of("https://google.evil.example/"), ("google.evil.example", "Referral", ""))
+        self.assertEqual(of("https://blog.example.com/post"), ("blog.example.com", "Referral", ""))
+        # A link's own tags win, and name a known source the same way its host does.
+        self.assertEqual(of("https://www.google.com/", utm_source="Newsletter", utm_medium="email",
+                            utm_campaign="  November   Notes "), ("newsletter", "Email", "november notes"))
+        self.assertEqual(of(None, utm_source="chatgpt.com"), ("ChatGPT", "AI assistants", ""))
+        self.assertEqual(of("https://news.ycombinator.com/item?id=1", ref="hn"), ("Hacker News", "Social", ""))
+        self.assertEqual(of("https://producthunt.example/p", ref="producthunt"), ("producthunt", "Referral", ""))
+        self.assertEqual(of(None, ref="producthunt"), ("producthunt", "Other", ""))
+        self.assertEqual(of(None, utm_medium="email"), ("(not set)", "Email", ""))
+        self.assertEqual(of(None, utm_source="mastodon", utm_medium="social"), ("Mastodon", "Social", ""))
+        # Paid: by medium, or an ad click id. fbclid is on every link Facebook opens.
+        self.assertEqual(of("https://www.google.com/", utm_source="google", utm_medium="cpc", utm_campaign="launch"),
+                         ("Google", "Paid search", "launch"))
+        self.assertEqual(of(None, click="gclid"), ("Google", "Paid search", ""))
+        self.assertEqual(of(None, click="twclid"), ("X", "Paid social", ""))
+        self.assertEqual(of(None, click="fbclid"), ("Facebook", "Social", ""))
+        self.assertEqual(of(None, click="nope"), ("Direct", "Direct", ""))
+        self.assertEqual(of(None, utm_source="x" * 300)[0], "x" * 100)
+        self.assertEqual(classify.source_of("https://bing.com/", "not tags", own).name, "Bing")
+
     def test_errors_group_across_builds(self):
         a = "TypeError: x is undefined\n    at go (https://a.example/app-3f9a1c2e.js:10:5)"
         b = "TypeError: x is undefined\n    at go (https://a.example/app-77aa88bb.js:12:9)"
@@ -190,6 +228,22 @@ class Ingest(unittest.TestCase):
         self.call.sign_in()
         return body(self.call("GET", "/_c/api/report", query={"site": site, "days": str(days)}))
 
+    def test_consent_version_is_kept(self):
+        """The version of the site's policy a visitor accepted goes on everything they send."""
+        ids = {"vid": VID, "sid": SID, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
+        self.call("POST", "/_c/i", {**ids, "cv": 2, "items": [{"t": "pv", "p": "/", "new": True}, {"t": "ev", "n": "x"}]})
+        for bad in (True, "2", -1, 10 ** 7):
+            self.call("POST", "/_c/i", {**ids, "cv": bad, "items": [{"t": "ev", "n": "y"}]})
+        self.call.sign_in()
+        session = body(self.call("GET", "/_c/api/sessions", query={"site": "a.example"}))["items"][0]
+        self.assertEqual(session["cv"], 2)
+        view, = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "pv"}))["items"]
+        self.assertEqual(view["cv"], 2)
+        events = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "ev"}))["items"]
+        self.assertEqual(sorted((e["name"], e.get("cv")) for e in events), [("x", 2)] + [("y", None)] * 4)
+        me = body(self.call("GET", "/_c/api/me"))
+        self.assertEqual({s["id"]: s["consent_docs"] for s in me["sites"]}, {"a.example": "", "b.example": ""})
+
     def test_refuses_without_the_origin_secret(self):
         res = self.call("POST", "/_c/i", {"items": []}, headers={"x-origin-verify": "nope"})
         self.assertEqual(res.status, 403)
@@ -213,7 +267,10 @@ class Ingest(unittest.TestCase):
         paths = {p["name"]: p for p in r["top"]["paths"]}
         self.assertEqual(paths["/x"]["avg_ms"], 4000)
         self.assertEqual({d["name"] for d in r["top"]["devices"]}, {"desktop", "mobile"})
-        self.assertIn({"name": "news.example", "value": 1}, r["top"]["referrers"])
+        self.assertEqual({s["name"]: (s["value"], s["bounce_rate"]) for s in r["top"]["sources"]},
+                         {"news.example": (1, 0.0), "Direct": (1, 1.0)})
+        self.assertEqual({s["name"] for s in r["top"]["channels"]}, {"Referral", "Direct"})
+        self.assertEqual(r["sources_from"], r["series"][-1]["day"])
         # Nothing identifying was stored for anonymous visitors.
         self.assertEqual(body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "pv"}))["items"], [])
         events = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "ev"}))["items"]
@@ -253,14 +310,97 @@ class Ingest(unittest.TestCase):
         sessions = body(self.call("GET", "/_c/api/sessions", query={"site": "a.example"}))["items"]
         self.assertEqual(len(sessions), 1)
         s = sessions[0]
-        self.assertEqual((s["id"], s["pages"], s["errors"], s["ms"], s["rec"], s["uid"], s["ip"]),
-                         (SID, 3, 1, 2000, 1, "user-1", "8.8.8.8"))
+        self.assertEqual((s["id"], s["pages"], s["errors"], s["ms"], s["rec"], s["uid"], s["ip"], s["exit"]),
+                         (SID, 3, 1, 2000, 1, "user-1", "8.8.8.8", "/x"))
         views = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "pv"}))["items"]
         self.assertEqual({v["fp"] for v in views}, {FP})
         res = self.call("GET", "/_c/api/recording", query={"site": "a.example", "id": SID})
         self.assertEqual([e["timestamp"] for e in body(res)], [1, 2, 3])
         # Another site can't read it.
         self.assertEqual(self.call("GET", "/_c/api/recording", query={"site": "b.example", "id": SID}).status, 404)
+
+    def test_a_session_can_begin_with_an_event(self):
+        # c.js's session went idle and the visitor came back with a click, not a page view.
+        ids = {"vid": VID, "sid": SID, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
+        self.call("POST", "/_c/i", {**ids, "items": [{"t": "ev", "n": "outbound", "p": "/x", "new": True}]})
+        self.call.sign_in()
+        s = body(self.call("GET", "/_c/api/sessions", query={"site": "a.example"}))["items"][0]
+        self.assertEqual((s["id"], s["pages"], s["events"], s["path"], s["exit"], s["ref"]),
+                         (SID, 0, 1, "/x", "/x", "direct"))
+
+    def visit(self, minute, items, ip="8.8.8.8", **kw):
+        # From 01:00 UTC today: one day's salt, so one visitor hash per address.
+        at = store_module.now().replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(minutes=minute)
+        with mock.patch.object(store_module, "now", lambda: at):
+            self.call("POST", "/_c/i", {"items": items}, ip=ip, **kw)
+
+    def test_visits_bounces_and_exits(self):
+        pv = lambda p: {"t": "pv", "p": p}  # noqa: E731
+        self.visit(0, [pv("/")])                                    # / then /x: one visit
+        self.visit(5, [pv("/x")])
+        self.visit(0, [pv("/")], ip="1.1.1.1")                      # a bounce, and it stays one:
+        self.visit(1, [{"t": "ev", "n": "seen", "props": {"non_interaction": True}}], ip="1.1.1.1")
+        self.visit(1, [{"t": "leave", "p": "/", "ms": 60000}], ip="1.1.1.1")
+        self.visit(0, [pv("/x"), {"t": "ev", "n": "outbound"}], ip="2.2.2.2")   # a click: not a bounce
+        self.visit(36, [pv("/y")])                                  # 31 minutes after /x: a new visit
+        self.visit(2, [pv("/")], ip="3.3.3.3", headers={"sec-gpc": "1"})        # opted out: none
+        self.visit(2, [pv("/")], ip="4.4.4.4", ua="Mozilla/5.0 (compatible; Googlebot/2.1)")
+        r = self.report()
+        t = r["totals"]
+        self.assertEqual((t["ses"], t["bnc"], t["pv"], t["vpv"]), (4, 2, 5, 5))
+        self.assertEqual({e["name"]: (e["value"], e["bounce_rate"]) for e in r["top"]["entries"]},
+                         {"/": (2, 0.5), "/x": (1, 0.0), "/y": (1, 1.0)})
+        self.assertEqual({e["name"]: (e["value"], e["exit_rate"]) for e in r["top"]["exits"]},
+                         {"/x": (2, 1.0), "/": (1, 0.5), "/y": (1, 1.0)})
+        self.assertEqual({p["name"]: p["exit_rate"] for p in r["top"]["paths"]}, {"/": 0.5, "/x": 1.0, "/y": 1.0})
+
+    def test_visits_by_source_channel_and_campaign(self):
+        pv = lambda p, r=None, **u: {"t": "pv", "p": p, "r": r, **({"u": u} if u else {})}  # noqa: E731
+        self.visit(0, [pv("/", "https://www.google.co.uk/")])                 # Google, then a second page
+        self.visit(3, [pv("/x", "https://a.example/")])
+        self.visit(0, [pv("/", None, utm_source="Newsletter", utm_medium="email", utm_campaign="November Notes")],
+                   ip="1.1.1.1")
+        self.visit(2, [pv("/x", None, utm_source="other")], ip="1.1.1.1")   # the visit's source stays
+        self.visit(0, [pv("/", "https://a.example/x")], ip="2.2.2.2")        # internal: direct, a bounce
+        self.visit(0, [pv("/", "https://www.google.com/", utm_source="google", utm_medium="cpc",
+                          utm_campaign="launch", click="gclid")], ip="4.4.4.4")
+        self.visit(1, [pv("/", "https://bsky.app/")], ip="3.3.3.3", headers={"sec-gpc": "1"})   # opted out
+        r = self.report()
+
+        def by(kind):
+            return {s["name"]: (s["value"], s["bounce_rate"]) for s in r["top"][kind]}
+
+        self.assertEqual(by("sources"), {"Google": (2, 0.5), "newsletter": (1, 0.0), "Direct": (1, 1.0)})
+        self.assertEqual(by("channels"), {"Search": (1, 0.0), "Email": (1, 0.0), "Direct": (1, 1.0),
+                                          "Paid search": (1, 1.0)})
+        self.assertEqual(by("campaigns"), {"november notes": (1, 0.0), "launch": (1, 1.0)})
+        self.assertEqual(r["totals"]["ses"], 4)
+
+    def test_a_consented_session_keeps_its_source(self):
+        ids = {"vid": VID, "sid": SID, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
+        self.call("POST", "/_c/i", {**ids, "items": [{"t": "pv", "p": "/", "r": "https://news.ycombinator.com/",
+                                                      "u": {"utm_campaign": "Show HN"}, "new": True}]})
+        self.call.sign_in()
+        s = body(self.call("GET", "/_c/api/sessions", query={"site": "a.example"}))["items"][0]
+        self.assertEqual((s["ref"], s["src"], s["ch"], s["cmp"]),
+                         ("news.ycombinator.com", "Hacker News", "Social", "show hn"))
+
+    def test_a_visit_begun_by_another_request(self):
+        store, W = self.app.store, store_module.web("a.example", "2026-01-01")
+        at = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        self.assertEqual(store.visit("a.example", W, "abc", at, ["/"]),
+                         {(W, "ses"): 1, (W, "bnc"): 1, (W, "entry#/"): 1, (W, "bnc#/"): 1, (W, "exit#/"): 1})
+        real, calls = store.table.update_if_recent, []
+
+        def late(*args, **kw):  # the first look misses the visit another request just began
+            calls.append(1)
+            return None if len(calls) == 1 else real(*args, **kw)
+
+        with mock.patch.object(store.table, "update_if_recent", late):
+            out = store.visit("a.example", W, "abc", at + timedelta(minutes=1), ["/x", ""])
+        self.assertEqual(out, {(W, "bnc"): -1, (W, "bnc#/"): -1, (W, "exit#/"): -1, (W, "exit#/x"): 1})
+        # Nothing on a counted page: the visit goes on, its exit stays.
+        self.assertEqual(store.visit("a.example", W, "abc", at + timedelta(minutes=2), [""]), {})
 
     def test_bad_identifiers_are_anonymous(self):
         self.call("POST", "/_c/i", {"vid": "x#y", "sid": SID, "items": [{"t": "pv", "p": "/"}]})
@@ -557,6 +697,46 @@ class Enrichment(unittest.TestCase):
         self.call.cookies.clear()
         self.assertEqual(self.call("GET", "/_c/api/ip", query={"ip": "66.249.66.1"}).status, 401)
 
+    def test_who(self):
+        """What a page hears when it asks about its visitor (c.js's cl("who"))."""
+        calls: list[str] = []
+        self.app.store.intel = fake_intel(self.app.store.table, calls)
+        google = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+
+        def who(ip, ua=SAFARI, query=None, headers=None):
+            res = self.call("GET", "/_c/who", ip=ip, ua=ua, query=query, headers=headers)
+            self.assertEqual((res.status, res.headers["Cache-Control"]), (200, "no-store"))
+            return body(res)
+
+        chicago = {"cloudfront-viewer-time-zone": "America/Chicago"}
+        self.assertEqual(who("198.51.100.7", query={"tz": "Europe/Berlin"}, headers=chicago), {
+            "bot": None, "net": "isp", "service": "", "listed": False, "abuse": [], "elsewhere": True,
+            "country": "US", "asn": "", "network": ""})
+        self.assertIs(who("198.51.100.7", query={"tz": "America/Chicago"}, headers=chicago)["elsewhere"], False)
+        self.assertEqual({ip: (w["net"], w["service"]) for ip in ("172.224.1.1", "52.4.2.2", "2001:db8:7::1")
+                          for w in [who(ip)]},
+                         {"172.224.1.1": ("relay", "iCloud Private Relay"), "52.4.2.2": ("hosting", "AWS EC2 us-east-1"),
+                          "2001:db8:7::1": ("tor", "Tor exit")})
+        self.assertEqual(who("203.0.113.9")["abuse"], ["blocklist.de"])
+        dropped = who("1.10.16.5")
+        self.assertEqual((dropped["bot"], dropped["listed"]),
+                         ({"name": "Spamhaus DROP", "category": "scanner", "verified": None}, True))
+        # Crawlers are checked: by their published ranges, else by a name that resolves back.
+        real = who("66.249.66.1", google)
+        self.assertEqual((real["bot"], real["net"]),
+                         ({"name": "Googlebot", "category": "search", "verified": True}, "crawler"))
+        self.assertIs(who("52.4.1.1", google)["bot"]["verified"], False)
+        self.assertIs(who("52.4.9.9", google)["bot"]["verified"], False)   # named like Googlebot, isn't
+        self.assertEqual(who("198.51.100.7", query={"wd": "1"})["bot"],
+                         {"name": "webdriver", "category": "automation", "verified": None})
+        self.assertEqual(who("198.51.100.7", ua="")["bot"]["name"], "(no user agent)")
+        self.assertIsNone(who("198.51.100.7", headers={"dnt": "1"})["bot"])
+        # Reverse DNS only for crawler claims the ranges didn't settle; nothing counted or kept but that.
+        self.assertEqual(sorted(calls), ["52.4.1.1", "52.4.9.9"])
+        self.assertEqual([pk for pk in self.app.store.table.items if not pk.startswith("ip|")], [])
+        self.assertEqual(self.call("GET", "/_c/who", site="nope.example").status, 404)
+        self.assertEqual(self.call("GET", "/_c/who", site=None).status, 404)
+
 
 class Console(unittest.TestCase):
     def setUp(self):
@@ -659,6 +839,15 @@ VID2 = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
 class FunnelConfig(unittest.TestCase):
+    def test_consent_docs(self):
+        site = {"id": "a.example", "url": "https://a.example/", "consent_docs": "/privacy/v{version}"}
+        cfg = Config.from_data({"site": [site]})
+        self.assertEqual(cfg.sites["a.example"].consent_docs_url, "https://a.example/privacy/v{version}")
+        self.assertEqual(Config.from_data(cfg.to_data()).sites["a.example"].consent_docs, "/privacy/v{version}")
+        for bad in ("privacy/v{version}", "/privacy", "https://a.example/privacy/v{version}"):
+            with self.assertRaises(ValueError):
+                Config.from_data({"site": [{**site, "consent_docs": bad}]})
+
     def test_steps(self):
         page = Step.parse("/pricing/")
         self.assertTrue(page.matches("page", "/pricing"))
@@ -775,9 +964,8 @@ class Funnels(unittest.TestCase):
         self.assertEqual(self.funnels()[0], 401)
 
 
-@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
-class GoogleCalls(unittest.TestCase):
-    """c.js in a stub page (tests/client_harness.js): Google's tracking calls become events."""
+class Page:
+    """c.js in a stub page (tests/client_harness.js), and what it sent."""
 
     def page(self, before="", after="", **spec):
         out = subprocess.run(["node", str(ROOT / "tests" / "client_harness.js"),
@@ -785,6 +973,11 @@ class GoogleCalls(unittest.TestCase):
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         return json.loads(out.stdout)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class GoogleCalls(Page, unittest.TestCase):
+    """Google's tracking calls become events."""
 
     @staticmethod
     def events(out):
@@ -877,6 +1070,158 @@ class GoogleCalls(unittest.TestCase):
         self.assertEqual(out["envelopes"][-1]["uid"], "user-9")
         out = self.page(after="gtag('config', 'G-TEST', { user_id: 'user-9' }); gtag('event', 'x');")
         self.assertNotIn("uid", out["envelopes"][-1])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientCampaignTags(Page, unittest.TestCase):
+    """The landing address's campaign tags go with its page view; ad click ids by name only."""
+
+    @staticmethod
+    def views(out):
+        return [i for i in out["items"] if i["t"] == "pv"]
+
+    def test_tags_and_click_ids(self):
+        out = self.page(url="https://a.example/start?utm_source=Newsletter&utm_campaign=nov&utm_term=x"
+                            "&gclid=SECRET-CLICK&fbclid=abc&ref=" + "r" * 150,
+                        referrer="https://www.google.com/")
+        pv, = self.views(out)
+        self.assertEqual(pv["r"], "https://www.google.com/")
+        self.assertEqual(pv["u"], {"utm_source": "Newsletter", "utm_campaign": "nov", "ref": "r" * 100,
+                                   "click": "gclid"})
+        self.assertNotIn("SECRET-CLICK", json.dumps(out["posts"]))
+
+    def test_an_untagged_address_sends_none(self):
+        pv, = self.views(self.page(url="https://a.example/start?page=2"))
+        self.assertNotIn("u", pv)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientSessions(Page, unittest.TestCase):
+    """c.js's sessions end after 30 minutes without a page view or event."""
+    OLD = "22222222-2222-4222-8222-222222222222"
+    MIN = 60 * 1000
+    CONSENTED = {"consent": "all", "vid": VID}   # a returning visitor: the first new id is the session's
+
+    @staticmethod
+    def sent(out):
+        """(type, sid, new) for each page view and event, in the order they went."""
+        return [(i["t"], p.get("sid"), i.get("new", False))
+                for p in out["posts"] for i in p.get("items", []) if i["t"] in ("pv", "ev")]
+
+    def test_idle_minutes_end_a_session(self):
+        out = self.page(cookies=self.CONSENTED, probe="sessionStorage.getItem('cl_sid')",
+                        after="advance(31 * 60 * 1000); cl('track', 'outbound', {});")
+        (pv, first, new1), (ev, second, new2) = self.sent(out)
+        self.assertEqual((pv, ev, new1, new2), ("pv", "ev", True, True))
+        self.assertEqual(first, SID)
+        self.assertNotEqual(second, SID)
+        self.assertEqual(out["probe"], second)
+
+    def test_activity_keeps_it_going(self):
+        out = self.page(cookies=self.CONSENTED, after=(
+            "advance(29 * 60 * 1000); cl('track', 'a', {}); advance(29 * 60 * 1000); cl('page', '/next');"
+            "advance(40 * 60 * 1000); cl('track', 'seen', { non_interaction: true });"))
+        self.assertEqual({sid for _, sid, _ in self.sent(out)}, {SID})
+        self.assertEqual([new for _, _, new in self.sent(out)], [True, False, False, False])
+
+    def test_a_page_load_after_idle_minutes(self):
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        now = int(time.time() * 1000)
+        for at, same in ((now - 5 * self.MIN, True), (now - 31 * self.MIN, False), (None, False)):
+            stored = {"cl_sid": self.OLD, "cl_sd": today, **({"cl_at": str(at)} if at else {})}
+            (kind, sid, new), = self.sent(self.page(cookies=self.CONSENTED, session=stored))
+            self.assertEqual((kind, sid == self.OLD, new), ("pv", same, not same), at)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientIdentify(Page, unittest.TestCase):
+    """cl("identify"): a consented visitor's user id, and forgetting it."""
+
+    def test_waits_in_memory_for_consent_on_the_page(self):
+        out = self.page(after="cl('identify', 'google:42'); cl('track', 'x', {});",
+                        probe="sessionStorage.getItem('cl_uid')")
+        self.assertEqual(([e.get("uid") for e in out["envelopes"]], out["probe"]), ([None], None))
+        out = self.page(after="cl('identify', 'google:42'); cl('consent', 'all');",
+                        probe="sessionStorage.getItem('cl_uid')")
+        self.assertEqual((out["envelopes"][-1]["uid"], out["probe"]), ("google:42", "google:42"))
+
+    def test_signing_out_forgets_it(self):
+        out = self.page(cookies={"consent": "all", "vid": VID}, probe="sessionStorage.getItem('cl_uid')", after="""
+            cl('identify', 'google:42');
+            carterlitics.flush().then(function () {
+              cl('identify', null); cl('track', 'after', {}); carterlitics.flush(); });""")
+        self.assertEqual([e.get("uid") for e in out["envelopes"]], ["google:42", None])
+        self.assertIsNone(out["probe"])
+        # A later page in the tab doesn't bring it back.
+        out = self.page(cookies={"consent": "all", "vid": VID}, session={"cl_uid": "google:42"},
+                        after="cl('identify', null);")
+        self.assertNotIn("uid", out["envelopes"][-1])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientConsentVersions(Page, unittest.TestCase):
+    """data-consent-version: an Accept given under an earlier version is asked for again."""
+    BANNER = """var banner = { hidden: true, addEventListener: function () {}, querySelector: function () { return null; } };
+                document.querySelector = function (s) { return s === '[data-consent]' ? banner : null; };"""
+    V2 = {"consentVersion": "2"}
+
+    def visit(self, consent, dataset=V2, after=""):
+        """(banner hidden, cl("consent"), identified, cookies) for a page load with that cookie."""
+        out = self.page(before=self.BANNER, after=after, dataset=dataset, cookies={"consent": consent, "vid": VID},
+                        probe="JSON.stringify([banner.hidden, carterlitics.consent(), document.cookie])")
+        hidden, choice, cookies = json.loads(out["probe"])
+        return hidden, choice, "vid" in out["envelopes"][-1], cookies
+
+    def test_an_earlier_accept_is_asked_again(self):
+        self.assertEqual(self.visit("all")[:3], (False, None, False))
+        # Accepting again records the version, and the next page doesn't ask.
+        self.assertIn("consent=all.2", self.visit("all", after="cl('consent', 'all');")[3])
+        self.assertEqual(self.visit("all.2")[:3], (True, "all", True))
+
+    def test_anonymous_only_stands_and_version_1_is_unchanged(self):
+        self.assertEqual(self.visit("essential")[:3], (True, "essential", False))
+        self.assertEqual(self.visit("all", dataset={})[:3], (True, "all", True))
+        self.assertEqual(self.visit("all.3")[:3], (True, "all", True))   # a later version covers this one
+        self.assertEqual(self.visit("all.x")[:3], (False, None, False))   # not a choice at all
+
+    def test_what_they_send_says_which_version_they_accepted(self):
+        def sent(**spec):
+            return self.page(**spec)["envelopes"][-1]
+        self.assertEqual(sent(dataset=self.V2, cookies={"consent": "all.2", "vid": VID})["cv"], 2)
+        self.assertEqual(sent(cookies={"consent": "all", "vid": VID})["cv"], 1)
+        full = sent(dataset={"mode": "full"})   # nobody was asked: no version
+        self.assertEqual(("vid" in full, "cv" in full), (True, False))
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientWho(Page, unittest.TestCase):
+    """cl("who"): what the collector makes of this visitor, when the page asks."""
+    VERDICT = {"bot": None, "net": "vpn", "service": "Mullvad"}
+
+    def test_asked_once_a_page_and_only_when_wanted(self):
+        self.assertEqual(self.page(answers=[self.VERDICT])["gets"], [])
+        out = self.page(answers=[self.VERDICT], probe="Intl.DateTimeFormat().resolvedOptions().timeZone", after="""
+            cl('who').then(function (w) { log.push(w.net); });
+            carterlitics.who(function (w) { log.push(w.service); });""")
+        self.assertEqual(out["log"], ["vpn", "Mullvad"])
+        self.assertEqual(out["gets"], ["/_c/who?tz=" + urllib.parse.quote(out["probe"], safe="")])
+
+    def test_through_the_stub(self):
+        out = self.page(answers=[self.VERDICT], before="""
+            window.cl = window.cl || function () { (cl.q = cl.q || []).push(arguments); };
+            cl('who', function (w) { log.push(w.net); });""")
+        self.assertEqual(out["log"], ["vpn"])
+
+    def test_webdriver_says_so(self):
+        out = self.page(answers=[self.VERDICT], before="navigator.webdriver = true;", after="cl('who');")
+        self.assertTrue(out["gets"][0].endswith("&wd=1"), out["gets"])
+
+    def test_unreachable_is_null_and_asked_again(self):
+        out = self.page(answers=[None, 503, self.VERDICT], after="""
+            cl('who').then(function (a) { log.push(a);
+              cl('who').then(function (b) { log.push(b);
+                cl('who').then(function (c) { log.push(c.net); }); }); });""")
+        self.assertEqual((out["log"], len(out["gets"])), ([None, None, "vpn"], 3))
 
 
 @unittest.skipUnless(os.environ.get("GEO_MMDB"), "set GEO_MMDB to test against a real database")

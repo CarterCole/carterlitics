@@ -3,9 +3,12 @@
      node tests/client_harness.js '{"before": "<page code>", "after": "<page code>", ...}'
 
    `before` runs ahead of c.js (Google's snippet, queued calls), `after` once it has
-   loaded. Page code can push to `log`. Prints what c.js sent, as JSON:
-   { items, envelopes, log, probe }. Spec keys: dataset (the script tag's data-*),
-   cookies, dnt, probe (an expression evaluated last). */
+   loaded. Page code can push to `log`, and call `advance(ms)` to move the page's clock
+   on. Prints what c.js sent, as JSON: { items, envelopes, posts, gets, log, probe }. Spec
+   keys: dataset (the script tag's data-*), cookies, session (sessionStorage to start with),
+   dnt, answers (what GETs get back, in turn, the last one repeating: a JSON body, a status,
+   or null for a network error), url and referrer (the page's address, and where it was
+   reached from), probe (an expression evaluated last). */
 "use strict";
 
 const fs = require("fs");
@@ -16,17 +19,34 @@ const spec = JSON.parse(process.argv[2] || "{}");
 const posts = [];
 const log = [];
 const cookies = Object.assign({}, spec.cookies || {});
-const stored = {};
+const stored = Object.assign({}, spec.session || {});
+const gets = [];
+const answers = [].concat(spec.answers === undefined ? [null] : spec.answers);
+const address = new URL(spec.url || "https://a.example/start");
+
+// The page's clock, which `advance` moves on.
+let skew = 0;
+class Clock extends Date {
+  constructor(...args) {
+    if (args.length) super(...args);
+    else super(Date.now() + skew);
+  }
+  static now() { return Date.now() + skew; }
+}
+let uuids = 0;
 
 const page = {
   log,
   console,
+  Date: Clock,
+  advance(ms) { skew += ms; },
   URL,
   setTimeout,
   clearTimeout,
   innerWidth: 1280,
   Blob: class { constructor(parts) { this.text = parts.join(""); } },
-  location: { href: "https://a.example/start", pathname: "/start", protocol: "https:", host: "a.example" },
+  location: { href: address.href, pathname: address.pathname, search: address.search, protocol: address.protocol,
+              host: address.host },
   navigator: {
     userAgent: "harness", languages: ["en"], doNotTrack: spec.dnt ? "1" : null,
     sendBeacon(url, blob) { posts.push({ url, body: JSON.parse(blob.text) }); return true; }
@@ -37,8 +57,16 @@ const page = {
     setItem: (k, v) => { stored[k] = String(v); },
     removeItem: (k) => { delete stored[k]; }
   },
-  crypto: { randomUUID: () => "11111111-2222-4333-8444-555555555555" },
+  // 11111111-2222-4333-8444-555555555555 first (the tests' SID), then the next ones.
+  crypto: { randomUUID: () => "11111111-2222-4333-8444-" + (0x555555555555 + uuids++).toString(16) },
   fetch(url, init) {
+    if (init.method !== "POST") {
+      gets.push(url);
+      const answer = answers.length > 1 ? answers.shift() : answers[0];
+      if (answer === null) return Promise.reject(new TypeError("Failed to fetch"));
+      if (typeof answer === "number") return Promise.resolve({ ok: false, status: answer });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(JSON.parse(JSON.stringify(answer))) });
+    }
     posts.push({ url, body: JSON.parse(init.body) });
     return Promise.resolve({});
   },
@@ -47,7 +75,7 @@ const page = {
 page.window = page;
 page.document = {
   currentScript: { src: "https://a.example/_c/c.js", dataset: spec.dataset || {} },
-  referrer: "",
+  referrer: spec.referrer || "",
   visibilityState: "visible",
   get cookie() { return Object.keys(cookies).map((k) => k + "=" + cookies[k]).join("; "); },
   set cookie(v) {
@@ -74,6 +102,8 @@ const client = fs.readFileSync(path.join(__dirname, "..", "carterlitics", "stati
   process.stdout.write(JSON.stringify({
     items: posts.flatMap((p) => p.body.items || []),
     envelopes: posts.map((p) => Object.assign({}, p.body, { items: undefined })),
+    posts: posts.map((p) => p.body),
+    gets,
     log,
     probe
   }));

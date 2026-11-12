@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import random
+import re
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from unittest import mock
 from . import store as store_module
 from .config import Funnel
 from .geo import Geo
+from .google import SearchConsole, pacific_today
 from .intel import Intelligence, Ranges, build_ranges
 from .store import LogLine, Meta
 
@@ -37,9 +39,18 @@ BOTS = [
     ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36", "45.148.10.{}"),
 ]
 PROBES = ["/wp-login.php", "/.env", "/xmlrpc.php", "/.git/config", "/wp-admin/setup-config.php", "/phpmyadmin/"]
-REFERRERS = [None, None, None, "https://news.ycombinator.com/item?id=4242", "https://www.google.com/",
-             "https://duckduckgo.com/", "https://github.com/CarterCole", "https://www.reddit.com/r/rust/",
-             "https://lobste.rs/s/abc"]
+# How visits arrive: (referrer, the campaign tags c.js reads off the landing address).
+ARRIVALS = [(None, None), (None, None), (None, None), ("https://news.ycombinator.com/item?id=4242", None),
+            ("https://www.google.com/", None), ("https://www.google.co.uk/", None),
+            ("android-app://com.google.android.googlequicksearchbox/", None), ("https://duckduckgo.com/", None),
+            ("https://github.com/CarterCole", None), ("https://www.reddit.com/r/rust/", None),
+            ("https://lobste.rs/s/abc", None), ("https://t.co/x1y2z3", None), ("https://bsky.app/", None),
+            (None, {"utm_source": "chatgpt.com"}), ("https://www.perplexity.ai/", None),
+            ("https://l.facebook.com/", {"click": "fbclid"}),
+            (None, {"utm_source": "newsletter", "utm_medium": "email", "utm_campaign": "november-notes"}),
+            ("https://hachyderm.io/", {"utm_source": "mastodon", "utm_medium": "social", "utm_campaign": "launch"}),
+            ("https://www.google.com/", {"utm_source": "google", "utm_medium": "cpc", "utm_campaign": "launch",
+                                         "click": "gclid"})]
 # country -> (city, region, time zone, ASN, network, reverse DNS name for a.b.c.d)
 PLACES = {
     "US": [("Chicago", "Illinois", "America/Chicago", "7922", "Comcast Cable Communications, LLC",
@@ -197,17 +208,18 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                     sid, vid = str(uuid.UUID(int=rng.getrandbits(128))), str(uuid.UUID(int=rng.getrandbits(128)))
                     ids = {"sid": sid, "vid": vid, "sd": at.strftime("%Y-%m-%d"),
                            "fp": f"{rng.getrandbits(128):032x}"} if consent else {}
-                    ref = rng.choice(REFERRERS)
+                    ref, tags = rng.choice(ARRIVALS)
                     width = rng.choice([390, 414, 820, 1280, 1440, 1728])
                     walks = consent and bool(site.funnels) and rng.random() < 0.55
                     ids = {**ids, "tz": zone}
                     if walks:
-                        for when, path in _journey(store, site, rng, at, now, ids, meta, width, ref):
+                        for when, path in _journey(store, site, rng, at, now, ids, meta, width, ref, tags):
                             lines.append(LogLine(when, site.host, ip, "GET", path, "", 200, ref or "", ua,
                                                  edge="Hit", seconds=0.004, country=meta.country, asn=meta.asn))
                     for n in range(0 if walks else rng.choice([1, 1, 1, 2, 3, 5])):
                         path = rng.choice(paths)
                         items = [{"t": "pv", "p": path, "r": ref if n == 0 else f"{site.url}/",
+                                  **({"u": tags} if n == 0 and tags else {}),
                                   **({"new": True} if n == 0 and consent else {})},
                                  {"t": "leave", "p": path, "ms": int(rng.expovariate(1 / 45000)) + 1500}]
                         if rng.random() < 0.08:
@@ -239,7 +251,7 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
             store.ingest_log(lines)
 
 
-def _journey(store, site, rng, at, now, ids, meta, width, ref) -> list[tuple[datetime, str]]:
+def _journey(store, site, rng, at, now, ids, meta, width, ref, tags) -> list[tuple[datetime, str]]:
     """One consented visit along the site's first funnel, as far as it gets. Returns
     the pages it requested, for the CloudFront log."""
     steps = [s.text for s in site.funnels[0].steps]
@@ -268,7 +280,8 @@ def _journey(store, site, rng, at, now, ids, meta, width, ref) -> list[tuple[dat
             else:
                 path = step.replace("*", rng.choice(["hello-world", "relay-ssr", "notes-on-sqlite"]))
                 store.ingest(site, {"w": width, **ids, "items": [
-                    {"t": "pv", "p": path, "r": ref if k == 0 else f"{site.url}/", **({"new": True} if k == 0 else {})},
+                    {"t": "pv", "p": path, "r": ref if k == 0 else f"{site.url}/",
+                     **({"u": tags} if k == 0 and tags else {}), **({"new": True} if k == 0 else {})},
                     {"t": "leave", "p": path, "ms": gaps[k] * 1000}]}, meta)
                 pages.append((when, path))
     return pages
@@ -295,3 +308,86 @@ def _recording(at: datetime, site) -> list:
         events.append({"type": 3, "data": {"source": 1, "positions": [
             {"x": 100 + i * 25, "y": 120 + (i % 7) * 30, "id": 6, "timeOffset": 0}]}, "timestamp": t + i * 200})
     return events
+
+
+# ---------------------------------------------------------------- Search Console
+
+# What made-up searches find: host -> [(page, its queries)]. Google's own numbers, so they
+# don't line up with the page views above, as the real ones don't either.
+SEARCHES = {
+    "cartercole.net": [("/", ["carter cole", "cartercole", "carter cole portfolio"]),
+                       ("/mosaic", ["photo mosaic generator", "mosaic maker"]),
+                       ("/rollopolis", ["rollopolis"]), ("/nukumori", ["nukumori"])],
+    "cartercole.com": [("/", ["carter cole blog", "carter cole"]),
+                       ("/blog/relay-ssr", ["relay ssr", "relay server side rendering", "react relay ssr streaming"]),
+                       ("/blog/hello-world", ["carter cole hello world"]), ("/projects", ["carter cole projects"])],
+    "mosaic.cartercole.net": [("/", ["photo mosaic online", "make a mosaic from photos", "mosaic generator free"])],
+    "rollopolis.cartercole.net": [("/", ["rollopolis game", "dice city builder"])],
+    "resume.cartercole.net": [("/", ["carter cole resume"])],
+    "resume.cartercole.com": [("/", ["carter cole cv"])],
+    "clock.cartercole.net": [("/", ["word clock online"])],
+}
+SEARCH_COUNTRIES = [("usa", .52), ("gbr", .1), ("ind", .09), ("deu", .08), ("can", .07), ("fra", .05), ("aus", .05),
+                    ("jpn", .04)]
+SEARCH_DEVICES = [("DESKTOP", .61), ("MOBILE", .36), ("TABLET", .03)]
+
+
+class DemoGoogle:
+    """Answers the calls google.SearchConsole makes, from SEARCHES, deterministically.
+    Google's last two days aren't in yet, as they wouldn't be."""
+
+    def __init__(self):
+        self.properties = [f"sc-domain:{d}" for d in sorted({".".join(h.split(".")[-2:]) for h in SEARCHES})]
+
+    def request(self, method, url, scope=None, body=None):
+        path = urllib.parse.urlsplit(url).path
+        if path.endswith("/sites"):
+            return {"siteEntry": [{"siteUrl": p, "permissionLevel": "siteRestrictedUser"} for p in self.properties]}
+        prop = urllib.parse.unquote(path.split("/sites/")[1].split("/")[0])
+        domain = prop.removeprefix("sc-domain:")
+        hosts = [h for h in SEARCHES if h == domain or h.endswith("." + domain)]
+        if path.endswith("/sitemaps"):
+            return {"sitemap": [{"path": f"https://{h}/sitemap.xml", "lastDownloaded": f"{pacific_today()}T04:12:09.000Z",
+                                 "isPending": False, "isSitemapsIndex": False, "warnings": "0",
+                                 "errors": "1" if h.startswith("rollopolis") else "0",
+                                 "contents": [{"type": "web", "submitted": str(len(SEARCHES[h]) * 3)}]} for h in hosts]}
+        return {"rows": self._query(hosts, body)}
+
+    def _query(self, hosts, body):
+        start, end = (datetime.fromisoformat(body[k]).date() for k in ("startDate", "endDate"))
+        latest = min(end, pacific_today() - timedelta(days=2))
+        dim = body["dimensions"][0]
+        pattern = None
+        for group in body.get("dimensionFilterGroups") or []:
+            for f in group["filters"]:
+                pattern = re.compile(f["expression"])
+        acc = {}
+        day = start
+        while day <= latest:
+            for host in hosts:
+                for page, queries in SEARCHES[host]:
+                    url = f"https://{host}{page}"
+                    if pattern and not pattern.search(url):
+                        continue
+                    for rank, query in enumerate(queries):
+                        rng = random.Random(f"{url}|{query}|{day}")
+                        shown = max(0, int(rng.gauss(40 / (rank + 1), 9 / (rank + 1))))
+                        if not shown:
+                            continue
+                        position = max(1.0, rng.gauss(3 + rank * 4, 1.5))
+                        clicked = sum(rng.random() < 0.3 / position for _ in range(shown))
+                        splits = {"date": [(day.isoformat(), 1)], "query": [(query, 1)], "page": [(url, 1)],
+                                  "country": SEARCH_COUNTRIES, "device": SEARCH_DEVICES}[dim]
+                        for key, share in splits:
+                            a = acc.setdefault(key, [0.0, 0.0, 0.0])
+                            a[0] += clicked * share
+                            a[1] += shown * share
+                            a[2] += position * shown * share
+            day += timedelta(days=1)
+        rows = [{"keys": [k], "clicks": round(c), "impressions": round(i), "ctr": c / i if i else 0,
+                 "position": p / i if i else 0} for k, (c, i, p) in acc.items() if round(i)]
+        return sorted(rows, key=lambda r: -r["clicks"])[: body.get("rowLimit", 1000)]
+
+
+def search_console(cfg) -> SearchConsole:
+    return SearchConsole(DemoGoogle().request, "carterlitics@demo.iam.gserviceaccount.com")

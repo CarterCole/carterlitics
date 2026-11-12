@@ -11,7 +11,7 @@
   var MOUNT = root.dataset.mount || "/_c";
   var API = MOUNT + "/api";
   var RANGES = [1, 7, 30, 90];
-  var TABS = ["overview", "traffic", "bots", "visitors", "events", "funnels", "errors"];
+  var TABS = ["overview", "traffic", "search", "bots", "visitors", "events", "funnels", "errors"];
   var params = new URLSearchParams(location.search);
   var state = {
     site: params.get("site") || "",
@@ -130,6 +130,16 @@
     if (!ip) return "";
     return el("button", { type: "button", class: "ip", text: ip, title: "Look up " + ip,
       onclick: function (e) { e.stopPropagation(); inspect(ip); } });
+  }
+  /* The consent version a session was accepted under, linked to that version's policy. */
+  function consentCell(cv) {
+    if (!cv) return "";
+    var site = ((state.me && state.me.sites) || []).filter(function (s) { return s.id === state.site; })[0];
+    var docs = site && site.consent_docs;
+    return docs
+      ? el("a", { href: docs.replace("{version}", cv), target: "_blank", rel: "noopener", text: "v" + cv,
+                  title: "The privacy policy this visitor accepted" })
+      : el("span", { text: "v" + cv, title: "Consent version (set consent_docs to link its policy)" });
   }
   function replayLink(sid, label) {
     return el("a", { href: MOUNT + "/admin/replay?site=" + encodeURIComponent(state.site) + "&id=" + encodeURIComponent(sid),
@@ -396,6 +406,20 @@
 
   /* ---------------------------------------------------------------- views */
 
+  function rate(x) { return x === null || x === undefined ? "—" : pct.format(x); }
+
+  /* Visits by where they came from (a source, channel or campaign), with the share that bounced. */
+  function arrivals(rows, head, empty) {
+    return ranked(rows, { head: [head, "Visits", "Bounce"], more: [function (x) { return rate(x.bounce_rate); }],
+      empty: empty || "No visits counted yet." });
+  }
+
+  /* Visits were first counted by source on sources_from: say so when the range starts earlier. */
+  function sourcesNote(r, text) {
+    var first = r.series.length ? r.series[0].day : "";
+    return r.sources_from && r.sources_from > first ? text + " Counted from " + dayLabel(r.sources_from) + " on." : text;
+  }
+
   function overview(r) {
     var t = r.totals;
     var avg = t.pv ? t.ms / t.pv : 0;
@@ -404,6 +428,10 @@
       tiles([
         ["Page views", big(t.pv), "people running JavaScript", num(t.pv)],
         ["Visitors", big(t.uv), "unique per day, summed", num(t.uv)],
+        ["Visits", big(t.ses), t.ses ? (t.vpv / t.ses).toFixed(1) + " pages each; 30 idle minutes end one"
+          : "none counted yet", num(t.ses)],
+        ["Bounce rate", t.ses ? pct.format(t.bnc / t.ses) : "—", "visits with one page view or event",
+          t.ses ? num(t.bnc) + " of " + num(t.ses) + " visits" : null],
         ["Engaged time", dur(avg), "visible time per view"],
         ["Requests", big(t.req), noLogs ? "no access logs yet" : "every page request at the edge", num(t.req)],
         ["Bots", t.req ? pct.format(t.bot / t.req) : "—", t.req ? num(t.bot) + " bot requests" : "of requests"],
@@ -412,7 +440,8 @@
       el("div", { class: "grid" },
         card("Page views", "From c.js: people with JavaScript, after bots are taken out.",
           columns(r.series, [{ key: "pv", label: "Page views", cls: "people", color: "var(--people)" }],
-            [{ key: "uv", label: "Visitors" }])),
+            [{ key: "uv", label: "Visitors" }, { key: "ses", label: "Visits" },
+              { label: "Bounce rate", format: function (d) { return d.ses ? pct.format(d.bnc / d.ses) : "—"; } }])),
         card("Requests at the edge", noLogs
           ? "From CloudFront's access logs. None have arrived yet: run infra/deploy.py logging for this site."
           : "From CloudFront's access logs: every page request, cache hits included.",
@@ -420,8 +449,21 @@
             { key: "bot", label: "Bots", cls: "bots", color: "var(--bots)" }]))),
       el("div", { class: "grid" },
         card("Pages", null, ranked(r.top.paths, { head: ["Page", "Views", "Time"], more: [function (x) { return dur(x.avg_ms); }] })),
-        card("Referrers", null, ranked(r.top.referrers, { head: ["Source", "Views"] })),
+        card("Sources", sourcesNote(r, "A link's utm_source, or the site it was on: google.co.uk is Google."),
+          arrivals(r.top.sources, "Source")),
         card("Countries", null, ranked(r.top.countries, { head: ["Country", "Views"] }))),
+      el("div", { class: "grid" },
+        card("Channels", sourcesNote(r, "Kinds of source, Google Analytics' way, with AI assistants apart."),
+          arrivals(r.top.channels, "Channel")),
+        card("Campaigns", sourcesNote(r, "Links tagged with utm_campaign."),
+          arrivals(r.top.campaigns, "Campaign", "No tagged links yet: add ?utm_campaign=… to a link you share."))),
+      el("div", { class: "grid" },
+        card("Landing pages", "Where visits began, and the share that went no further: one page view or event.",
+          ranked(r.top.entries, { head: ["Page", "Visits", "Bounce"], more: [function (x) { return rate(x.bounce_rate); }],
+            empty: "No visits counted yet." })),
+        card("Exit pages", "Where visits were last seen, and the share of the page's views that were the last.",
+          ranked(r.top.exits, { head: ["Page", "Exits", "Exit rate"], more: [function (x) { return rate(x.exit_rate); }],
+            empty: "No visits counted yet." }))),
       el("div", { class: "grid" },
         card("Devices", "By window width.", ranked(r.top.devices)),
         card("Browsers", null, ranked(r.top.browsers)),
@@ -538,14 +580,15 @@
       return get("/sessions", { days: Math.min(state.days, 30) }).then(function (d) { return d.items; });
     }).then(function (items) {
       sessions.replaceChildren.apply(sessions, searchable(
-        ["Started (UTC)", "Length", "#Pages", "#Events", "#Errors", "Landed on", "From", "IP", "Where", "Browser", "Visitor", "User", ""],
+        ["Started (UTC)", "Length", "#Pages", "#Events", "#Errors", "Landed on", "Left from", "From", "IP", "Where", "Browser", "Visitor", "User", "Consent", ""],
         items.map(function (s) {
           return row([el("span", { class: "when", text: stamp(s.started) }), span(s.started, s.last),
             td(num(s.pages), "num"), td(num(s.events), "num"),
             td(el("span", { class: s.errors ? "bad" : null, text: num(s.errors) }), "num"),
-            clip(s.path), clip(s.ref), ipCell(s.ip), where(s, true),
+            clip(s.path), clip(s.exit), clip(s.src ? [s.src, s.cmp].filter(Boolean).join(" · ") : s.ref),
+            ipCell(s.ip), where(s, true),
             clip([s.browser, s.os, s.device].filter(Boolean).join(" · ")), short(s.vid), clip(s.uid),
-            s.rec ? replayLink(s.id) : el("span", { class: "empty", text: "no recording" })], s);
+            consentCell(s.cv), s.rec ? replayLink(s.id) : el("span", { class: "empty", text: "no recording" })], s);
         }), "No consented sessions yet."));
     }, function (e) { sessions.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     logOf("pv").then(function (items) {
@@ -558,7 +601,8 @@
         }), "No consented page views yet."));
     }, function (e) { views.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     return [
-      card("Sessions", "Visitors who accepted tracking: one browser tab, across page loads. Recordings are kept " +
+      card("Sessions", "Visitors who accepted tracking: one browser tab, across page loads, until 30 minutes pass " +
+        "without a page view or event. Recordings are kept " +
         ((state.me && state.me.retention.recordings) || 30) + " days.", sessions),
       card("Consented page views", "With address, network, visitor cookie and device fingerprint.", views)
     ];
@@ -788,8 +832,134 @@
     ];
   }
 
-  var VIEWS = { overview: overview, traffic: traffic, bots: bots, visitors: visitors, events: events, funnels: funnels,
-    errors: errors };
+  /* ---------------------------------------------------------------- search */
+
+  /* Google Search Console, read by the collector's service account (google.py). Numbers
+     are Google's: clicks and impressions in its results, counted by page. */
+  var DEVICES = { DESKTOP: "Desktop", MOBILE: "Mobile", TABLET: "Tablet" };
+  var PERMISSIONS = { siteOwner: "Owner", siteFullUser: "Full", siteRestrictedUser: "Restricted (read only)" };
+  var SEARCH_SETUP = [
+    "AWS_PROFILE=carter-admin infra/deploy.py search-console   # the service account, and AWS federation",
+    "AWS_PROFILE=carter-admin infra/deploy.py provision        # hands the function the pool to sign in through",
+    "",
+    "# then, once per domain, in Search Console: Settings > Users and permissions > Add user,",
+    "# the service account as Restricted. Or: infra/deploy.py search-console --verify-dns"
+  ].join("\n");
+
+  function position(p) { return p === null || p === undefined ? "—" : p.toFixed(1); }
+
+  /* Rows of {key, clicks, impressions, ctr, position}: a bar for the share of impressions,
+     clicks first, as Google sorts them. */
+  function searchRanked(rows, head, label, limit) {
+    if (!rows || !rows.length) return el("p", { class: "empty", text: "Nothing in this range." });
+    limit = limit || 15;
+    var most = Math.max.apply(null, rows.map(function (r) { return r.impressions; }).concat([1]));
+    var body = el("tbody");
+    var more = el("button", { type: "button", class: "btn btn--quiet more", text: "Show all " + num(rows.length) });
+    function draw(n) {
+      refill(body, rows.slice(0, n).map(function (r) {
+        var name = label ? label(r.key) : r.key;
+        return el("tr", null,
+          el("th", { scope: "row" }, el("span", { class: "name", style: "--w:" + (r.impressions / most * 100) + "%",
+            text: name, title: r.key })),
+          el("td", { class: "num num--lead", text: num(r.clicks) }),
+          el("td", { class: "num", text: num(r.impressions) }),
+          el("td", { class: "num", text: rate(r.ctr) }),
+          el("td", { class: "num", text: position(r.position) }));
+      }));
+      more.hidden = n >= rows.length;
+    }
+    more.addEventListener("click", function () { draw(rows.length); });
+    draw(limit);
+    return [el("table", { class: "ranked" },
+      el("thead", null, el("tr", null, el("th", { text: head }),
+        ["Clicks", "Impr.", "CTR", "Position"].map(function (h) { return el("td", { class: "num", text: h }); }))),
+      body), more];
+  }
+
+  /* A page as a path on the site's own host; with its host on any other. */
+  function pageLabel(hosts) {
+    return function (url) {
+      var m = /^https?:\/\/([^/:]+)(?::\d+)?(\/.*)?$/.exec(url || "");
+      if (!m) return url;
+      return (m[1] === hosts[0] ? "" : m[1]) + (m[2] || "/");
+    };
+  }
+
+  function searchProperties(d) {
+    var covers = d.covers || {};
+    return table(["Property", "Access", "Sites"], d.properties.map(function (p) {
+      return [el("span", { class: "mono", style: "white-space:nowrap", text: p.site_url }),
+        PERMISSIONS[p.permission] || p.permission,
+        (covers[p.site_url] || []).join(", ") || "—"];
+    }), "It can't read any property yet.");
+  }
+
+  function sitemaps(rows) {
+    return table(["Sitemap", "Read by Google", "#URLs", "#Errors", "#Warnings"], rows.map(function (s) {
+      return [clip(s.path, true), el("span", { class: "when", text: s.pending ? "pending" : stamp(s.read) || "never" }),
+        td(num(s.urls), "num"), td(el("span", { class: s.errors ? "bad" : null, text: num(s.errors) }), "num"),
+        td(num(s.warnings), "num")];
+    }), "None submitted for this site's hosts.");
+  }
+
+  function searchView(d) {
+    if (!d.connected) {
+      return card("Search Console", "Not connected: " + d.reason + ".",
+        el("pre", { class: "stack", text: SEARCH_SETUP }));
+    }
+    var props = card("Search Console properties", d.account + " reads these. A site's numbers are its own hosts' " +
+      "pages, so one domain property serves every site under the domain.", searchProperties(d));
+    if (!d.sources.length) {
+      return [card("Search Console", d.hosts.length
+        ? "No property covers " + d.hosts.join(", ") + ". Give " + d.account + " access to one (below)."
+        : "This site is a catch-all with no host of its own, so Google has nothing to show for it.",
+        d.hosts.length ? el("pre", { class: "stack", text: SEARCH_SETUP }) : null), props];
+    }
+    var t = d.totals;
+    var from = d.sources.map(function (s) { return s.property + " (" + s.hosts.join(", ") + ")"; }).join(" and ");
+    var behind = !d.latest ? "Google has nothing for these days yet."
+      : d.latest < d.range.end ? "Google's newest day is " + dayLabel(d.latest) + "; it runs two or three days behind."
+      : "The newest days are still filling in.";
+    var detail = [{ label: "CTR", format: function (r) { return rate(r.ctr); } },
+      { label: "Position", format: function (r) { return position(r.position); } }];
+    return [
+      tiles([
+        ["Clicks", big(t.clicks), "from Google Search", num(t.clicks)],
+        ["Impressions", big(t.impressions), "times a page was in results", num(t.impressions)],
+        ["CTR", rate(t.impressions ? t.ctr : null), "clicks per impression"],
+        ["Position", position(t.position), "average, where 1 is the top"]
+      ]),
+      el("p", { class: "lede", text: "From " + from + ". " + behind + " Days are Google's, Pacific time." }),
+      el("div", { class: "grid" },
+        card("Clicks", "Visits from Google's results.", columns(d.series,
+          [{ key: "clicks", label: "Clicks", cls: "people", color: "var(--people)" }],
+          [{ key: "impressions", label: "Impressions" }].concat(detail))),
+        card("Impressions", "Times one of the site's pages was in someone's results.", columns(d.series,
+          [{ key: "impressions", label: "Impressions", cls: "people", color: "var(--people)" }],
+          [{ key: "clicks", label: "Clicks" }].concat(detail)))),
+      el("div", { class: "grid" },
+        card("Queries", "What people searched for. Google leaves out rare queries, so these add up to less.",
+          searchRanked(d.queries, "Query")),
+        card("Pages", "Where Google's results led.", searchRanked(d.pages, "Page", pageLabel(d.hosts)))),
+      el("div", { class: "grid" },
+        card("Countries", null, searchRanked(d.countries, "Country", function (k) { return k.toUpperCase(); }, 10)),
+        card("Devices", null, searchRanked(d.devices, "Device", function (k) { return DEVICES[k] || k; }))),
+      card("Sitemaps", "The ones submitted for this site's hosts, and when Google last read each.", sitemaps(d.sitemaps)),
+      props
+    ];
+  }
+
+  function search() {
+    var holder = el("div", null, el("p", { class: "empty", text: "Asking Google…" }));
+    cached("search", function () { return get("/search", { days: state.days }); }).then(function (d) {
+      refill(holder, searchView(d));
+    }, failed(holder));
+    return holder;
+  }
+
+  var VIEWS = { overview: overview, traffic: traffic, search: search, bots: bots, visitors: visitors, events: events,
+    funnels: funnels, errors: errors };
 
   /* ---------------------------------------------------------------- shell */
 
