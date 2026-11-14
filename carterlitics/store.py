@@ -70,6 +70,11 @@ TOP = 25
 BEACON_DNS = 0.8               # seconds a browser batch may wait on reverse DNS
 SERVER_DNS = 2.0               # ... a backend's batch of events
 LOG_DNS = 20.0                 # ... a CloudFront log file, all its addresses at once
+# The dimensions /_c/export/daily sends, each day's EXPORT_TOP biggest values: page views by
+# path, visits by source and channel, page views by country, device, browser and system,
+# custom events, server requests by bot, bot category and status.
+EXPORT_DIMS = ("path", "src", "ch", "cty", "dev", "br", "os", "ev", "sb", "sc", "ss")
+EXPORT_TOP = 15
 IDLE = 30 * 60                 # seconds without a page view or event that end a visit (c.js: the same)
 
 
@@ -821,6 +826,38 @@ class Store:
                                                            "last", "last_path")}}
             for gid, n in sorted((dims.get("eg") or {}).items(), key=lambda kv: -kv[1])[:100]
         ]
+        return out
+
+    def daily(self, site, days: int, top: int = EXPORT_TOP) -> dict:
+        """Each day's counters, as stored, for an export to a metrics store: the totals the
+        console's series shows, and the biggest values of the dimensions in EXPORT_DIMS.
+        Nothing is derived (no rates, no visit-weighted paths): a time-series database
+        can divide, and a day's counts here are the same ones the console reads."""
+        keys = days_back(days)
+        out = {"site": site.id, "days": []}
+        if not self.table:
+            return out
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            webs = list(pool.map(lambda d: self.table.query(web(site.id, d)), keys))
+            srvs = list(pool.map(lambda d: self.table.query(srv(site.id, d)), keys))
+        for day, w_items, s_items in zip(keys, webs, srvs):
+            totals: Counter = Counter()
+            dims: dict[str, Counter] = {k: Counter() for k in EXPORT_DIMS}
+            for item in w_items + s_items:
+                sk = item["sk"]
+                if sk == "uv":
+                    totals["uv"] = len(item.get("h") or ())
+                elif "#" not in sk:
+                    totals[sk] += item.get("n", 0)
+                else:
+                    kind, value = sk.split("#", 1)
+                    if kind in dims:
+                        dims[kind][value] += item.get("n", 0)
+            if not totals and not any(dims.values()):
+                continue
+            out["days"].append({"day": day, "totals": dict(totals), "dims": {
+                kind: dict(sorted((kv for kv in c.items() if kv[1] > 0), key=lambda kv: (-kv[1], kv[0]))[:top])
+                for kind, c in dims.items() if c}})
         return out
 
     def about(self, ip: str, registry: bool = True) -> dict | None:
