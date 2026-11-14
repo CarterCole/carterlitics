@@ -1,3 +1,5 @@
+![CARTERLITICS](.github/banner.png)
+
 # carterlitics
 
 First-party, self-hosted analytics for a handful of sites: who visits, which bots crawl,
