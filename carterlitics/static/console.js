@@ -97,6 +97,11 @@
     tor: "Tor", crawler: "A crawler's own range" };
   var NET_PILL = { hosting: "datacenter", relay: "private relay", vpn: "vpn", tor: "tor" };
   function netLabel(r) { return NET[r.name] || r.name; }
+  /* Signs of automation (c.js's sig, the collector's ip, the <noscript> pixel), and how page views ended. */
+  var SIGN = { rapid: "8+ clicks in 2 seconds", ip: "Address on an attack list", nojs: "Without JavaScript" };
+  var LEFT = { page: "Another page here", out: "Another site", back: "Back", forward: "Forward", reload: "Reload" };
+  function signLabel(r) { return SIGN[r.name] || r.name; }
+  function leftLabel(r) { return LEFT[r.name] || r.name; }
 
   /* Country, place and network, with the reverse DNS name under it; `marks` adds flags. */
   function where(row, marks) {
@@ -141,9 +146,17 @@
                   title: "The privacy policy this visitor accepted" })
       : el("span", { text: "v" + cv, title: "Consent version (set consent_docs to link its policy)" });
   }
-  function replayLink(sid, label) {
-    return el("a", { href: MOUNT + "/admin/replay?site=" + encodeURIComponent(state.site) + "&id=" + encodeURIComponent(sid),
-      text: label || "Replay" });
+  // One session's recording; given its visitor, the replay shows the session's numbers too.
+  function replayLink(sid, label, vid) {
+    return el("a", { href: MOUNT + "/admin/replay?site=" + encodeURIComponent(state.site) + "&id=" + encodeURIComponent(sid) +
+      (vid ? "&vid=" + encodeURIComponent(vid) : ""), text: label || "Replay" });
+  }
+  // Every session of one consented visitor: what they add up to, and their recordings in turn.
+  function visitorLink(vid) {
+    if (!vid) return "";
+    return el("a", { class: "mono", href: MOUNT + "/admin/replay?site=" + encodeURIComponent(state.site) +
+      "&visitor=" + encodeURIComponent(vid), text: vid.slice(0, 8),
+      title: "Every session of this visitor, added up and played in turn" });
   }
 
   /* ---------------------------------------------------------------- data */
@@ -465,6 +478,14 @@
           ranked(r.top.exits, { head: ["Page", "Exits", "Exit rate"], more: [function (x) { return rate(x.exit_rate); }],
             empty: "No visits counted yet." }))),
       el("div", { class: "grid" },
+        card("How page views ended", "When the browser's navigate event said, as the page left: a link, a form, " +
+          "back, forward, a reload. The rest closed the tab, typed an address, or switched apps.",
+          ranked(r.top.left, { head: ["Ended by", "Views", "Share"], label: leftLabel,
+            more: [function (x) { return t.pv ? pct.format(x.value / t.pv) : "—"; }],
+            empty: "Nothing yet: browsers with the Navigation API say." })),
+        card("Left for", "Other sites a page view went to, in the same tab.",
+          ranked(r.top.outbound, { head: ["Site", "Views"], limit: 15, empty: "Nobody has followed a link off the site yet." }))),
+      el("div", { class: "grid" },
         card("Devices", "By window width.", ranked(r.top.devices)),
         card("Browsers", null, ranked(r.top.browsers)),
         card("Systems", null, ranked(r.top.systems)),
@@ -547,6 +568,14 @@
         ["Fake crawlers", big(sum(r.top.impostors)), "claimed a crawler's name from someone else's address"]
       ]),
       el("div", { class: "grid" },
+        card("Ran JavaScript", "Page views c.js counted as a bot's: by user agent, navigator.webdriver, a driver's " +
+          "own globals or headless brand, or an address on Spamhaus DROP.",
+          ranked(r.top.automation, { head: ["Bot", "Views"], limit: 15, empty: "No bot ran c.js in this range." })),
+        card("Signs of automation", "What a bot challenge page looks for, counted with people's page views and never " +
+          "acted on. A burst of clicks may be someone frustrated; most pages seen without JavaScript are people's " +
+          "(Tor Browser, NoScript), as bots that skip it skip images too.",
+          ranked(signs(r), { head: ["Sign", "Views"], label: signLabel, empty: "No signs in this range." }))),
+      el("div", { class: "grid" },
         card("Bots", null, ranked(r.top.bots, { head: ["Bot", "Requests"], limit: 20 })),
         card("Kinds", null, ranked(r.top.categories)),
         card("Networks", "The organisation that owns the address.", ranked(r.top.bot_networks, { limit: 15 }))),
@@ -561,6 +590,12 @@
         card("Addresses", "Click one for everything known about it.", addressList(r.top.bot_ips))),
       card("Bot requests", "Newest first, up to 300. Click an address for everything known about it.", holder)
     ];
+  }
+
+  /* c.js's signs and the <noscript> pixel's count, most first. */
+  function signs(r) {
+    var rows = (r.top.signs || []).concat(r.totals.nojs ? [{ name: "nojs", value: r.totals.nojs }] : []);
+    return rows.sort(function (a, b) { return b.value - a.value; });
   }
 
   /* A ranked list of addresses, each one clickable. */
@@ -587,17 +622,18 @@
             td(el("span", { class: s.errors ? "bad" : null, text: num(s.errors) }), "num"),
             clip(s.path), clip(s.exit), clip(s.src ? [s.src, s.cmp].filter(Boolean).join(" · ") : s.ref),
             ipCell(s.ip), where(s, true),
-            clip([s.browser, s.os, s.device].filter(Boolean).join(" · ")), short(s.vid), clip(s.uid),
-            consentCell(s.cv), s.rec ? replayLink(s.id) : el("span", { class: "empty", text: "no recording" })], s);
+            clip([s.browser, s.os, s.device].filter(Boolean).join(" · ")), visitorLink(s.vid), clip(s.uid),
+            consentCell(s.cv), s.rec ? replayLink(s.id, null, s.vid) : el("span", { class: "empty", text: "no recording" })], s);
         }), "No consented sessions yet."));
     }, function (e) { sessions.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     logOf("pv").then(function (items) {
       views.replaceChildren.apply(views, searchable(
         ["Time (UTC)", "Page", "IP", "Where", "Visitor", "Device", "Browser", "User agent", ""],
         items.map(function (v) {
-          return row([el("span", { class: "when", text: stamp(v.at) }), clip(v.path), ipCell(v.ip),
-            where(v, true), short(v.vid), short(v.fp), clip([v.browser, v.os, v.device].filter(Boolean).join(" · ")),
-            clip(v.ua, true), v.sid ? replayLink(v.sid) : ""], v);
+          var page = v.sig ? v.path + " · " + v.sig.map(function (k) { return SIGN[k] || k; }).join(", ") : v.path;
+          return row([el("span", { class: "when", text: stamp(v.at) }), clip(page), ipCell(v.ip),
+            where(v, true), visitorLink(v.vid), short(v.fp), clip([v.browser, v.os, v.device].filter(Boolean).join(" · ")),
+            clip(v.ua, true), v.sid ? replayLink(v.sid, null, v.vid) : ""], v);
         }), "No consented page views yet."));
     }, function (e) { views.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     return [
@@ -617,7 +653,7 @@
           var props = e.props && typeof e.props === "object" ? JSON.stringify(e.props) : String(e.props || "");
           return row([el("span", { class: "when", text: stamp(e.at) }), el("strong", { text: e.name }),
             el("span", { class: "props clip clip--wide", text: props === "{}" ? "" : props, title: props }),
-            clip(e.path), e.source || "", where(e, true), e.vid ? short(e.vid) : clip(e.uid), e.sid ? replayLink(e.sid) : ""], e);
+            clip(e.path), e.source || "", where(e, true), e.vid ? visitorLink(e.vid) : clip(e.uid), e.sid ? replayLink(e.sid, null, e.vid) : ""], e);
         }), "No events yet. Send one with cl(\"track\", \"name\", { … })."));
     }, function (e) { holder.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     return [

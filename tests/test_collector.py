@@ -295,6 +295,55 @@ class Ingest(unittest.TestCase):
         r = self.report()
         self.assertEqual((r["totals"]["pv"], r["totals"]["jsbot"]), (0, 2))
 
+    def test_signs_of_automation(self):
+        """A driver c.js names makes a page view a bot's; other signs are counted with it."""
+        self.app.store.intel = fake_intel(self.app.store.table)
+        self.call("POST", "/_c/i", {"auto": "Playwright", "items": [{"t": "pv", "p": "/"}]})
+        self.call("POST", "/_c/i", {"items": [{"t": "pv", "p": "/"}]}, ip="1.10.16.5")   # Spamhaus DROP
+        self.call("POST", "/_c/i", {"auto": "made up", "items": [{"t": "pv", "p": "/a"}]}, ip="1.1.1.1")
+        self.call("POST", "/_c/i", {"items": [
+            {"t": "pv", "p": "/b", "sig": ["rapid"]},                # a page view's signs come as it ends
+            {"t": "leave", "p": "/b", "sig": ["rapid", "rapid", "bogus", 7]}]}, ip="2.2.2.2")
+        self.call("POST", "/_c/i", {"items": [{"t": "pv", "p": "/c"}]}, ip="203.0.113.9")   # blocklist.de
+        r = self.report()
+        self.assertEqual((r["totals"]["pv"], r["totals"]["jsbot"]), (3, 2))
+        self.assertEqual({x["name"]: x["value"] for x in r["top"]["automation"]}, {"Playwright": 1, "Spamhaus DROP": 1})
+        self.assertEqual({x["name"]: x["value"] for x in r["top"]["signs"]}, {"rapid": 1, "ip": 1})
+
+    def test_how_page_views_ended(self):
+        """What the navigate event said: another page here, another site (which), back, a reload."""
+        self.call("POST", "/_c/i", {"items": [
+            {"t": "pv", "p": "/"},
+            {"t": "leave", "p": "/", "ms": 3000, "how": "out", "to": "www.GitHub.com"},
+            {"t": "leave", "p": "/", "how": "out", "to": "www.a.example"},   # the site, by another name
+            {"t": "leave", "p": "/", "how": "back"},
+            {"t": "leave", "p": "/", "how": "out", "to": "evil|key#x"},
+            {"t": "leave", "p": "/", "how": "sideways"},
+            {"t": "leave", "p": "/"},
+        ]})
+        r = self.report()
+        self.assertEqual({x["name"]: x["value"] for x in r["top"]["left"]}, {"out": 2, "page": 1, "back": 1})
+        self.assertEqual(r["top"]["outbound"], [{"name": "github.com", "value": 1}])
+        self.assertEqual(r["totals"]["ms"], 3000)
+
+    def test_pages_without_javascript(self):
+        """The <noscript> pixel: a page shown without JavaScript, named by its Referer."""
+        def pixel(referer, ua=SAFARI, headers=None):
+            res = self.call("GET", "/_c/n.gif", ua=ua, headers={**({"referer": referer} if referer else {}),
+                                                                **(headers or {})})
+            self.assertEqual((res.status, res.headers["Content-Type"]), (200, "image/gif"))
+            self.assertTrue(res.body.startswith(b"GIF89a"))
+        pixel("https://a.example/posts/x?y=1")
+        pixel("https://www.a.example/posts/x/")
+        pixel("")                                                   # a crawler fetching the page's images
+        pixel("https://a.example/", ua="Mozilla/5.0 (compatible; Googlebot/2.1)")
+        pixel("https://evil.example/posts/x")
+        pixel("https://a.example/admin/x")                          # excluded
+        pixel("https://a.example/", headers={"sec-gpc": "1"})
+        r = self.report()
+        self.assertEqual((r["totals"]["nojs"], r["totals"]["pv"]), (2, 0))
+        self.assertEqual(r["top"]["nojs_paths"], [{"name": "/posts/x", "value": 2}])
+
     def test_consented_visitor_session_and_recording(self):
         ids = {"vid": VID, "sid": SID, "fp": FP, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
         self.call("POST", "/_c/i", {**ids, "w": 1200, "items": [{"t": "pv", "p": "/", "new": True}]})
@@ -318,6 +367,50 @@ class Ingest(unittest.TestCase):
         self.assertEqual([e["timestamp"] for e in body(res)], [1, 2, 3])
         # Another site can't read it.
         self.assertEqual(self.call("GET", "/_c/api/recording", query={"site": "b.example", "id": SID}).status, 404)
+
+    def test_a_visitors_sessions_add_up(self):
+        """Every session of one visitor, found by their index, oldest first, with what they
+        add up to and the pages they viewed."""
+        start = datetime.now(timezone.utc).replace(microsecond=0)
+        today = start.strftime("%Y-%m-%d")
+        self.call("POST", "/_c/i", {"vid": VID, "sid": SID, "sd": today, "items": [
+            {"t": "pv", "p": "/", "new": True}, {"t": "pv", "p": "/x"}, {"t": "leave", "p": "/x", "ms": 3000},
+            {"t": "ev", "n": "outbound", "p": "/x"}]})
+        self.call("POST", "/_c/r", {"sid": SID, "vid": VID, "seq": 0, "events": [{"type": 4, "timestamp": 1}]})
+        with mock.patch.object(store_module, "now", lambda: start + timedelta(minutes=40)):
+            self.call("POST", "/_c/i", {"vid": VID, "sid": SID2, "sd": today, "items": [
+                {"t": "pv", "p": "/x", "new": True}, {"t": "err", "m": "boom"}]})
+        self.call("POST", "/_c/i", {"vid": VID2, "sid": SID3, "sd": today, "items": [{"t": "pv", "p": "/y", "new": True}]})
+
+        self.call.sign_in()
+        got = body(self.call("GET", "/_c/api/visitor", query={"site": "a.example", "id": VID.upper()}))
+        self.assertEqual([s["id"] for s in got["sessions"]], [SID, SID2])
+        t = got["totals"]
+        self.assertEqual((t["sessions"], t["recorded"], t["pages"], t["unique_pages"], t["events"], t["errors"],
+                          t["ms"], t["days"]), (2, 1, 3, 2, 1, 1, 3000, 1))
+        self.assertEqual((t["first"], t["last"]), (got["sessions"][0]["started"], got["sessions"][1]["last"]))
+        self.assertEqual(got["pages"], [{"path": "/x", "views": 2}, {"path": "/", "views": 1}])
+        for query in ({"site": "b.example", "id": VID}, {"site": "a.example", "id": VID.replace("a", "c")},
+                      {"site": "a.example", "id": "../x"}):
+            self.assertEqual(self.call("GET", "/_c/api/visitor", query=query).status, 404, query)
+
+    def test_a_recording_alone_indexes_its_session(self):
+        """A lost first beacon: the recording's first chunk makes the session, and indexes it."""
+        self.call("POST", "/_c/r", {"sid": SID, "vid": VID, "seq": 0, "p": "/", "events": [{"type": 4, "timestamp": 1}]})
+        self.call.sign_in()
+        got = body(self.call("GET", "/_c/api/visitor", query={"site": "a.example", "id": VID}))
+        self.assertEqual(([s["id"] for s in got["sessions"]], got["totals"]["recorded"]), ([SID], 1))
+
+    def test_sessions_from_before_the_index(self):
+        """The index-visitors task indexes sessions kept from before it existed, once."""
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        self.call("POST", "/_c/i", {"vid": VID, "sid": SID, "sd": today, "items": [{"t": "pv", "p": "/", "new": True}]})
+        store = self.app.store
+        store.table.items.pop(store_module.visitor_pk("a.example", VID))
+        self.call.sign_in()
+        self.assertEqual(self.call("GET", "/_c/api/visitor", query={"site": "a.example", "id": VID}).status, 404)
+        self.assertEqual((store.index_visitors(), store.index_visitors()), (1, 0))
+        self.assertEqual(self.call("GET", "/_c/api/visitor", query={"site": "a.example", "id": VID}).status, 200)
 
     def test_a_session_can_begin_with_an_event(self):
         # c.js's session went idle and the visitor came back with a click, not a page view.
@@ -729,6 +822,10 @@ class Enrichment(unittest.TestCase):
         self.assertIs(who("52.4.9.9", google)["bot"]["verified"], False)   # named like Googlebot, isn't
         self.assertEqual(who("198.51.100.7", query={"wd": "1"})["bot"],
                          {"name": "webdriver", "category": "automation", "verified": None})
+        # What c.js found: a driver by name, only the ones it knows.
+        self.assertEqual(who("198.51.100.7", query={"wd": "1", "auto": "Playwright"})["bot"],
+                         {"name": "Playwright", "category": "automation", "verified": None})
+        self.assertIsNone(who("198.51.100.7", query={"auto": "anything"})["bot"])
         self.assertEqual(who("198.51.100.7", ua="")["bot"]["name"], "(no user agent)")
         self.assertIsNone(who("198.51.100.7", headers={"dnt": "1"})["bot"])
         # Reverse DNS only for crawler claims the ranges didn't settle; nothing counted or kept but that.
@@ -1222,6 +1319,200 @@ class ClientWho(Page, unittest.TestCase):
               cl('who').then(function (b) { log.push(b);
                 cl('who').then(function (c) { log.push(c.net); }); }); });""")
         self.assertEqual((out["log"], len(out["gets"])), ([None, None, "vpn"], 3))
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientSigns(Page, unittest.TestCase):
+    """Signs of automation, as a bot challenge page looks for them."""
+
+    @staticmethod
+    def kinds(out):
+        return [(i["t"], i["p"], i.get("sig"), i.get("how")) for i in out["items"]]
+
+    def test_a_drivers_globals_name_it(self):
+        for before, name in (("window.__playwright__binding__ = function () {};", "Playwright"),
+                             ("window.cdc_adoQpoasnfa76pfcZLmcfl_Array = Array;", "Selenium"),
+                             ("window.callPhantom = function () {};", "PhantomJS"),
+                             ("navigator.userAgentData = { brands: [{ brand: 'HeadlessChrome', version: '142' }] };",
+                              "HeadlessChrome")):
+            self.assertEqual(self.page(before=before)["envelopes"][-1].get("auto"), name, before)
+        self.assertNotIn("auto", self.page()["envelopes"][-1])
+        out = self.page(before="window.__pwInitScripts = {};", answers=[{}], after="cl('who');")
+        self.assertTrue(out["gets"][0].endswith("&auto=Playwright"), out["gets"])
+
+    def test_a_burst_of_clicks(self):
+        def leaves(gap):
+            out = self.page(after="for (var i = 0; i < 8; i++) fire('document', 'click', { target: {}, timeStamp: 1000 + i * %d });"
+                                  "fire('window', 'pagehide', {});" % gap)
+            return [i for i in out["items"] if i["t"] == "leave"]
+        self.assertEqual([x["sig"] for x in leaves(200)], [["rapid"]])
+        self.assertEqual(leaves(400), [])   # 8 clicks over 2.8 s
+
+    def test_once_a_page_view(self):
+        """Hidden, back, then gone: the burst is told on the first leave only."""
+        out = self.page(after="for (var i = 0; i < 8; i++) fire('document', 'click', { target: {}, timeStamp: i });"
+                              "document.visibilityState = 'hidden'; fire('document', 'visibilitychange', {});"
+                              "document.visibilityState = 'visible'; fire('document', 'visibilitychange', {});"
+                              "fire('window', 'pagehide', {}); cl('page', '/next');")
+        self.assertEqual(self.kinds(out), [("pv", "/start", None, None), ("leave", "/start", ["rapid"], None),
+                                           ("leave", "/start", None, "page"), ("pv", "/next", None, None)])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientLeaving(Page, unittest.TestCase):
+    """The navigate event settles a page view before the page goes, by beacon, and says how."""
+
+    def go(self, url, kind="push", index=-1, then="", **event):
+        """A navigation to `url`; `then` runs once every listener has heard it. Returns
+        the leaves that went by beacon, as (how, to), and every leave sent."""
+        ev = {"destination": {"url": url, "sameDocument": False, "index": index}, "navigationType": kind,
+              "canIntercept": url.startswith("https://a.example/"), "hashChange": False, "downloadRequest": None,
+              "defaultPrevented": False, **event}
+        out = self.page(navigation=True, after=f"var ev = {json.dumps(ev)}; fire('navigation', 'navigate', ev); {then}")
+        beaconed = [(i.get("how"), i.get("to")) for k in out["beacons"] for i in out["posts"][k]["items"]
+                    if i["t"] == "leave"]
+        return beaconed, [i for i in out["items"] if i["t"] == "leave"], out
+
+    def test_to_another_site(self):
+        beaconed, leaves, out = self.go("https://www.github.com/x?token=SECRET")
+        self.assertEqual((beaconed, len(leaves)), ([("out", "www.github.com")], 1))
+        self.assertNotIn("SECRET", json.dumps(out["posts"]))
+
+    def test_back_forward_reload_and_another_page(self):
+        self.assertEqual(self.go("https://a.example/", "traverse", 0)[0], [("back", None)])
+        self.assertEqual(self.go("https://a.example/later", "traverse", 2)[0], [("forward", None)])
+        self.assertEqual(self.go("https://google.com/search", "traverse", -1)[0], [("back", None)])
+        self.assertEqual(self.go("https://a.example/start", "reload")[0], [("reload", None)])
+        self.assertEqual(self.go("https://a.example/next")[0], [("page", None)])
+
+    def test_what_isnt_leaving(self):
+        for kind, args in (("a #fragment", {"hashChange": True}), ("a download", {"downloadRequest": "x.pdf"}),
+                           ("cancelled", {"then": "ev.defaultPrevented = true;"}),
+                           ("the router's", {"then": "navigation.transition = {};"})):
+            self.assertEqual(self.go("https://a.example/next", **args)[1], [], kind)
+        self.assertEqual(self.go("mailto:carter@cartercole.com")[1], [])
+
+    def test_pagehide_first(self):
+        """A next page quicker than the check still gets the leave, once."""
+        beaconed, leaves, _ = self.go("https://www.github.com/", then="fire('window', 'pagehide', {});")
+        self.assertEqual((beaconed, len(leaves)), ([("out", "www.github.com")], 1))
+
+    def test_an_spa_going_back(self):
+        """Within the page, page() settles it: the navigate event says it was back."""
+        _, leaves, _ = self.go("https://a.example/earlier", "traverse", 0, then="cl('page', '/earlier');",
+                               destination={"url": "https://a.example/earlier", "sameDocument": True, "index": 0})
+        self.assertEqual([(x["p"], x["how"]) for x in leaves], [("/start", "back")])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientPageShown(Page, unittest.TestCase):
+    """A page view is a page someone saw: one the back/forward cache brings back counts
+    again, and a prerendered one only once it's shown."""
+    STUB = "window.cl = function () { (cl.q = cl.q || []).push(arguments); }; cl('track', 'early', {});"
+
+    @staticmethod
+    def sent(out):
+        """(type, path or event name, referrer or engaged seconds) for each item, in the order they went."""
+        return [(i["t"], i.get("n") or i.get("p"), i.get("r") if i["t"] == "pv" else i.get("ms") and round(i["ms"] / 1000))
+                for i in out["items"]]
+
+    def test_back_to_a_page_kept_whole(self):
+        """Its own referrer, as a Back that loaded it anew would have; the time it spent
+        in the cache isn't engaged time."""
+        out = self.page(referrer="https://www.google.com/", after=(
+            "advance(5000); fire('window', 'pagehide', { persisted: true }); advance(60000);"
+            "fire('window', 'pageshow', { persisted: true }); advance(3000); fire('window', 'pagehide', {});"))
+        self.assertEqual(self.sent(out), [("pv", "/start", "https://www.google.com/"), ("leave", "/start", 5),
+                                          ("pv", "/start", "https://www.google.com/"), ("leave", "/start", 3)])
+
+    def test_an_ordinary_load_counts_once(self):
+        out = self.page(after="fire('window', 'pageshow', { persisted: false });")
+        self.assertEqual([t for t, _, _ in self.sent(out)], ["pv"])
+
+    def test_prerendered_and_never_shown(self):
+        """Nothing goes, and the page's calls are still waiting in the stub's queue."""
+        out = self.page(prerendering=True, before=self.STUB, probe="cl.q.length",
+                        after="cl('track', 'while', {}); carterlitics.track('direct', {}); fire('window', 'pagehide', {});")
+        self.assertEqual((out["posts"], out["probe"]), ([], 2))
+
+    def test_prerendered_then_shown(self):
+        """It starts as if it had just loaded: the page view first, then the calls made
+        while it waited, and engaged time only from when it was shown."""
+        out = self.page(prerendering=True, before=self.STUB, referrer="https://a.example/", after=(
+            "advance(60000); cl('track', 'while', {});"
+            "document.prerendering = false; fire('document', 'prerenderingchange', {});"
+            "advance(4000); fire('window', 'pagehide', {});"))
+        self.assertEqual(self.sent(out), [("pv", "/start", "https://a.example/"), ("ev", "early", None),
+                                          ("ev", "while", None), ("leave", "/start", 4)])
+
+    def test_a_recording_goes_on_from_a_fresh_snapshot(self):
+        """A page Back brings back gets a new snapshot, so the replay isn't left showing the
+        page before it, and the timeline marks it, as it marks an SPA's next page."""
+        out = self.page(cookies={"consent": "all", "vid": VID}, rrweb=True, after=(
+            "setTimeout(function () { fire('window', 'pagehide', { persisted: true });"
+            "fire('window', 'pageshow', { persisted: true }); cl('page', '/next'); }, 5);"))
+        recorded = [e for e in out["log"] if not (isinstance(e, list) and e[0] == "tab")]
+        self.assertEqual(recorded, ["record", "snapshot", ["custom", "page", {"path": "/start"}],
+                                    ["custom", "page", {"path": "/next"}]])
+        # Another tab may have been copied from this one while it was cached: it asks.
+        self.assertEqual([e[1]["t"] for e in out["log"] if isinstance(e, list) and e[0] == "tab"], ["claim"])
+
+    def test_nothing_recorded_without_consent(self):
+        out = self.page(rrweb=True, after=(
+            "setTimeout(function () { fire('window', 'pageshow', { persisted: true }); cl('page', '/next'); }, 5);"))
+        self.assertEqual(out["log"], [])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientTabs(Page, unittest.TestCase):
+    """A duplicated tab starts with a copy of its tab's session: it asks the site's other
+    tabs, and takes a session of its own if one of them still has it."""
+    OLD = "22222222-2222-4222-8222-222222222222"
+
+    def load(self, **spec):
+        """A consented page that picks up a session from storage, with 7 chunks sent."""
+        stored = {"cl_sid": self.OLD, "cl_sd": time.strftime("%Y-%m-%d", time.gmtime()), "cl_seq": "7",
+                  "cl_at": str(int(time.time() * 1000) - 60_000)}
+        return self.page(cookies={"consent": "all", "vid": VID}, session=stored, wait=600,
+                         probe="sessionStorage.getItem('cl_sid') + ' ' + sessionStorage.getItem('cl_seq')", **spec)
+
+    @staticmethod
+    def views(out):
+        return [(p.get("sid"), i.get("new", False)) for p in out["posts"] for i in p.get("items", []) if i["t"] == "pv"]
+
+    @staticmethod
+    def told(out, kind):
+        return [e[1] for e in out["log"] if isinstance(e, list) and e[0] == "tab" and e[1]["t"] == kind]
+
+    def test_a_duplicated_tab_takes_a_session_of_its_own(self):
+        """Its first page view begins the new session, and its chunks count from 0 again."""
+        out = self.load(tabs=99)
+        self.assertEqual(len(self.told(out, "claim")), 2)
+        self.assertEqual(self.views(out), [(SID, True)])
+        self.assertEqual(out["probe"], SID + " 0")
+
+    def test_the_page_before_answers_only_once(self):
+        """This tab's own page before this one, still going: the second claim finds no one."""
+        out = self.load(tabs=1)
+        self.assertEqual((len(self.told(out, "claim")), self.views(out)), (2, [(self.OLD, False)]))
+        self.assertEqual(out["probe"], self.OLD + " 7")
+
+    def test_alone_it_keeps_its_session(self):
+        out = self.load()
+        self.assertEqual((len(self.told(out, "claim")), self.views(out)), (1, [(self.OLD, False)]))
+
+    def test_a_new_session_asks_no_one(self):
+        out = self.page(cookies={"consent": "all", "vid": VID}, tabs=99, wait=300)
+        self.assertEqual((self.told(out, "claim"), self.views(out)), ([], [(SID, True)]))
+
+    def test_it_answers_for_its_session_until_it_goes(self):
+        claim = json.dumps({"t": "claim", "sid": self.OLD, "from": "other"})
+        other = json.dumps({"t": "claim", "sid": SID3, "from": "other"})
+        out = self.load(after=f"tell({claim}); tell({other}); fire('window', 'pagehide', {{}}); tell({claim});")
+        self.assertEqual([(m["to"], m["sid"]) for m in self.told(out, "mine")], [("other", self.OLD)])
+
+    def test_anonymous_visitors_ask_nothing(self):
+        self.assertEqual([e for e in self.page(tabs=99)["log"] if isinstance(e, list) and e[0] == "tab"], [])
 
 
 @unittest.skipUnless(os.environ.get("GEO_MMDB"), "set GEO_MMDB to test against a real database")

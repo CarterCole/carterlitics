@@ -11,12 +11,16 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   datacenter, iCloud Private Relay, a VPN, Tor, a crawler's own range, or a known attacker.
   A request that says it's Googlebot (or Bingbot, GPTBot, Applebot, …) is checked
   against the crawler's published ranges and forward-confirmed DNS, so fakes show up.
-- **Client side, one script.** `/_c/c.js` counts page views (SPA navigations too),
+- **Client side, one script.** `/_c/c.js` counts page views (SPA navigations and pages
+  brought back by Back too; a prerendered page only once it's shown),
   engaged time, unique visitors and visits (cookieless, a daily-salted hash), with bounce
   rates, landing and exit pages, where visits came from (sources, channels and UTM
   campaigns), custom events (`cl("track", …)`, awaitable), and
   JavaScript errors: uncaught, unhandled rejections,
-  failed resources, CSP violations, grouped by bug. Google Analytics calls (`gtag()`,
+  failed resources, CSP violations, grouped by bug. How each page view ended (another
+  page, another site and which, back, reload), sent by beacon as the browser starts to
+  leave, and the signs of automation a bot challenge page looks for, counted rather than
+  challenged. Google Analytics calls (`gtag()`,
   `dataLayer.push()`, `ga()`, `_gaq.push()`) are understood too, so a page written for
   Google works unchanged.
 - **With consent, more.** A visitor cookie, a session, a device fingerprint, the IP and
@@ -82,14 +86,21 @@ country and ASN, and blockers that target third-party analytics hosts don't appl
 | | When | What | Kept |
 |---|---|---|---|
 | Server requests | always | IP, user agent, method, path, query, status, referrer, country, network, reverse DNS name, kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
-| Page counters | always, unless DNT/GPC | daily counts per page, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; bots that run JS are counted apart | 400 days |
+| Page counters | always, unless DNT/GPC | daily counts per page, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; how page views ended and the other sites they left for (host only); signs of automation; pages seen without JavaScript; bots that run JS are counted apart | 400 days |
 | Unique visitors | always, unless DNT/GPC | `sha256(daily salt, site, IP, UA)`; the salt is random and deleted after 2 days, so hashes can't be reversed afterwards | 400 days (as a count) |
 | Visits | always, unless DNT/GPC | daily counts of visits, bounces, landing and exit pages, and where visits came from: source, channel, campaign. The visit in progress is one item per visitor hash: when it was last seen, how many page views and events, its first and latest page, its source; no address or user agent (`v\|<site>\|<hash>`) | 400 days (as counts); the item a day |
 | Events | always, unless DNT/GPC | name, properties (≤ 2 KB), page | 180 days |
 | Errors | always | message, type, stack, source, page, user agent; no identifier unless consented | 90 days |
 | Consented visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view | 400 days |
+| Visitor index | consent only | each consented visitor's session ids and the day each began (`vs\|<site>\|<vid>`), to find all their sessions | as long as the sessions |
 | Address names | with the above | an address's reverse DNS name, as a cache (`ip\|<address>`) | 7 days |
 | Recordings | consent only | rrweb: DOM, mouse, scroll; inputs masked, `[data-private]` blocked, `[data-mask]` text masked | 30 days |
+
+**Radio events.** A page running a Virtual Radio player can send two events, under its own and the
+radios' consent (Virtual Radio's `PRIVACY.md` and SPEC 6.5.9): `radio.nearby` `{radios, window_s}`, a
+count of radios heard that allow counting, with no ids; and `radio.present` `{token}`, a radio that chose
+to be reported to this site, by a token that is this site's alone and changes daily. Both are ordinary
+events (`non_interaction`), so DNT and GPC stop them like any other.
 
 Retention is `[retention]` in `carterlitics.toml`; everything expires through the table's
 TTL or a bucket lifecycle rule. A site with `server_ip = "truncate"` keeps server-log
@@ -124,6 +135,48 @@ the tab's next one starts a new session, and a running recording carries on unde
 a fresh snapshot of the page. They are per tab rather than a cookie because each is one
 recording. Each session row shows the page it landed on, the page it left from, and where
 it came from.
+
+A duplicated tab, or a window opened with an opener, starts with a copy of its tab's
+`sessionStorage`: the same session and the same count of recording chunks, so the two tabs
+would overwrite each other's chunks and play as one recording. So a page that picks a
+session up from storage asks the site's other tabs (a `BroadcastChannel`, consented
+visitors only) whether one of them has it, twice, 200 ms apart. The page the tab itself is
+leaving may answer the first time, but it stops answering as it goes, and is gone by the
+second. A tab that answers both times is the one this was copied from, so this tab takes a
+session of its own, before its first page view is sent. A page restored from the
+back/forward cache asks again, and the channel is closed while the page is cached.
+
+**A recording follows the tab** across every page it loads on the site. Each page starts
+rrweb again with a snapshot of itself and carries on the session's chunk numbers
+(`rec/<site>/<session>/<seq>`), so the replay plays the chunks in order as one recording.
+A page that Back brings back from the back/forward cache gets a fresh snapshot too;
+before, the replay applied its changes to the page Back came from. The replay marks each
+page on its timeline and lists them under the player, with the time each began, to jump
+to. A page load's marker comes from its snapshot; c.js marks the rest (an SPA's
+navigation, a page Back brought back) with an rrweb `page` event. Older recordings get
+markers for their page loads only.
+
+**A visitor's sessions** are found through an index kept beside them: each consented
+session goes into its visitor's (`vs|<site>|<vid>`, by the visitor cookie) as it begins,
+so one query finds them all, however many days apart. Click a visitor id in the console
+(Visitors, Events) for their page:
+
+- **What their sessions add up to**: sessions (and how many were recorded, on how many
+  days), pages visited (distinct pages, page views, and page views a session), engaged
+  time (in all, and a session), events and errors, first and last seen.
+- **Every session**, oldest first, with its pages, engaged time, events, errors, landing
+  and exit pages, source and device, and **every page they viewed**, by views, from the
+  page-view log of the days the sessions ran.
+- **Their recordings, in turn**: the latest 20 recorded sessions, stitched together in the
+  browser one after another, with 2 seconds between them however long the real gap was
+  (two tabs at once play one after the other). The page list under the player starts each
+  session with its date and gives each page the time it was seen.
+
+A single session's replay, reached from a row that knows its visitor, shows that session's
+numbers and links to its visitor's page. The visitor id is the site's own cookie, so
+cartercole.com and cartercole.net see the same person as two visitors, and a visitor who
+clears cookies or uses another browser starts again. Sessions kept from before the index
+existed are added once by `{"task": "index-visitors"}` (*Deploy*).
 
 ### Where visits came from
 
@@ -173,7 +226,8 @@ The two main sites have funnels. cartercole.com's events come from its
 social, SEO, monitoring, feeds, scanners, automation and HTTP libraries), by asking for
 something only a scanner wants (`.php`, `/.env`, `/.git/`, `/wp-…`), by sending no user
 agent or a non-browser one, by coming from a Spamhaus DROP network, and, for scripts
-that run, by `navigator.webdriver`. A browser user agent from a hosting network (AWS,
+that run, by `navigator.webdriver`, a driver's own globals or a headless brand (see
+*Signs of automation*). A browser user agent from a hosting network (AWS,
 GCP, Azure, DigitalOcean, Hetzner, …) is flagged "datacenter" rather than called a bot,
 since it may be a VPN.
 
@@ -213,6 +267,63 @@ any lookup service:
   its abuse contact. This sends the address to the registry, so it only happens when
   you click.
 
+### Signs of automation
+
+A bot challenge page ("We detected unusual activity… rapid taps or clicks, JavaScript
+disabled, automated activity on your network, developer or inspection tools") is a
+vendor's script scoring each visitor before the page is served: a cookie its script has
+to set, the address's reputation across every site it guards, how the visitor clicks,
+and what the browser gives away. carterlitics looks for the same things, counts them on
+the Bots tab, and never blocks; a page that wants to act can ask `cl("who")`.
+
+| Sign | How it's seen | Then |
+|---|---|---|
+| A driver | `navigator.webdriver`; globals Playwright, Selenium (ChromeDriver's `cdc_…`), PhantomJS, Nightmare, Cypress leave on the page; `HeadlessChrome` in `navigator.userAgentData` | a bot: the page view is counted under *Ran JavaScript* by name, not as a person's |
+| DevTools or a driver attached (`cdp`) | c.js logs an error at the debug level whose `stack` is a getter. Chrome reads it only while its DevTools protocol's Runtime domain is on: DevTools open, or Puppeteer, Playwright, Selenium's CDP. Nothing else does | flagged. It can't tell your own DevTools from a driver, which is why the challenge page lists "developer tools" |
+| Rapid clicks (`rapid`) | 8 clicks or taps inside 2 seconds | flagged, on the page view's leave. People do it too, at a page that won't respond |
+| Automated activity on the address (`ip`) | the address is on an attack list (blocklist.de, DShield; *What an address is*); Spamhaus DROP is a bot outright | flagged |
+| JavaScript off | an `<img>` inside `<noscript>` (*Using it on a site*), named by its Referer | counted apart from page views. Mostly people (Tor Browser's Safest, NoScript): crawlers that skip JavaScript send no Referer, and are left out by user agent |
+
+Each sign counts once per page view. `data-bots="off"` turns off all but `navigator.webdriver`;
+the DevTools check is the only one that shows anywhere, as one debug-level message
+DevTools hides unless Verbose is on. It skips a `console.debug` the page has wrapped (a
+logger that might read the stack itself).
+
+### How page views end
+
+The browser's `navigate` event (the Navigation API, in every engine since 2026) fires as
+the page starts to leave, and says where to. c.js settles the page view then (engaged
+time, signs) and sends what's queued by `sendBeacon` while the page is still whole,
+instead of waiting for `pagehide`. Each page view's leave says how it ended: another page
+here (a link, a form, an SPA's navigation), another site (its host only, never the path or
+query), back, forward, or a reload. The Overview shows them, with the sites people left for.
+
+A navigation isn't leaving if it's to a `#fragment`, a download, a `mailto:` link, or
+cancelled, or if the page's own router takes it in hand. Closing the tab, typing an
+address and switching apps don't fire the event; `pagehide` and `visibilitychange` send
+those, as before, with no ending. Links that open a new tab don't leave the page, so a
+site that wants those still sends its own `outbound` event. A router built on the
+Navigation API (no `pushState`) has its page views counted too.
+
+### Prerendered and restored pages
+
+A page view is a page someone saw, so two kinds of page load count differently:
+
+- **Prerendered.** A browser can load a page before anyone asks for it, because of a site's
+  speculation rules or because Chrome guesses from what's being typed in the address bar.
+  The page's scripts run then, and it may never be shown. c.js waits for
+  `prerenderingchange` and starts then, as if it had just loaded. Until then, `cl()` calls
+  wait in the stub's queue (and Google's calls in theirs) and nothing is sent, so a page
+  nobody opens isn't counted. Errors from before it was shown aren't reported.
+- **Back and forward.** A page the back/forward cache kept whole comes back without
+  running its scripts again. c.js counts it on `pageshow` as a new view of that page, with
+  its own referrer, the way the same Back would count if the page loaded anew. The time it
+  spent in the cache isn't engaged time.
+
+Before this, pages brought back by Back went uncounted, and prerendered pages counted
+whether or not anyone saw them. Pages per visit, bounces and exit pages from before then
+lean slightly toward fewer pages.
+
 ## Using it on a site
 
 1. Add the site to `carterlitics.toml` (`id`, `url`, `aliases`, `exclude`, `dev_url`) and
@@ -221,6 +332,8 @@ any lookup service:
 
    ```html
    <script async src="/_c/c.js"></script>
+   <!-- a page shown without JavaScript (Signs of automation) -->
+   <noscript><img src="/_c/n.gif" alt="" width="1" height="1" style="position:absolute"></noscript>
 
    <!-- c.js shows this if the visitor hasn't chosen, and hides it when they do -->
    <div data-consent hidden>
@@ -240,7 +353,8 @@ Script options (attributes on the tag): `data-mode="consent"` (default) · `"ful
 (identify without asking: an internal tool) · `"anonymous"` (never identify, no
 banner); `data-record="off"`; `data-errors="off"`; `data-exclude="/admin,/auth"`;
 `data-google="off"` (ignore Google Analytics calls); `data-datalayer="name"` (gtag.js or
-GTM was given another name for its queue); `data-consent-version="2"` (see below).
+GTM was given another name for its queue); `data-consent-version="2"` (see below);
+`data-bots="off"` (no checks for automation beyond `navigator.webdriver`).
 
 **When Accept comes to cover more**, raise `data-consent-version` (it starts at 1).
 Visitors who accepted under an earlier version see the banner again, and until they
@@ -301,6 +415,7 @@ cl("who", function (who) {   // works through the stub; once loaded, cl("who") i
   listed: false,             // on Spamhaus DROP (then bot is "Spamhaus DROP" too)
   abuse: [],                 // the attack lists that name the address: "blocklist.de", "DShield"
   elsewhere: true,           // the browser's clock keeps another time than the address's (null: unknown)
+  signals: ["cdp"],          // DevTools or a driver attached (cdp), the address on an attack list (ip)
   country: "DE", asn: "39351", network: "31173 Services AB"
 }
 ```
@@ -310,8 +425,9 @@ stored or counted, so it answers with Do Not Track too. The address and its reve
 name aren't in the answer. The address is only looked up in DNS when the user agent
 claims a crawler that its address alone can't prove (Yandex, Baidu, a Googlebot outside
 Google's published ranges). A bot that doesn't run JavaScript never asks, so this
-catches the ones that do: headless browsers (`navigator.webdriver`), crawlers that
-render pages, and scripts on hosting networks or proxies.
+catches the ones that do: headless browsers (`navigator.webdriver`, a driver's globals,
+`bot` by the driver's name), crawlers that render pages, scripts on hosting networks or
+proxies, and a browser with DevTools or a driver attached (`signals`).
 
 ### Google Analytics calls
 
@@ -387,7 +503,8 @@ doesn't matter. Items in one batch from c.js keep the order they happened in.
   to 90 days, two queries per day) and counts in the Lambda; nothing is precomputed.
 
 Events and errors are batched for a second, then sent with `fetch(keepalive)`, or
-`sendBeacon` when the page is going away.
+`sendBeacon` when the page is going away: at its `navigate` event (*How page views end*),
+else `pagehide` or `visibilitychange`.
 
 ### From a site's backend
 
@@ -501,6 +618,13 @@ Then deploy each site (its `deploy.sh`) so its pages load `/_c/c.js`. After that
 `infra/deploy.py code` ships a changed collector: a deterministic zip of the package (and
 any `.mmdb` and `ranges.bin` in `geo/`), uploaded only when its SHA-256 differs from what
 Lambda runs.
+
+The first deploy with visitor pages should be followed, once, by indexing the sessions
+already kept (it only adds what's missing, so running it again does nothing):
+
+```bash
+AWS_PROFILE=carter-admin aws lambda invoke --function-name carterlitics --cli-binary-format raw-in-base64-out --payload '{"task": "index-visitors"}' /dev/stdout
+```
 
 The lists change: Tor exits hourly, attackers daily, clouds weekly. Re-run
 `infra/deploy.py intel && infra/deploy.py code` to refresh them (the console says how old

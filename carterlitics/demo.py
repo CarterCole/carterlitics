@@ -38,6 +38,11 @@ BOTS = [
     ("curl/8.7.1", "198.51.100.{}"),
     ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36", "45.148.10.{}"),
 ]
+# How demo page views end (the navigate event's say), and the other sites they leave for.
+ENDINGS = ["page"] * 9 + ["out"] * 3 + ["back"] * 4 + ["reload", "forward"] + [None] * 5
+OUTBOUND = ["github.com", "github.com", "www.linkedin.com", "news.ycombinator.com", "en.wikipedia.org", "x.com"]
+DRIVERS = [{"wd": True}, {"wd": True, "auto": "Playwright"}, {"auto": "HeadlessChrome"}, {"wd": True, "auto": "Selenium"}]
+
 PROBES = ["/wp-login.php", "/.env", "/xmlrpc.php", "/.git/config", "/wp-admin/setup-config.php", "/phpmyadmin/"]
 # How visits arrive: (referrer, the campaign tags c.js reads off the landing address).
 ARRIVALS = [(None, None), (None, None), (None, None), ("https://news.ycombinator.com/item?id=4242", None),
@@ -187,6 +192,7 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
     def past(at: datetime) -> datetime:
         return at if at < now else now - timedelta(minutes=rng.randrange(1, 90))
     for site in cfg.sites.values():
+        regulars: list[tuple[str, str, str]] = []   # consented visitors who come back: vid, fingerprint, browser
         paths = {"cartercole.net": ["/", "/", "/", "/mosaic", "/rollopolis", "/raindrive", "/nukumori", "/cartier",
                                     "/privacy"],
                  "cartercole.com": ["/", "/", "/blog", "/blog/hello-world", "/projects", "/blog/relay-ssr",
@@ -202,12 +208,16 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                 with mock.patch.object(store_module, "now", lambda at=at: at):
                     ua = rng.choice(PEOPLE)
                     meta, zone = person()
-                    meta = dataclasses.replace(meta, user_agent=ua)
-                    ip = meta.ip
                     consent = rng.random() < 0.3
                     sid, vid = str(uuid.UUID(int=rng.getrandbits(128))), str(uuid.UUID(int=rng.getrandbits(128)))
-                    ids = {"sid": sid, "vid": vid, "sd": at.strftime("%Y-%m-%d"),
-                           "fp": f"{rng.getrandbits(128):032x}"} if consent else {}
+                    fp = f"{rng.getrandbits(128):032x}"
+                    if consent and regulars and rng.random() < 0.35:   # someone back again (their visitor page)
+                        vid, fp, ua = rng.choice(regulars)
+                    elif consent:
+                        regulars.append((vid, fp, ua))
+                    meta = dataclasses.replace(meta, user_agent=ua)
+                    ip = meta.ip
+                    ids = {"sid": sid, "vid": vid, "sd": at.strftime("%Y-%m-%d"), "fp": fp} if consent else {}
                     ref, tags = rng.choice(ARRIVALS)
                     width = rng.choice([390, 414, 820, 1280, 1440, 1728])
                     walks = consent and bool(site.funnels) and rng.random() < 0.55
@@ -218,10 +228,15 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                                                  edge="Hit", seconds=0.004, country=meta.country, asn=meta.asn))
                     for n in range(0 if walks else rng.choice([1, 1, 1, 2, 3, 5])):
                         path = rng.choice(paths)
+                        how = rng.choice(ENDINGS)
+                        rapid = rng.random() < 0.01
                         items = [{"t": "pv", "p": path, "r": ref if n == 0 else f"{site.url}/",
                                   **({"u": tags} if n == 0 and tags else {}),
                                   **({"new": True} if n == 0 and consent else {})},
-                                 {"t": "leave", "p": path, "ms": int(rng.expovariate(1 / 45000)) + 1500}]
+                                 {"t": "leave", "p": path, "ms": int(rng.expovariate(1 / 45000)) + 1500,
+                                  **({"how": how} if how else {}),
+                                  **({"to": rng.choice(OUTBOUND)} if how == "out" else {}),
+                                  **({"sig": ["rapid"]} if rapid else {})}]
                         if rng.random() < 0.08:
                             items.append({"t": "ev", "n": rng.choice(["outbound", "download", "copy-code", "zoom"]),
                                           "props": {"target": rng.choice(["github.com", "x.zip", "lightbox"])}})
@@ -230,12 +245,20 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                             items.append({"t": "err", "k": kind, "name": name,
                                           "m": message.format(host=site.host), "st": stack.format(host=site.host)})
                         store.ingest(site, {"w": width, "items": items, **ids}, meta)
+                        if rng.random() < 0.012:   # the same page, in a browser with JavaScript off
+                            store.no_script(site, f"{site.url}{path}", meta)
                         lines.append(LogLine(at, site.host, ip, "GET", path, "", 200, ref or "", ua,
                                              edge=rng.choice(["Hit", "Hit", "Miss", "RefreshHit"]), seconds=0.004,
                                              country=meta.country, asn=meta.asn))
                     if consent:
                         store.chunk(site, {"sid": sid, "vid": vid, "sd": ids["sd"], "seq": 0, "p": "/",
                                            "events": _recording(at, site)}, meta)
+            for _ in range(rng.choice([0, 0, 1, 2])):   # headless browsers that run c.js
+                when = past(base.replace(hour=rng.randrange(0, 24)))
+                with mock.patch.object(store_module, "now", lambda when=when: when):
+                    meta = dataclasses.replace(person()[0], user_agent=rng.choice(PEOPLE))
+                    store.ingest(site, {"w": 1280, **rng.choice(DRIVERS),
+                                        "items": [{"t": "pv", "p": rng.choice(paths)}]}, meta)
             for _ in range(int(visitors * rng.uniform(1.5, 3.2))):
                 ua, net = rng.choice(BOTS)
                 at = past(base.replace(hour=rng.randrange(0, 24 if back else max(1, base.hour + 1)),
@@ -288,25 +311,44 @@ def _journey(store, site, rng, at, now, ids, meta, width, ref, tags) -> list[tup
 
 
 def _recording(at: datetime, site) -> list:
-    """A tiny but real rrweb recording: a page with a heading, then a scroll."""
+    """A short but real rrweb recording across pages, as c.js makes one: two page loads,
+    each its own snapshot (node ids start again at 1, as they do on a real page load), then
+    an SPA's navigation, which c.js marks with a `page` event."""
     t = int(at.timestamp() * 1000)
-    doc = {"type": 0, "childNodes": [
-        {"type": 1, "name": "html", "publicId": "", "systemId": "", "id": 2},
-        {"type": 2, "tagName": "html", "attributes": {}, "id": 3, "childNodes": [
-            {"type": 2, "tagName": "head", "attributes": {}, "id": 4, "childNodes": [
-                {"type": 2, "tagName": "style", "attributes": {"_cssText": "body{font:20px system-ui;padding:40px;"
-                 "background:#0e1116;color:#d6dde6}h1{color:#7cc4fa}"}, "childNodes": [], "id": 5}]},
-            {"type": 2, "tagName": "body", "attributes": {}, "id": 6, "childNodes": [
-                {"type": 2, "tagName": "h1", "attributes": {}, "id": 7,
-                 "childNodes": [{"type": 3, "textContent": f"Demo recording on {site.id}", "id": 8}]},
-                {"type": 2, "tagName": "p", "attributes": {}, "id": 9,
-                 "childNodes": [{"type": 3, "textContent": "A visitor who accepted tracking moved the mouse here.", "id": 10}]}]}]}],
-        "id": 1}
-    events = [{"type": 4, "data": {"href": f"{site.url}/", "width": 1280, "height": 720}, "timestamp": t},
-              {"type": 2, "data": {"node": doc, "initialOffset": {"left": 0, "top": 0}}, "timestamp": t + 10}]
-    for i in range(1, 30):
-        events.append({"type": 3, "data": {"source": 1, "positions": [
-            {"x": 100 + i * 25, "y": 120 + (i % 7) * 30, "id": 6, "timeOffset": 0}]}, "timestamp": t + i * 200})
+
+    def doc(title: str, text: str) -> dict:
+        return {"type": 0, "id": 1, "childNodes": [
+            {"type": 1, "name": "html", "publicId": "", "systemId": "", "id": 2},
+            {"type": 2, "tagName": "html", "attributes": {}, "id": 3, "childNodes": [
+                {"type": 2, "tagName": "head", "attributes": {}, "id": 4, "childNodes": [
+                    {"type": 2, "tagName": "style", "attributes": {"_cssText": "body{font:20px system-ui;padding:40px;"
+                     "background:#0e1116;color:#d6dde6}h1{color:#7cc4fa}"}, "childNodes": [], "id": 5}]},
+                {"type": 2, "tagName": "body", "attributes": {}, "id": 6, "childNodes": [
+                    {"type": 2, "tagName": "h1", "attributes": {}, "id": 7,
+                     "childNodes": [{"type": 3, "textContent": title, "id": 8}]},
+                    {"type": 2, "tagName": "p", "attributes": {}, "id": 9,
+                     "childNodes": [{"type": 3, "textContent": text, "id": 10}]}]}]}]}
+
+    def mouse(start: int, n: int) -> list:
+        return [{"type": 3, "data": {"source": 1, "positions": [
+            {"x": 100 + i * 25, "y": 120 + (i % 7) * 30, "id": 6, "timeOffset": 0}]}, "timestamp": start + i * 200}
+            for i in range(1, n)]
+
+    events = []
+    pages = (("/", f"Demo recording on {site.id}", "A visitor who accepted tracking moved the mouse here."),
+             ("/notes", "Notes", "Then followed a link to another page, which loaded anew."))
+    for k, (path, title, text) in enumerate(pages):
+        start = t + k * 8000
+        events += [{"type": 4, "data": {"href": f"{site.url}{path}", "width": 1280, "height": 720}, "timestamp": start},
+                   {"type": 2, "data": {"node": doc(title, text), "initialOffset": {"left": 0, "top": 0}},
+                    "timestamp": start + 10}]
+        events += mouse(start, 25)
+    spa = t + 8000 + 5500
+    events += [{"type": 5, "data": {"tag": "page", "payload": {"path": "/notes/2"}}, "timestamp": spa},
+               {"type": 3, "data": {"source": 0, "texts": [{"id": 8, "value": "Notes, page 2"},
+                                                           {"id": 10, "value": "The page's own router moved here."}],
+                                    "attributes": [], "removes": [], "adds": []}, "timestamp": spa + 5}]
+    events += mouse(spa, 20)
     return events
 
 

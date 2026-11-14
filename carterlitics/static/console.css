@@ -281,6 +281,17 @@ pre.stack {
 /* replay */
 .player { margin-top: 12px; display: flow-root; }
 .player .rr-player { box-shadow: none !important; border: 1px solid var(--ring); border-radius: 12px; overflow: hidden; }
+.pages { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.pages button {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--raised); border: 1px solid var(--ring);
+  border-radius: 8px; padding: 4px 10px; cursor: pointer; max-width: 100%; overflow-wrap: anywhere; text-align: left;
+}
+.pages button:hover { background: var(--wash); }
+.pages .mono { color: var(--muted); }
+.pages .pages-session { flex-basis: 100%; color: var(--muted); font-size: 12px; margin-top: 6px; }
+.pages .pages-session:first-child { margin-top: 0; }
+[data-stats] .tiles { margin: 4px 0 0; }
+[data-stats] .tile-value { font-size: 22px; }
 
 @media (max-width: 640px) {
   .who span { display: none; }

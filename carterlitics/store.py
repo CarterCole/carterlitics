@@ -11,6 +11,8 @@ never see each other's data. The layout:
     l|<site>|<day>|<k>   <ts>#<rand>    …        logs: pv (consented page views), ev, err,
                                                  hum and bot (server requests)
     s|<site>|<day>       <session id>   …        a consented session, keyed by its first day
+    vs|<site>|<vid>      <session id>   day      a consented visitor's sessions: the index that
+                                                 finds them all, to add up and play in turn
     g|<site>             <group id>     …        an error group: first/last seen, a sample
     o|<site>|<group>     <ts>#<rand>    …        that group's occurrences
     salt|<day>           -              salt     the day's visitor-hash salt, gone in 2 days
@@ -50,6 +52,7 @@ import re
 import secrets
 import statistics
 import time
+import urllib.parse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -120,6 +123,11 @@ def sessions_pk(site: str, day: str) -> str:
 
 def visit_pk(site: str, visitor: str) -> str:
     return f"v|{site}|{visitor}"
+
+
+def visitor_pk(site: str, vid: str) -> str:
+    """A consented visitor's sessions, by their visitor cookie (`vid`)."""
+    return f"vs|{site}|{vid.lower()}"
 
 
 def groups_pk(site: str) -> str:
@@ -204,6 +212,37 @@ def group_id(kind: str, name: str, message: str, stack: str, source: str) -> str
 
 
 ERROR_KINDS = {"error", "rejection", "resource", "csp", "manual", "console"}
+
+
+# ---------------------------------------------------------------- automation, and leaving
+
+# What c.js finds driving the browser (`auto`), besides navigator.webdriver (`wd`).
+DRIVERS = frozenset({"Playwright", "Selenium", "PhantomJS", "Nightmare", "Cypress", "Chrome automation",
+                     "HeadlessChrome"})
+# Signs c.js flags on a page view as it ends (`sig`): a burst of clicks. The collector
+# adds `ip`, an address on an attack list, to its page view.
+SIGNS = frozenset({"rapid"})
+# How a page view ended, when its navigate event said: another page here, another site,
+# back, forward, a reload.
+LEFT = frozenset({"page", "out", "back", "forward", "reload"})
+HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}\.)*[a-z0-9-]{1,63}")
+
+
+def automation(webdriver, driver) -> Bot | None:
+    """The driver c.js found, by name, else navigator.webdriver."""
+    if isinstance(driver, str) and driver in DRIVERS:
+        return Bot(driver, "automation")
+    return Bot("webdriver", "automation") if webdriver is True else None
+
+
+def signs_of(value) -> list[str]:
+    return sorted({s for s in value if isinstance(s, str) and s in SIGNS}) if isinstance(value, list) else []
+
+
+def outbound(value) -> str:
+    """The other site a page view left for, as c.js names it (`URL.hostname`), without `www.`."""
+    host = text(value, 253).lower().removeprefix("www.")
+    return host[:80] if HOST.fullmatch(host) else ""
 
 
 # ---------------------------------------------------------------- store
@@ -291,12 +330,13 @@ class Store:
             start_day = day
 
         ua = meta.user_agent or ""
-        bot = classify.bot_of(ua)
-        if not bot and batch.get("wd") is True:
-            bot = Bot("webdriver", "automation")
-        geo = self.locate(meta.ip, meta.country, meta.asn, meta.city, meta.region, meta.tz)
         # From the ranges alone (no DNS), so anonymous views are counted by connection too.
-        net = self.intel.local(meta.ip).net(geo.network) or "isp"
+        local = self.intel.local(meta.ip)
+        bot = classify.bot_of(ua) or automation(batch.get("wd"), batch.get("auto"))
+        if not bot and local.listed:
+            bot = Bot("Spamhaus DROP", "scanner")  # as the server logs and cl("who") count it
+        geo = self.locate(meta.ip, meta.country, meta.asn, meta.city, meta.region, meta.tz)
+        net = local.net(geo.network) or "isp"
         zone = text(batch.get("tz"), 64)
         elsewhere = clock_elsewhere(zone, geo.tz, at)
         browser, system = classify.browser_of(ua)
@@ -351,12 +391,15 @@ class Store:
                     continue
                 if bot:
                     counts[(W, "jsbot")] += 1
+                    counts[(W, f"jb#{bot.name}")] += 1
                     continue
                 source = classify.source_of(item.get("r"), item.get("u"), own)
+                sig = ["ip"] if local.abuse else []
                 if not dup:
                     origin = origin or source
                     for sk in ("pv", f"path#{path}", f"dev#{device}",
-                               f"cty#{geo.country or '??'}", f"br#{browser}", f"os#{system}", f"net#{net}"):
+                               f"cty#{geo.country or '??'}", f"br#{browser}", f"os#{system}", f"net#{net}",
+                               *(f"sig#{s}" for s in sig)):
                         counts[(W, sk)] += 1
                     if elsewhere:
                         counts[(W, "tzx")] += 1
@@ -366,7 +409,8 @@ class Store:
                 if consented:
                     logs.append({"pk": log_pk(site.id, day, "pv"), "sk": stamp(at, seq), "path": path,
                                  "ref": text(item.get("r"), 300), "browser": browser, "os": system,
-                                 "device": device, **who(), "expires": self.keep("visits")})
+                                 "device": device, **({"sig": sig} if sig else {}), **who(),
+                                 "expires": self.keep("visits")})
                     session["pages"] += 1
                     exit_path = path
                     if item.get("new") is True and new_session is None:
@@ -375,13 +419,23 @@ class Store:
             elif kind == "leave":
                 if meta.opted_out or bot or not path:
                     continue
+                kept = []
                 ms = item.get("ms")
-                if not isinstance(ms, int) or isinstance(ms, bool) or not 0 < ms <= 3_600_000:
-                    continue
-                counts[(W, "ms")] += ms
-                counts[(W, f"ms#{path}")] += ms
-                session["ms"] += ms
-                stored += 1
+                if isinstance(ms, int) and not isinstance(ms, bool) and 0 < ms <= 3_600_000:
+                    kept += [("ms", ms), (f"ms#{path}", ms)]
+                    session["ms"] += ms
+                how = item.get("how") if item.get("how") in LEFT else ""
+                to = outbound(item.get("to")) if how == "out" else ""
+                if to in own:
+                    how = "page"  # the same site under another of its names
+                if how:
+                    kept.append((f"left#{how}", 1))
+                if how == "out" and to:
+                    kept.append((f"out#{to}", 1))
+                kept += [(f"sig#{s}", 1) for s in signs_of(item.get("sig"))]
+                for sk, n in kept:
+                    counts[(W, sk)] += n
+                stored += bool(kept)
 
             elif kind == "ev":
                 name = item.get("n")
@@ -452,6 +506,7 @@ class Store:
         if consented:
             if new_session:
                 self.table.put_new(new_session)
+                self.index_session(site.id, vid, start_day, sid, new_session["started"], new_session["expires"])
             if session:
                 self.table.update(sessions_pk(site.id, start_day), sid, add=dict(session),
                                   set_={"last": iso(at), **({"exit": exit_path} if exit_path else {}),
@@ -526,11 +581,12 @@ class Store:
 
     # -- what the collector makes of a visitor, for the page that asks (c.js's cl("who"))
 
-    def who(self, meta: Meta, zone: str = "", webdriver: bool = False) -> dict:
+    def who(self, meta: Meta, zone: str = "", webdriver: bool = False, driver: str = "") -> dict:
         """The verdict on one request, for the page that made it: a bot (and, for a
         crawler that can be checked, whether it is the real one), the kind of connection,
         the lists that name the address, and whether the browser's clock (`zone`) keeps
-        another time than the address's. Nothing is stored or counted.
+        another time than the address's. c.js says what it found driving the browser
+        (`webdriver`, `driver`), which comes back as `bot`. Nothing is stored or counted.
 
         Only a request that says it is a crawler checked by its name gets a reverse DNS
         lookup, and only when its address hasn't already proved it: a person's address
@@ -548,8 +604,8 @@ class Store:
                 about = self.intel.lookup(meta.ip, BEACON_DNS)
                 ver = verify(bot.name, about, geo.asn, has_ranges)
             verified = {"verified": True, "spoofed": False}.get(ver)
-        elif webdriver:
-            bot = Bot("webdriver", "automation")
+        elif automation(webdriver, driver):
+            bot = automation(webdriver, driver)
         elif about.listed:
             bot = Bot("Spamhaus DROP", "scanner")  # as the server logs count it
         return {
@@ -559,6 +615,25 @@ class Store:
             "elsewhere": clock_elsewhere(zone, geo.tz, now()),
             "country": geo.country, "asn": geo.asn, "network": geo.network,
         }
+
+    # -- a page shown without JavaScript
+
+    def no_script(self, site, referrer: str, meta: Meta) -> bool:
+        """Its <noscript> pixel, which names the page by its Referer. Crawlers that don't
+        run JavaScript fetch the images in a page's markup, the pixel too; they're left
+        out by user agent, and by sending no Referer from the site."""
+        if not self.table or meta.opted_out or not site.client:
+            return False
+        if classify.bot_of(meta.user_agent) or self.intel.local(meta.ip).listed:
+            return False
+        if classify.host_of(referrer) not in site.hosts:
+            return False
+        path = clean_path(urllib.parse.urlsplit(referrer).path, site.exclude)
+        if not path:
+            return False
+        W = web(site.id, day_of(now()))
+        self.table.add_many({(W, "nojs"): 1, (W, f"nj#{path}"): 1}, self.keep("counts"))
+        return True
 
     # -- events from a site's own server
 
@@ -619,6 +694,7 @@ class Store:
                                              **self.profile(geo, self.intel.lookup(meta.ip, BEACON_DNS)),
                                              "path": clean_path(data.get("p"), site.exclude) or "",
                                              "expires": self.keep("recordings")})
+            self.index_session(site.id, visitor, start_day, session, iso(at), self.keep("recordings"))
         return True
 
     def recording(self, site, session) -> str | None:
@@ -632,6 +708,68 @@ class Store:
             chunks = list(pool.map(lambda k: gzip.decompress(self.blobs.get(k)).decode(), keys))
         inner = [c[1:-1] for c in chunks if len(c) > 2]
         return f"[{','.join(inner)}]" if inner else None
+
+    # -- a visitor's sessions
+
+    def index_session(self, site_id: str, vid: str, day: str, sid: str, started: str, expires: int) -> bool:
+        """A consented session in its visitor's index (`vs|`), which finds every session a
+        visitor had without reading each day's. It lasts as long as the session; the first
+        write stands."""
+        return self.table.put_new({"pk": visitor_pk(site_id, vid), "sk": sid, "day": day, "started": started,
+                                   "expires": expires})
+
+    def visitor(self, site, vid: str, limit: int = 60) -> dict | None:
+        """One consented visitor's sessions on a site, oldest first (the latest `limit`),
+        with what they add up to and the pages they viewed, from the page-view log of the
+        days the sessions ran. None when the visitor has no sessions kept."""
+        if not self.table or not valid_id(vid):
+            return None
+        index = self.table.query(visitor_pk(site.id, vid))
+        keys = [(sessions_pk(site.id, i["day"]), i["sk"]) for i in index
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(i.get("day", "")))]
+        found = self.table.get_many(keys)
+        rows = sorted(({**public(s), "id": s["sk"]} for s in found.values()), key=lambda r: r.get("started", ""))
+        rows = rows[-limit:]
+        if not rows:
+            return None
+
+        days: set[str] = set()
+        for r in rows:
+            first = datetime.strptime(r.get("started", "")[:10] or day_of(now()), "%Y-%m-%d")
+            last = datetime.strptime((r.get("last") or r.get("started", ""))[:10] or day_of(now()), "%Y-%m-%d")
+            days.update(day_of(first + timedelta(days=d)) for d in range(min((last - first).days, 2) + 1))
+        ids = {r["id"] for r in rows}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            parts = list(pool.map(lambda d: self.table.query(log_pk(site.id, d, "pv")), sorted(days)))
+        views = Counter(i.get("path", "") for part in parts for i in part if i.get("sid") in ids and i.get("path"))
+
+        def total(key: str) -> int:
+            return sum(int(r.get(key) or 0) for r in rows)
+
+        totals = {
+            "sessions": len(rows), "recorded": sum(1 for r in rows if r.get("rec")),
+            "pages": total("pages"), "unique_pages": len(views), "events": total("events"),
+            "errors": total("errors"), "ms": total("ms"), "days": len({r.get("started", "")[:10] for r in rows}),
+            "first": rows[0].get("started", ""), "last": max(r.get("last") or r.get("started", "") for r in rows),
+        }
+        return {"vid": vid.lower(), "sessions": rows, "totals": totals,
+                "pages": [{"path": path, "views": n} for path, n in views.most_common(100)]}
+
+    def index_visitors(self) -> int:
+        """Index the consented sessions kept from before visitors were indexed, on every
+        site (`{"task": "index-visitors"}`, once after the deploy that added the index).
+        Safe to run again: it only adds what's missing. Returns how many it added."""
+        if not self.table:
+            return 0
+        added = 0
+        for site in self.cfg.sites.values():
+            for day in days_back(self.cfg.retention["recordings"] + 1):
+                for s in self.table.query(sessions_pk(site.id, day)):
+                    if valid_id(s.get("vid")) and self.index_session(
+                            site.id, s["vid"], day, s["sk"], s.get("started", ""),
+                            int(s.get("expires") or self.keep("recordings"))):
+                        added += 1
+        return added
 
     # -- server logs
 
@@ -744,7 +882,7 @@ class Store:
         totals: Counter = Counter()
         for day, w_items, s_items in zip(keys, webs, srvs):
             row = {"day": day, "pv": 0, "uv": 0, "ms": 0, "jsbot": 0, "ev": 0, "err": 0, "req": 0,
-                   "hum": 0, "bot": 0, "dc": 0, "tzx": 0, "abuse": 0, "ses": 0, "bnc": 0, "vpv": 0}
+                   "hum": 0, "bot": 0, "dc": 0, "tzx": 0, "abuse": 0, "ses": 0, "bnc": 0, "vpv": 0, "nojs": 0}
             # Only days that counted visits (from the deploy that added them on) go into exit rates.
             visits = any(item["sk"] == "ses" for item in w_items)
             if not out["sources_from"] and any(item["sk"].startswith("ch#") for item in w_items):
@@ -811,6 +949,8 @@ class Store:
             "connections": top("net"), "server_connections": top("snet"), "server_networks": top("shn", 30),
             "server_domains": top("shd", 30), "bot_domains": top("sdom", 30), "verified": top("sv", 30),
             "impostors": top("sx", 30),
+            "automation": top("jb", 30), "signs": top("sig"), "nojs_paths": top("nj", 20),
+            "left": top("left"), "outbound": top("out", 30),
         }
         out["intel"] = {"ranges": self.intel.ranges.built if self.intel.ranges else "",
                         "dns": self.intel.dns, "geo": [r.database_type for r in self.geo.readers]}

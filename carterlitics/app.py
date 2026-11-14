@@ -5,19 +5,23 @@
     POST /_c/i                      a batch from c.js: page views, leaves, events, errors
     GET  /_c/who                    what the collector makes of this visitor, for the page:
                                     a bot (checked, if a crawler), VPN, Tor, relay, hosting
+    GET  /_c/n.gif                  a page shown without JavaScript: its <noscript> pixel
     POST /_c/r                      a chunk of a consented session recording
     POST /_c/server/events          events from a site's own backend (x-carterlitics-key)
     GET  /_c/admin/                 the console (on the console site; others redirect there)
-    GET  /_c/admin/replay           one session recording, played back
+    GET  /_c/admin/replay           one session recording, played back; with ?visitor=…,
+                                    every recorded session of one visitor, in turn
     GET  /_c/api/*                  the console's data, for a signed-in administrator
                                     (/api/ip?ip=…: one address, registry included;
-                                    /api/search: Google Search Console, `google.py`)
+                                    /api/search: Google Search Console, `google.py`;
+                                    /api/visitor?id=…: one visitor's sessions, added up)
     GET  /_c/auth/login|callback    sign-in at the OpenID Connect issuer
     POST /_c/auth/logout
 
 and, not over HTTP, S3 notifications for new CloudFront access log files, which it
-reads and counts (`logs.py`), and `{"task": "search-console"}` from `aws lambda invoke`,
-which answers with the Search Console properties the function itself can read.
+reads and counts (`logs.py`), and, from `aws lambda invoke`, `{"task": "search-console"}`,
+which answers with the Search Console properties the function itself can read, and
+`{"task": "index-visitors"}`, which indexes sessions kept from before visitors were.
 
 CloudFront adds two headers to every request it sends here: `x-origin-verify`, a
 secret, so the Function URL is useless on its own, and `x-carterlitics-site`, which
@@ -49,6 +53,7 @@ from .web import NO_STORE, Request, Response, from_lambda, no_content, plain, re
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 64 * 1024            # a batch from c.js: sendBeacon's limit
 MAX_CHUNK_BODY = 3 * 1024 * 1024
+PIXEL = bytes.fromhex("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b")
 
 
 # ---------------------------------------------------------------- static files
@@ -195,7 +200,15 @@ class App:
             # answers with Do Not Track too.
             if not self.site_of(req):
                 return plain(404, "unknown site")
-            return reply_json(self.store.who(self.meta(req), req.query.get("tz", ""), req.query.get("wd") == "1"))
+            q = req.query
+            return reply_json(self.store.who(self.meta(req), q.get("tz", ""), q.get("wd") == "1", q.get("auto", "")))
+
+        if route == ("GET", "/n.gif"):
+            # In a page's <noscript>, so only a browser not running JavaScript asks for it.
+            site = self.site_of(req)
+            if site:
+                self.store.no_script(site, req.headers.get("referer", ""), self.meta(req))
+            return Response(200, PIXEL, {"Content-Type": "image/gif", **NO_STORE})
 
         if route == ("POST", "/r"):
             site = self.site_of(req)
@@ -302,6 +315,9 @@ class App:
         if path == "/error":
             found = self.store.error(site, q.get("id", ""))
             return self.big_json(found) if found else reply_json({"error": "not found"}, 404)
+        if path == "/visitor":
+            found = self.store.visitor(site, q.get("id", ""))
+            return self.big_json(found) if found else reply_json({"error": "not found"}, 404)
         if path == "/recording":
             events = self.store.recording(site, q.get("id"))
             if events is None:
@@ -377,6 +393,8 @@ def lambda_handler(event, context):
             return {"ok": True, "account": _app.search.account, "properties": _app.search.properties()}
         except GoogleError as e:
             return {"ok": False, "account": _app.search.account, "error": str(e)}
+    if isinstance(event, dict) and event.get("task") == "index-visitors":
+        return {"ok": True, "indexed": _app.store.index_visitors()}
     try:
         res = _app.handle(from_lambda(event))
     except Exception:  # noqa: BLE001 - one bad request must not look like an outage

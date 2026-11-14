@@ -8,11 +8,24 @@
    Only after the visitor accepts (the consent banner, or cl("consent", "all")): a
    visitor cookie, a session id, a device fingerprint, and a session recording (rrweb,
    typed text masked, [data-private] blanked, [data-mask] text masked). A session is one
-   tab's, in sessionStorage, and ends after 30 minutes without a page view or event.
+   tab's, in sessionStorage, and ends after 30 minutes without a page view or event. A
+   duplicated tab, which starts with a copy of its tab's sessionStorage, asks the site's
+   other tabs (BroadcastChannel) and takes a session of its own.
 
    Do Not Track and Global Privacy Control are a standing "no": nothing is identified
    or recorded, page views and events aren't sent, and the banner never shows. Error
    reports still go, anonymously, so the site can be fixed.
+
+   Signs of automation go with page views, as a bot challenge page would look for them,
+   but are only counted: navigator.webdriver, a driver's own globals (Playwright,
+   Selenium, PhantomJS, …) and a headless brand make a page view a bot's; a burst of
+   clicks (`rapid`) is flagged. Leaving goes out by beacon when the browser's `navigate`
+   event says the page is going (a link, a form, back, forward, reload), with where to:
+   another page here, or which other site. pagehide covers the rest.
+
+   A page view is a page someone saw. A page the browser prerenders starts nothing until
+   it's shown (cl() calls wait in the stub's queue, nothing is sent), and one the
+   back/forward cache brings back counts again, as the same Back would without the cache.
 
    Options, as attributes on the script tag:
      data-mode="consent"   consent (default) · full (identify without asking) · anonymous
@@ -103,6 +116,10 @@
   var errors = 0;
   var seen = {};
   var recorder = null;
+  var shipped = 0;              // recording chunks this page has sent
+  var going = null;             // how the page view is ending, when the navigate event said: { how, to }
+  var noted = {};               // the page view's signs of automation: seen,
+  var told = {};                // ... and already sent (each goes once a page view)
 
   /* ---------------------------------------------------------------- storage */
 
@@ -153,6 +170,7 @@
     var e = { v: 1, w: w.innerWidth, items: items };
     if (ZONE) e.tz = ZONE;
     if (nav.webdriver) e.wd = true;
+    if (DRIVER) e.auto = DRIVER;
     if (ident) {
       e.vid = ident.vid;
       e.sid = ident.sid;
@@ -168,6 +186,8 @@
   function flush(final) {
     clearTimeout(timer);
     timer = null;
+    // A prerendered page not shown yet sends nothing; what's queued goes once it starts.
+    if (!started) return Promise.resolve();
     var done = waiting;
     waiting = [];
     var sends = [];
@@ -199,20 +219,87 @@
     return sent;
   }
 
+  /* ---------------------------------------------------------------- signs of automation */
+
+  // What a bot challenge page checks before it lets a visitor through, short of the
+  // challenge: counted with the page view, never acted on here. cl("who") gives a page
+  // that wants to act the verdict. Not DevTools: the check challenge pages used, a logged
+  // error whose stack getter only Chrome's DevTools protocol would read, no longer fires
+  // (Chromium 145 never reads it, even with the protocol's Runtime domain on).
+
+  // A driver that leaves its own globals on the page, by name. navigator.webdriver covers
+  // most of the rest, and the collector knows more by user agent.
+  var DRIVERS = [
+    ["Playwright", "__playwright__binding__ __pwInitScripts"],
+    ["Selenium", "_selenium callSelenium _Selenium_IDE_Recorder __selenium_unwrapped __selenium_evaluate " +
+      "__webdriver_evaluate __webdriver_unwrapped __webdriver_script_fn __driver_evaluate __driver_unwrapped " +
+      "__fxdriver_evaluate __fxdriver_unwrapped"],
+    ["PhantomJS", "callPhantom _phantom"],
+    ["Nightmare", "__nightmare"],
+    ["Cypress", "Cypress"],
+    ["Chrome automation", "domAutomation domAutomationController"]
+  ];
+
+  function driver() {
+    var found = "";
+    each(DRIVERS, function (entry) {
+      if (!found && entry[1].split(" ").some(function (k) { return k in w || k in d; })) found = entry[0];
+    });
+    // ChromeDriver puts cdc_… names on the window and $cdc_… on the document.
+    each([w, d], function (o) {
+      if (!found && Object.keys(o).some(function (k) { return /^\$?cdc_/.test(k); })) found = "Selenium";
+    });
+    // Headless Chrome says so in its brands even when its user agent says otherwise.
+    var brands = nav.userAgentData && nav.userAgentData.brands;
+    if (!found && brands && brands.some(function (b) { return /headless/i.test(b.brand); })) found = "HeadlessChrome";
+    return found;
+  }
+
+  var DRIVER = driver();
+
+  // A burst: 8 clicks or taps inside 2 seconds. Scripts click that fast, and so does a
+  // person clicking something that won't respond, which is worth knowing too.
+  var clicks = [];
+
+  function watchClicks() {
+    d.addEventListener("click", function (e) {
+      var t = e.timeStamp || Date.now();
+      clicks.push(t);
+      while (clicks.length && t - clicks[0] > 2000) clicks.shift();
+      if (clicks.length >= 8) noted.rapid = 1;
+    }, true);
+  }
+
+  // The page view's signs not sent yet, which are then sent: each once a page view.
+  function signs() {
+    var out = Object.keys(noted).filter(function (k) { return !told[k]; });
+    each(out, function (k) { told[k] = 1; });
+    return out.length ? out : null;
+  }
+
   /* ---------------------------------------------------------------- page views */
 
   function counting() {
     return !OPTED_OUT && current !== null && !excluded(current);
   }
 
+  // The page view so far: engaged time, how it ended (when the page knows), and any sign
+  // of automation since its page view went.
   function settle() {
     // Engaged time: only while the page is visible.
     if (visibleSince) {
       engaged += Date.now() - visibleSince;
       visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
     }
-    if (counting() && engaged >= 1000) {
-      queue.push({ t: "leave", p: current, ms: Math.min(Math.round(engaged), 3600000) });
+    var away = going;
+    going = null;
+    if (counting()) {
+      var item = { t: "leave", p: current }, sig = signs();
+      if (engaged >= 1000) item.ms = Math.min(Math.round(engaged), 3600000);
+      if (away) item.how = away.how;
+      if (away && away.to) item.to = away.to;
+      if (sig) item.sig = sig;
+      if (item.ms || item.how || item.sig) queue.push(item);
     }
     engaged = 0;
   }
@@ -238,12 +325,23 @@
 
   function page(path) {
     path = typeof path === "string" ? path : loc.pathname;
-    if (path === current) return Promise.resolve();
-    if (current !== null) settle();
+    if (path === current) {
+      going = null;   // the address changed, the page didn't
+      return Promise.resolve();
+    }
+    if (current !== null) {
+      going = going || { how: "page" };   // an SPA's navigation; back or forward if the navigate event said so
+      settle();
+    }
     var referrer = current === null ? d.referrer : lastUrl;
     current = path;
     lastUrl = loc.href;
     visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
+    noted = {};
+    told = {};
+    clicks = [];
+    leaving = false;
+    mark(path);
     if (!counting()) return Promise.resolve();
     var item = { t: "pv", p: path, r: referrer || null }, u = tags();
     if (u) item.u = u;
@@ -261,6 +359,55 @@
       };
     });
     w.addEventListener("popstate", function () { page(); });
+    // A router built on the Navigation API moves the address without pushState.
+    var n = w.navigation;
+    if (n && typeof n.addEventListener === "function") n.addEventListener("currententrychange", function () { page(); });
+  }
+
+  /* ---------------------------------------------------------------- leaving */
+
+  // The Navigation API's navigate event says the page is going before it goes, and
+  // where: a link or form to another page here or to another site, back, forward, a
+  // reload. That is when the page view is settled and what's queued goes out by beacon,
+  // while the page is whole. pagehide still covers the rest: a closed tab, an address
+  // typed in, a browser without the API. A #fragment, a download, a mailto: link or a
+  // cancelled navigation isn't leaving.
+  function watchLeaving() {
+    var n = w.navigation;
+    if (!n || typeof n.addEventListener !== "function") return;
+    n.addEventListener("navigate", function (e) {
+      var to;
+      try { to = new URL(e.destination.url); } catch (x) { return; }
+      if (e.hashChange || typeof e.downloadRequest === "string" || !/^https?:$/.test(to.protocol)) return;
+      var how = to.origin === loc.origin ? "page" : "out";
+      if (e.navigationType === "reload") how = "reload";
+      else if (e.navigationType === "traverse") {
+        // An entry on another site has no index here: most often that's back to a search.
+        var at = n.currentEntry ? n.currentEntry.index : -1, there = e.destination.index;
+        how = there > -1 && at > -1 && there > at ? "forward" : "back";
+      }
+      var leaving = { how: how, to: how === "out" ? to.hostname : "" };
+      going = leaving;
+      if (e.destination.sameDocument) return;   // pushState or popstate: page() settles it
+      var from = loc.href;
+      function away() {
+        if (going !== leaving) return;
+        if (e.defaultPrevented || n.transition || loc.href !== from) {
+          going = null;
+          return;
+        }
+        leaving = true;
+        settle();
+        ship(true);
+        flush(true);
+      }
+      // Somewhere the page's router can't keep it (another site, a page from the cache):
+      // now, before the next page can arrive. Otherwise once every listener has had its
+      // say, as the router may take the link in hand (page() settles it) or cancel it; a
+      // next page quicker than that gets it from pagehide, `going` and all.
+      if (e.canIntercept) setTimeout(away, 0);
+      else away();
+    });
   }
 
   /* ---------------------------------------------------------------- events */
@@ -516,7 +663,8 @@
   // Do Not Track too. null when the collector can't be reached, and asked again next time.
   function who(callback) {
     if (!asked) {
-      var query = [ZONE ? "tz=" + encodeURIComponent(ZONE) : "", nav.webdriver ? "wd=1" : ""].filter(Boolean).join("&");
+      var query = [ZONE ? "tz=" + encodeURIComponent(ZONE) : "", nav.webdriver ? "wd=1" : "",
+        DRIVER ? "auto=" + encodeURIComponent(DRIVER) : ""].filter(Boolean).join("&");
       asked = fetch(BASE + "/who" + (query ? "?" + query : ""), { credentials: "omit", cache: "no-store" }).then(function (res) {
         if (!res.ok) throw new Error("who: " + res.status);
         return res.json();
@@ -576,6 +724,8 @@
     session("cl_uid", uid || null);
     ident = { vid: vid, sid: sid, sd: sd, fresh: fresh, uid: uid };
     if (crypto.subtle) fingerprint().then(function (fp) { ident && (ident.fp = fp); }, function () {});
+    listen();
+    if (!fresh) claim();
     return true;
   }
 
@@ -609,12 +759,85 @@
     session("cl_sd", ident.sd);
     session("cl_seq", "0");
     // The recording goes on under the new session, from a fresh snapshot of the page.
-    if (recorder && recorder.stop && w.rrweb && w.rrweb.record.takeFullSnapshot) {
-      try { w.rrweb.record.takeFullSnapshot(true); } catch (e) { /* the next page load starts one */ }
+    snapshot();
+  }
+
+  /* ---------------------------------------------------------------- one session a tab */
+
+  // A duplicated tab, or a window opened with an opener, starts with a copy of this tab's
+  // sessionStorage: its session, and its count of recording chunks, so the two would write
+  // each other's chunks and play as one recording. So a page that picks a session up from
+  // storage asks the site's other tabs (a BroadcastChannel, consented visitors only)
+  // whether one of them has it, twice, CLAIM_MS apart. The page this tab is leaving may
+  // still answer the first time; it stops answering as it goes (`leaving`), and is gone by
+  // the second. A tab that still answers is the one this was copied from, and this tab
+  // takes a session of its own.
+  var TAB = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  var CLAIM_MS = 200;
+  var tabs = null;
+  var heard = 0;                // answers to this page's latest claim
+  var leaving = false;
+
+  function listen() {
+    if (tabs || typeof w.BroadcastChannel !== "function") return;
+    try { tabs = new w.BroadcastChannel("carterlitics"); } catch (e) { return; }
+    tabs.onmessage = function (e) {
+      var m = e && e.data;
+      if (!m || !ident || leaving || m.from === TAB || m.sid !== ident.sid) return;
+      if (m.t === "claim") tabs.postMessage({ t: "mine", sid: m.sid, to: m.from, from: TAB });
+      else if (m.t === "mine" && m.to === TAB) heard++;
+    };
+  }
+
+  // Closed as the page goes (and while it's in the back/forward cache), so it answers no
+  // one and doesn't keep the page from being cached.
+  function quiet() {
+    if (tabs) {
+      try { tabs.close(); } catch (e) { /* closed already */ }
+    }
+    tabs = null;
+  }
+
+  function claim() {
+    if (!tabs || !ident) return;
+    var sid = ident.sid;
+    function ask(then) {
+      if (!tabs) return;
+      heard = 0;
+      tabs.postMessage({ t: "claim", sid: sid, from: TAB });
+      setTimeout(function () {
+        if (heard && ident && ident.sid === sid) then();
+      }, CLAIM_MS);
+    }
+    ask(function () { ask(fork); });
+  }
+
+  // This tab's copy of another tab's session becomes a session of its own, from here on.
+  // What's still queued goes out under it, its first page view or event saying it's new,
+  // and a recording that has already sent chunks under the old one starts again from a
+  // fresh snapshot (otherwise its first chunk still holds the page's).
+  function fork() {
+    ident.sid = crypto.randomUUID();
+    ident.sd = today();
+    session("cl_sid", ident.sid);
+    session("cl_sd", ident.sd);
+    session("cl_seq", "0");
+    session("cl_at", String(Date.now()));
+    var first = queue.filter(function (i) { return i.t === "pv" || i.t === "ev"; })[0];
+    ident.fresh = !first;
+    if (first) {
+      first.new = true;
+      clearTimeout(timer);
+      timer = setTimeout(flush, 0);
+    }
+    if (recorder && shipped) {
+      recorder.buffer = [];
+      snapshot();
     }
   }
 
   function forget() {
+    quiet();
     cookie("vid", "", 0);
     ["cl_sid", "cl_sd", "cl_seq", "cl_uid", "cl_at"].forEach(function (k) { session(k, null); });
     ident = null;
@@ -649,6 +872,24 @@
     }, function () { recorder = null; });
   }
 
+  // A fresh snapshot of the whole page for the replay to go on from: under a new session,
+  // or for a page the back/forward cache brought back, whose changes would otherwise land
+  // on the snapshot of the page before it.
+  function snapshot() {
+    if (recorder && recorder.stop && w.rrweb && w.rrweb.record.takeFullSnapshot) {
+      try { w.rrweb.record.takeFullSnapshot(true); } catch (e) { /* the next page load starts one */ }
+    }
+  }
+
+  // A page in the recording, for the replay's timeline. A page load's snapshot already says
+  // where it is (rrweb's Meta event); this marks the rest: an SPA's navigation, a page
+  // brought back by Back.
+  function mark(path) {
+    if (recorder && recorder.stop && w.rrweb && w.rrweb.record.addCustomEvent) {
+      try { w.rrweb.record.addCustomEvent("page", { path: path }); } catch (e) { /* not recording yet */ }
+    }
+  }
+
   function nextSeq() {
     var seq = parseInt(session("cl_seq"), 10) || 0;
     session("cl_seq", String(seq + 1));
@@ -667,6 +908,7 @@
       var seq = nextSeq();
       if (seq < MAX_CHUNKS) {
         post("/r", { sid: ident.sid, vid: ident.vid, sd: ident.sd, seq: seq, events: batch, p: loc.pathname }, final);
+        shipped++;
       }
       batch = [];
       size = 0;
@@ -774,37 +1016,72 @@
   };
   w.carterlitics = api;
 
-  var pending = (w.cl && w.cl.q) || [];
-  w.cl = function (command) {
-    var fn = api[command];
-    return fn ? fn.apply(api, Array.prototype.slice.call(arguments, 1)) : undefined;
-  };
+  // A page the browser prerenders (speculation rules, or Chrome guessing from what's typed
+  // in the address bar) runs its scripts before anyone sees it, and may never be shown.
+  // Until it is, c.js is as good as not loaded: cl() calls wait in the stub's queue,
+  // Google's in theirs, and nothing is sent. Once it's shown, c.js starts as if it had
+  // just loaded, and the page view counts from then.
+  var started = false;
 
-  watchErrors();
-  watchConsent();
+  function start() {
+    if (started || d.prerendering) return;
+    started = true;
 
-  if (MODE === "full") apply("all");
-  else if (MODE === "consent" && OPTED_OUT) forget();
-  else if (MODE === "consent" && choice()) apply(choice());
-  else if (MODE === "consent") ask();
+    var pending = (w.cl && w.cl.q) || [];
+    w.cl = function (command) {
+      var fn = api[command];
+      return fn ? fn.apply(api, Array.prototype.slice.call(arguments, 1)) : undefined;
+    };
 
-  page();
-  watchNavigation();
-  pending.forEach(function (args) { w.cl.apply(null, args); });
-  watchGoogle();
+    watchErrors();
+    watchConsent();
+    watchClicks();
 
-  d.addEventListener("visibilitychange", function () {
-    if (d.visibilityState === "hidden") {
+    if (MODE === "full") apply("all");
+    else if (MODE === "consent" && OPTED_OUT) forget();
+    else if (MODE === "consent" && choice()) apply(choice());
+    else if (MODE === "consent") ask();
+
+    page();
+    watchNavigation();
+    watchLeaving();
+    pending.forEach(function (args) { w.cl.apply(null, args); });
+    watchGoogle();
+
+    d.addEventListener("visibilitychange", function () {
+      if (d.visibilityState === "hidden") {
+        settle();
+        ship(true);
+        flush(true);
+      } else {
+        visibleSince = Date.now();
+      }
+    });
+    w.addEventListener("pagehide", function () {
+      leaving = true;
+      quiet();
       settle();
       ship(true);
       flush(true);
-    } else {
-      visibleSince = Date.now();
-    }
-  });
-  w.addEventListener("pagehide", function () {
-    settle();
-    ship(true);
-    flush(true);
-  });
+    });
+    // Back or forward to a page the browser kept whole (the back/forward cache). It comes
+    // back as it was left, without running its scripts again, so this is its page view:
+    // counted as the same Back would be if the page loaded anew, from its own referrer.
+    // pagehide has already settled the one before. A recording goes on from a fresh
+    // snapshot, since the replay last saw the page Back came from.
+    w.addEventListener("pageshow", function (e) {
+      if (!e || !e.persisted) return;
+      snapshot();
+      current = null;
+      page();
+      // Another tab may have been copied from this one while it was cached.
+      if (ident) {
+        listen();
+        claim();
+      }
+    });
+  }
+
+  if (d.prerendering) d.addEventListener("prerenderingchange", start);
+  start();
 })();

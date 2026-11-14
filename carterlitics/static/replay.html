@@ -15,11 +15,23 @@
     <div class="filters"><a data-back href="{{mount}}/admin/#visitors">&larr; Sessions</a></div>
   </header>
   <section class="card">
-    <h2>Session <span class="mono" data-session>…</span></h2>
+    <h2><span data-title>Session</span> <span class="mono" data-session>…</span></h2>
     <p class="sub" data-when></p>
-    <p class="status" data-status role="status">Loading the recording…</p>
+    <div data-stats hidden></div>
+    <p class="status" data-status role="status">Loading…</p>
     <noscript><p class="status status--bad">The player needs JavaScript.</p></noscript>
     <div class="player" data-player></div>
+    <ol class="pages" data-pages aria-label="Pages in this recording" hidden></ol>
+  </section>
+  <section class="card" hidden>
+    <h2>Sessions</h2>
+    <p class="sub">Oldest first. A session is one browser tab, until 30 minutes pass without a page view or event.</p>
+    <div data-sessions></div>
+  </section>
+  <section class="card" hidden>
+    <h2>Pages viewed</h2>
+    <p class="sub">Every page view in these sessions, by page.</p>
+    <div data-viewed></div>
   </section>
 </div>
 <script src="{{asset:vendor/rrweb-player.min.js}}" defer></script>
