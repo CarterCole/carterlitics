@@ -11,7 +11,7 @@
   var MOUNT = root.dataset.mount || "/_c";
   var API = MOUNT + "/api";
   var RANGES = [1, 7, 30, 90];
-  var TABS = ["overview", "traffic", "search", "bots", "visitors", "events", "funnels", "errors"];
+  var TABS = ["overview", "traffic", "search", "bots", "visitors", "events", "funnels", "forms", "errors"];
   var params = new URLSearchParams(location.search);
   var state = {
     site: params.get("site") || "",
@@ -800,7 +800,7 @@
       area,
       el("div", { class: "toolbar" }, el("label", { class: "field" }, by),
         el("button", { type: "submit", class: "btn", text: "Count" }),
-        el("span", { class: "hint", text: "/path · /path/* · event:name · event:name?key=value" })));
+        el("span", { class: "hint", text: "/path · /path/* · event:name · event:name?key=value · form:key · form:key?res=submit" })));
     if (state.explore.steps) explore();
 
     return [
@@ -808,6 +808,116 @@
       card("Try a funnel", "Steps in order, one per line. Counted over the consented sessions in this range; " +
         "anonymous visits carry nothing that ties one page to the next.", [form, result])
     ];
+  }
+
+  /* ---------------------------------------------------------------- forms */
+
+  /* How people fill in forms (c.js watches every <form>): per form, attempts begun and
+     sent, and per field, in the form's order, who got to it, how long they hesitated, and
+     what went wrong there. Counts come from the collector; shares are worked out here. */
+  var FORM_SETUP = [
+    "<form id=\"signup\">                a form is named by data-cl-form, its id or name, or where it posts",
+    "  <input name=\"email\">            a field by data-cl-field, its name or its id",
+    "  <div data-private>…</div>       fields in here aren't watched",
+    "</form>",
+    "<form data-cl-form=\"off\">         nor is this form; data-forms=\"off\" on c.js's tag: none",
+    "cl(\"submit\", el)                  a form sent without a submit event (by script, or no <form>)"
+  ].join("\n");
+  /* Each column: its heading, what it means, and its value for a field `x` of form `f`. */
+  var FIELD_COLUMNS = [
+    ["Reached", "Attempts that got to this field (clicked into it, autofilled, or refused when they tried to send), of those begun",
+      function (x, f) { return share(x.reached, f.started); }],
+    ["Wait", "Median time from clicking into the field to typing in it",
+      function (x) { return quick(x.wait_ms); }],
+    ["Pause before", "Median time from leaving the field before to clicking into this one",
+      function (x) { return quick(x.gap_ms); }],
+    ["In it", "Median time spent in the field, every visit to it together",
+      function (x) { return quick(x.ms); }],
+    ["Came back", "Of those who clicked into it, the share who left and came back to it",
+      function (x) { return share(x.back, x.visited); }],
+    ["Corrected", "Of those who clicked into it, the share who deleted some of what they typed",
+      function (x) { return share(x.fixed, x.visited); }],
+    ["Refused", "Of those who reached it, the share the browser's validation refused (required, its type, a pattern)",
+      function (x) { return share(x.refused, x.reached); }],
+    ["Left empty", "Of those who clicked into it, the share who left it empty",
+      function (x) { return share(x.empty, x.visited); }],
+    ["Gave up here", "Attempts given up with this the last field they touched",
+      function (x) { return num(x.dropped); }]
+  ];
+
+  /* A short time: tenths of a second under ten seconds, since hesitation is often that short. */
+  function quick(ms) {
+    if (ms === null || ms === undefined) return "—";
+    return ms < 10000 ? (ms / 1000).toFixed(1) + "s" : dur(ms);
+  }
+
+  function fieldTable(f) {
+    var worst = Math.max.apply(null, f.fields.map(function (x) { return x.dropped; }).concat([0]));
+    return el("div", { class: "table-wrap" }, el("table", { class: "ranked fields" },
+      el("thead", null, el("tr", null, el("th", { text: "Field" }), FIELD_COLUMNS.map(function (c) {
+        return el("td", { class: "num", text: c[0], title: c[1] });
+      }))),
+      el("tbody", null, f.fields.map(function (x) {
+        var notes = [x.kind, x.autofilled ? num(x.autofilled) + " autofilled" : "",
+          x.pasted ? num(x.pasted) + " pasted" : ""].filter(Boolean).join(" · ");
+        return el("tr", null,
+          el("th", { scope: "row" }, el("span", { class: "name", style: "--w:" + (f.started ? x.reached / f.started * 100 : 0) + "%",
+            text: x.name, title: x.name + "\n" + notes })),
+          FIELD_COLUMNS.map(function (c, i) {
+            var hot = i === FIELD_COLUMNS.length - 1 && worst && x.dropped === worst;
+            return el("td", { class: "num" + (i ? "" : " num--lead") + (hot ? " bad" : ""), text: c[2](x, f) });
+          }));
+      }))));
+  }
+
+  function attemptRows(f) {
+    return table(["Time (UTC)", "Page", "", "Last field", "#Time", "#Fields", "Device", ""], f.recent.map(function (a) {
+      return [el("span", { class: "when", text: stamp(a.at) }), clip(a.path),
+        el("span", { class: "pill" + (a.res === "submit" ? " pill--good" : ""), text: a.res === "submit" ? "sent" : "gave up" }),
+        clip(a.last), td(dur(a.ms), "num"), td(num(a.fields), "num"),
+        clip([a.device, a.browser, a.country].filter(Boolean).join(" · ")),
+        a.sid ? replayLink(a.sid, "Watch", a.vid) : ""];
+    }), "None in this range.");
+  }
+
+  function formCard(f) {
+    var pages = f.pages.map(function (p) { return p.name; });
+    var sub = "On " + (pages.length > 3 ? pages.slice(0, 3).join(", ") + " and " + (pages.length - 3) + " more" : pages.join(", ")) +
+      ". " + num(f.started) + " began it and " + num(f.submitted) + " (" + share(f.submitted, f.started) + ") sent it" +
+      (f.ms !== null ? ", in a median " + quick(f.ms) : "") + "; " + num(f.abandoned) + " gave up." +
+      (f.blocked ? " The browser's validation stopped " + num(f.blocked) + " (" + share(f.blocked, f.started) + "), and " +
+        num(f.recovered) + " of them sent it after." : "") +
+      (f.lead !== null ? " People began it a median " + quick(f.lead) + " into the page." : "");
+    return card(f.form, sub, [
+      fieldTable(f),
+      el("details", { class: "table-view" },
+        el("summary", { text: "Newest attempts" + (f.consented ? " (" + num(f.consented) + " consented, with replays)" : "") }),
+        attemptRows(f))
+    ]);
+  }
+
+  function forms() {
+    var holder = el("div", { class: "cards" }, el("p", { class: "empty", text: "Loading forms…" }));
+    cached("forms", function () { return get("/forms", { days: Math.min(state.days, 90) }); }).then(function (d) {
+      if (!d.forms.length) {
+        refill(holder, card("Forms", "Nobody has filled in a form on " + state.site + " in this range. c.js watches " +
+          "every <form> by itself and never sends what's typed: which fields people reach, how long they hesitate, " +
+          "and where they give up.", el("pre", { class: "stack", text: FORM_SETUP })));
+        return;
+      }
+      var t = { started: 0, submitted: 0, abandoned: 0, blocked: 0 };
+      d.forms.forEach(function (f) { Object.keys(t).forEach(function (k) { t[k] += f[k]; }); });
+      refill(holder,
+        tiles([
+          ["Begun", big(t.started), d.forms.length === 1 ? "attempts at one form" : "attempts at " + d.forms.length + " forms",
+            num(t.started)],
+          ["Sent", big(t.submitted), share(t.submitted, t.started) + " of those begun", num(t.submitted)],
+          ["Given up", big(t.abandoned), "began, then left the page", num(t.abandoned)],
+          ["Refused", share(t.blocked, t.started), "stopped by the browser's validation at least once"]
+        ]),
+        d.forms.map(formCard));
+    }, failed(holder));
+    return holder;
   }
 
   function errorDetail(gid, cell) {
@@ -995,7 +1105,7 @@
   }
 
   var VIEWS = { overview: overview, traffic: traffic, search: search, bots: bots, visitors: visitors, events: events,
-    funnels: funnels, errors: errors };
+    funnels: funnels, forms: forms, errors: errors };
 
   /* ---------------------------------------------------------------- shell */
 

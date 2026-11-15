@@ -269,6 +269,11 @@ pre.stack {
   border-left: 1px solid var(--axis);
 }
 .funnel-fig .tip { white-space: normal; max-width: 280px; }
+/* forms: a field per row, its bar the share of attempts that reached it */
+.fields { min-width: 760px; }
+.fields tbody th { min-width: 140px; }
+.fields td.bad { color: var(--critical); }
+.fields thead td { cursor: help; }
 .explore textarea {
   display: block; width: 100%; min-height: 104px; resize: vertical; margin-bottom: 10px;
   font: 12.5px/1.6 var(--mono); color: var(--ink); background: var(--raised);

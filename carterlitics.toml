@@ -79,6 +79,12 @@ steps = ["/", "event:outbound"]
 name = "Sign-in"
 steps = ["event:login_view", "event:login_start", "event:login"]
 
+# The newsletter form in every page's footer (frontend/src/layouts/Layout.astro), named on
+# the Forms tab by where it posts: a post read, the form begun, the form sent.
+[[site.funnel]]
+name = "A post to the newsletter"
+steps = ["/blog/*", "form:/subscribe", "form:/subscribe?res=submit"]
+
 # ---------------------------------------------------------------- project sites
 
 [[site]]

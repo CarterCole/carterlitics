@@ -6,7 +6,7 @@
    loaded. Page code can push to `log`, call `advance(ms)` to move the page's clock on,
    and `fire(target, type, event)` to dispatch an event to what c.js listens to on
    "window", "document" or "navigation". Prints what c.js sent, as JSON: { items,
-   envelopes, posts, beacons, gets, log, probe }. Spec keys: dataset (the script tag's
+   envelopes, posts, beacons, gets, log, console, probe }. Spec keys: dataset (the script tag's
    data-*), cookies, session (sessionStorage to start with), dnt, answers (what GETs get
    back, in turn, the last one repeating: a JSON body, a status, or null for a network
    error), url and referrer (the page's address, and where it was reached from),
@@ -18,7 +18,16 @@
    BroadcastChannel: what the page posts goes to `log` as ["tab", message], another tab
    answers its first `tabs` claims, and page code calls `tell(message)` to deliver one),
    wait (ms to let the page's own timers run before the last flush), probe (an expression
-   evaluated last). */
+   evaluated last).
+
+   Forms, for page code: `form(attrs)` is a stand-in <form> (`form(attrs, "DIV")` a box
+   that isn't one, for [data-cl-form]), and `form.add(tag, attrs)` a field in it ("INPUT",
+   "SELECT", "TEXTAREA"; attrs are its attributes, with `type`, `value`, `checked` and
+   `private` for one inside [data-private]); `loose(tag, attrs)` is a field in no form.
+   Then what a visitor does, as the browser tells the page: `focus(el)` (blurring the field
+   before), `blur(el)`, `type(el, value, inputType)` (an input event, "insertText" unless
+   said), `invalid(el)`, `submit(form)`, and `elsewhere(ms)`: to another tab for that long
+   and back, the focused field losing focus and getting it back. */
 "use strict";
 
 const fs = require("fs");
@@ -49,9 +58,12 @@ const listeners = { window: {}, document: {}, navigation: {} };
 const listen = (where) => (type, fn) => { (listeners[where][type] = listeners[where][type] || []).push(fn); };
 const beacons = [];
 
+// What c.js prints, as each console.log call's arguments (stdout is the JSON below).
+const said = [];
+
 const page = {
   log,
-  console,
+  console: { log: (...args) => said.push(args.map(String)), debug() {}, info() {}, warn() {}, error() {} },
   fire(where, type, event) { (listeners[where][type] || []).forEach((fn) => fn(event)); },
   Date: Clock,
   advance(ms) { skew += ms; },
@@ -139,6 +151,79 @@ page.document = {
   }
 };
 
+// Stand-in forms and fields: what c.js asks of them, no more.
+const forms = [];
+page.document.forms = forms;
+page.document.activeElement = null;
+let windowFocus = true;
+page.document.hasFocus = () => windowFocus;
+
+function element(tag, attrs, box) {
+  attrs = Object.assign({}, attrs);
+  const flags = { private: Boolean(attrs.private) };
+  const el = {
+    nodeType: 1, tagName: tag, box: box || null, form: box && box.tagName === "FORM" ? box : null,
+    type: attrs.type || (tag === "INPUT" ? "text" : tag === "SELECT" ? "select-one" : tag.toLowerCase()),
+    value: attrs.value || "", checked: Boolean(attrs.checked), autofilled: false,
+    getAttribute: (k) => (k in attrs && !["value", "checked", "private"].includes(k) ? String(attrs[k]) : null),
+    closest(sel) {
+      if (sel === "[data-private]") return flags.private ? {} : null;
+      if (!el.box) return null;
+      if (sel === "[data-cl-form]") return el.box.tagName !== "FORM" && el.box.getAttribute("data-cl-form") !== null ? el.box : null;
+      return el.box;
+    },
+    matches: (sel) => (/autofill/.test(sel) ? el.autofilled : false)
+  };
+  return el;
+}
+
+page.form = (attrs, tag) => {
+  const box = element(tag || "FORM", attrs);
+  const fields = [];
+  if (box.tagName === "FORM") {
+    box.elements = fields;
+    forms.push(box);
+  } else {
+    box.querySelectorAll = () => fields;
+  }
+  box.closest = (sel) => (sel === "[data-private]" ? null : box);
+  box.add = (tag, a) => {
+    const f = element(tag, a, box);
+    fields.push(f);
+    return f;
+  };
+  return box;
+};
+page.loose = (tag, attrs) => element(tag, attrs, null);
+page.blur = (el) => {
+  page.fire("document", "focusout", { target: el });
+  if (page.document.activeElement === el) page.document.activeElement = null;
+};
+page.focus = (el) => {
+  const was = page.document.activeElement;
+  if (was && was !== el) page.blur(was);
+  page.document.activeElement = el;
+  page.fire("document", "focusin", { target: el });
+};
+page.type = (el, value, inputType) => {
+  el.value = value;
+  page.fire("document", "input", { target: el, inputType: inputType === undefined ? "insertText" : inputType });
+};
+page.invalid = (el) => page.fire("document", "invalid", { target: el });
+page.submit = (box) => page.fire("document", "submit", { target: box });
+page.elsewhere = (ms) => {
+  const el = page.document.activeElement;
+  windowFocus = false;
+  if (el) page.fire("document", "focusout", { target: el });
+  page.document.visibilityState = "hidden";
+  page.fire("document", "visibilitychange", {});
+  skew += ms;
+  page.document.visibilityState = "visible";
+  page.fire("document", "visibilitychange", {});
+  windowFocus = true;
+  if (el) page.fire("document", "focusin", { target: el });
+};
+
 vm.createContext(page);
 const client = fs.readFileSync(path.join(__dirname, "..", "carterlitics", "static", "c.js"), "utf8");
 
@@ -157,6 +242,7 @@ const client = fs.readFileSync(path.join(__dirname, "..", "carterlitics", "stati
     beacons,
     gets,
     log,
+    console: said,
     probe
   }));
   process.exit(0);   // c.js's own fallback timers (2 s callback timeouts) needn't run out

@@ -4,6 +4,7 @@ compare. Everything goes through the real Store methods, with the clock moved ba
 from __future__ import annotations
 
 import dataclasses
+import math
 import random
 import re
 import urllib.parse
@@ -154,6 +155,44 @@ ERRORS = [
 ]
 
 
+# Forms people fill in, by site: the form's key, the share of page views that begin it, and
+# its fields: (key, kind, median seconds before typing, chance the browser's validation
+# refuses it, chance it's left empty). Harder fields lose more people.
+FORMS = {
+    "cartercole.com": ("/subscribe", 0.06, [("email", "email", 1.6, 0.14, 0.04)]),
+    "cartercole.net": ("contact", 0.05, [("name", "text", 1.1, 0.0, 0.02), ("email", "email", 1.4, 0.1, 0.03),
+                                         ("topic", "select", 2.4, 0.0, 0.08), ("message", "textarea", 7.5, 0.06, 0.1),
+                                         ("budget", "radio", 5.0, 0.0, 0.3)]),
+}
+
+
+def _form_attempt(rng, path: str, key: str, fields) -> dict:
+    """One made-up attempt at a demo form, field by field, until it's sent or given up."""
+    out, tries, spent = [], 0, 0
+    for i, (name, kind, wait, refuse, empty) in enumerate(fields):
+        if out and rng.random() < 0.04 + wait * 0.03:
+            break   # gave up before this field
+        typed = int(rng.lognormvariate(math.log(wait * 1000), 0.7))
+        f = {"f": name, "k": kind, "i": i, "n": 2 if rng.random() < 0.12 else 1, "wait": typed,
+             "ms": typed + int(rng.lognormvariate(math.log(2500 if kind != "textarea" else 30000), 0.6))}
+        if i:
+            f["gap"] = int(rng.lognormvariate(math.log(600), 0.9))
+        if kind in ("text", "email", "textarea") and rng.random() < 0.18:
+            f["fix"] = rng.choice([1, 1, 1, 2, 3])
+        if kind == "email" and rng.random() < 0.22:
+            f["auto"] = 1
+        if rng.random() < refuse:
+            f["bad"], tries = 1, 1
+        if rng.random() >= empty:
+            f["fill"] = 1
+        spent += f["ms"] + f.get("gap", 0)
+        out.append(f)
+    sent = len(out) == len(fields) and (not tries or rng.random() < 0.6)
+    return {"t": "form", "p": path, "a": f"{rng.getrandbits(64):016x}", "f": key, "res": "submit" if sent else "abandon",
+            "ms": spent, "lead": int(rng.lognormvariate(math.log(20000), 0.9)), "fields": out, "last": out[-1]["f"],
+            **({"tries": tries} if tries else {})}
+
+
 def configure(cfg):
     """The config with the demo's funnels on the sites that have none."""
     sites = {k: dataclasses.replace(s, funnels=tuple(Funnel.parse(f, k) for f in FUNNELS[k]))
@@ -163,6 +202,7 @@ def configure(cfg):
 
 def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
     rng = random.Random(seed)
+    filling = random.Random(seed + 1)   # forms, apart, so they leave the rest of the demo as it was
     now = datetime.now(timezone.utc)
     directory = DemoGeo(store.geo)
     store.geo = directory
@@ -245,6 +285,13 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                             items.append({"t": "err", "k": kind, "name": name,
                                           "m": message.format(host=site.host), "st": stack.format(host=site.host)})
                         store.ingest(site, {"w": width, "items": items, **ids}, meta)
+                        if site.id in FORMS and filling.random() < FORMS[site.id][1]:
+                            # Sent as it ends: its lead and its time into the page view.
+                            key, _, fields = FORMS[site.id]
+                            attempt = _form_attempt(filling, path, key, fields)
+                            done = min(at + timedelta(milliseconds=attempt["lead"] + attempt["ms"]), now)
+                            with mock.patch.object(store_module, "now", lambda done=done: done):
+                                store.ingest(site, {"w": width, "items": [attempt], **ids}, meta)
                         if rng.random() < 0.012:   # the same page, in a browser with JavaScript off
                             store.no_script(site, f"{site.url}{path}", meta)
                         lines.append(LogLine(at, site.host, ip, "GET", path, "", 200, ref or "", ua,

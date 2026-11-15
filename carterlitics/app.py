@@ -2,7 +2,8 @@
 
     GET  /_c/c.js                   the client: page views, events, errors, consent, recording
     GET  /_c/s/<file>               static files, content-hashed and immutable
-    POST /_c/i                      a batch from c.js: page views, leaves, events, errors
+    POST /_c/i                      a batch from c.js: page views, leaves, events, errors,
+                                    form attempts
     GET  /_c/who                    what the collector makes of this visitor, for the page:
                                     a bot (checked, if a crawler), VPN, Tor, relay, hosting
     GET  /_c/n.gif                  a page shown without JavaScript: its <noscript> pixel
@@ -14,7 +15,8 @@
     GET  /_c/api/*                  the console's data, for a signed-in administrator
                                     (/api/ip?ip=…: one address, registry included;
                                     /api/search: Google Search Console, `google.py`;
-                                    /api/visitor?id=…: one visitor's sessions, added up)
+                                    /api/visitor?id=…: one visitor's sessions, added up;
+                                    /api/forms: how people fill in forms, field by field)
     GET  /_c/auth/login|callback    sign-in at the OpenID Connect issuer
     POST /_c/auth/logout
 
@@ -306,6 +308,8 @@ class App:
                     return reply_json({"error": str(e)}, 400)
             return self.big_json({**self.store.funnels(site, funnels, self.clamp(q.get("days"), 30, 1, 90)),
                                   "configured": [f.to_data() for f in site.funnels]})
+        if path == "/forms":
+            return self.big_json(self.store.forms(site, self.clamp(q.get("days"), 30, 1, 90)))
         if path == "/search":
             return self.big_json(self.search_report(site, self.clamp(q.get("days"), 30, 1, 480)))
         if path == "/ip":

@@ -15,7 +15,8 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   brought back by Back too; a prerendered page only once it's shown),
   engaged time, unique visitors and visits (cookieless, a daily-salted hash), with bounce
   rates, landing and exit pages, where visits came from (sources, channels and UTM
-  campaigns), custom events (`cl("track", …)`, awaitable), and
+  campaigns), custom events (`cl("track", …)`, awaitable), how people fill in forms (field
+  by field: where they hesitate, correct, get refused and give up; never what they type), and
   JavaScript errors: uncaught, unhandled rejections,
   failed resources, CSP violations, grouped by bug. How each page view ended (another
   page, another site and which, back, reload), sent by beacon as the browser starts to
@@ -25,13 +26,14 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   Google works unchanged.
 - **With consent, more.** A visitor cookie, a session, a device fingerprint, the IP and
   user agent per page view, and an rrweb session recording you can replay.
-- **Funnels.** Steps in order (pages, events, a backend's events), counted over consented
-  sessions or visitors, with drop-off per step and replays of the sessions that stopped.
+- **Funnels.** Steps in order (pages, events, a backend's events, forms), counted over
+  consented sessions or visitors, with drop-off per step and replays of the sessions that
+  stopped.
 - **Google Search.** Clicks, impressions, CTR and position from Search Console, by day,
   query, page, country and device, with sitemaps, for each site's own hosts. A Google
   service account reads it, and the collector reaches that account with no stored key.
 - **One console** at `/_c/admin/`: overview, traffic, search, bots, visitors and sessions,
-  events, funnels, errors, replays, for every site. Click any address for everything
+  events, funnels, forms, errors, replays, for every site. Click any address for everything
   known about it, its registry record (RDAP) included.
 
 Stdlib Python on Lambda (no dependencies beyond the runtime's boto3), one DynamoDB table,
@@ -90,6 +92,7 @@ country and ASN, and blockers that target third-party analytics hosts don't appl
 | Unique visitors | always, unless DNT/GPC | `sha256(daily salt, site, IP, UA)`; the salt is random and deleted after 2 days, so hashes can't be reversed afterwards | 400 days (as a count) |
 | Visits | always, unless DNT/GPC | daily counts of visits, bounces, landing and exit pages, and where visits came from: source, channel, campaign. The visit in progress is one item per visitor hash: when it was last seen, how many page views and events, its first and latest page, its source; no address or user agent (`v\|<site>\|<hash>`) | 400 days (as counts); the item a day |
 | Events | always, unless DNT/GPC | name, properties (≤ 2 KB), page | 180 days |
+| Form attempts | always, unless DNT/GPC | each attempt at a form, and per field, in order: time before typing, between fields and in it; whether they came back, corrected, pasted, were autofilled, refused by validation or left it empty; how it ended and the last field; page, browser, device, country. Never a value or its length | 180 days |
 | Errors | always | message, type, stack, source, page, user agent; no identifier unless consented | 90 days |
 | Consented visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view | 400 days |
 | Visitor index | consent only | each consented visitor's session ids and the day each began (`vs\|<site>\|<vid>`), to find all their sessions | as long as the sessions |
@@ -354,7 +357,17 @@ Script options (attributes on the tag): `data-mode="consent"` (default) · `"ful
 banner); `data-record="off"`; `data-errors="off"`; `data-exclude="/admin,/auth"`;
 `data-google="off"` (ignore Google Analytics calls); `data-datalayer="name"` (gtag.js or
 GTM was given another name for its queue); `data-consent-version="2"` (see below);
-`data-bots="off"` (no checks for automation beyond `navigator.webdriver`).
+`data-bots="off"` (no checks for automation beyond `navigator.webdriver`);
+`data-hello="off"` (no hello in the console, below); `data-forms="off"` (forms aren't
+watched, *Forms*).
+
+**A hello in the console.** Whoever opens DevTools on a page gets one friendly line, once a
+page load: `(｡•ᴗ-)✧ a wee page counter lives here!`, what this site counts about them (no cookies
+or ids; a session and a replay since they said yes, with how to take it back; or nothing,
+since they asked not to be tracked), and `await cl("who")` to see what the collector makes
+of them. It's the only thing c.js prints. A prerendered page says it once it's shown, and
+an excluded path says nothing. A site with hellos of its own (cartercole.net has a few)
+shows both, so this one keeps to the counter, in its own words and in green.
 
 **When Accept comes to cover more**, raise `data-consent-version` (it starts at 1).
 Visitors who accepted under an earlier version see the banner again, and until they
@@ -386,6 +399,7 @@ cl("consent", "all");                                    // what the banner's bu
 cl("identify", "user-123");                              // tie a consented visitor to your user id
 cl("identify", null);                                    // signed out: forget it
 const who = await cl("who");                             // what the collector makes of this visitor
+cl("submit", form);                                      // a form sent without a submit event (Forms)
 carterlitics.flush();                                    // send what's queued now
 ```
 
@@ -479,6 +493,8 @@ steps = ["/", "/pricing", "event:begin_checkout", "event:sign_up?plan=pro"]
 | `/blog/*` | a page view of anything under `/blog/`; `*` matches anything, `/` included |
 | `event:sign_up` | an event of that name, from the page or from the site's backend; `*` works here too |
 | `event:sign_up?plan=pro&trial=true` | ... whose properties have these values |
+| `form:/subscribe` | an attempt at that form, by its key on the Forms tab, begun; `*` works here too |
+| `form:/subscribe?res=submit` | ... sent; `res=abandon`: given up, and `&last=email`: given up in that field |
 
 A new or changed funnel goes live with `infra/deploy.py provision`, which hands the
 Lambda its configuration (`code` ships only the code).
@@ -492,19 +508,76 @@ How a journey is matched: the first page view or event that matches step 1, then
 first one after it that matches step 2, and so on; whatever else happens in between
 doesn't matter. Items in one batch from c.js keep the order they happened in.
 
-- **Consented visitors only.** Funnels are read from the page-view and event logs, and
-  only a consented visit carries a session there. An anonymous page view isn't logged one
-  by one at all, and an anonymous event has nothing to tie it to the page before it. On
+- **Consented visitors only.** Funnels are read from the page-view, event and form logs,
+  and only a consented visit carries a session there. An anonymous page view isn't logged
+  one by one at all, and an anonymous event or form attempt has nothing to tie it to the
+  page before it. On
   a site in `anonymous` mode, funnels stay empty.
 - **Backend events join by user id.** An event POSTed to `/_c/server/events` with a `uid`
   joins the latest session (or visitor) that had sent that user id (`cl("identify")`)
   and had begun by then.
-- **Cost.** Opening the tab reads that site's page-view and event logs for the range (up
-  to 90 days, two queries per day) and counts in the Lambda; nothing is precomputed.
+- **Cost.** Opening the tab reads that site's logs the steps need for the range (up to
+  90 days, a query per log per day) and counts in the Lambda; nothing is precomputed.
 
 Events and errors are batched for a second, then sent with `fetch(keepalive)`, or
 `sendBeacon` when the page is going away: at its `navigate` event (*How page views end*),
 else `pagehide` or `visibilitychange`.
+
+### Forms
+
+c.js watches every `<form>` on the page by itself, so a form needs nothing added to be
+counted. An attempt at a form begins at the first field someone clicks into, and is sent
+when it's submitted or when the page view ends without (a link, Back, closing the tab, an
+SPA's next page). The Forms tab shows, for each form, how many began it, sent it and gave
+up, how long sending it took, and how many the browser's validation stopped; then a row per
+field, in the form's order, its bar the share of attempts that reached it:
+
+| Column | Over attempts that… |
+|---|---|
+| Reached | got to the field: clicked into it, had it autofilled, or had it refused when they tried to send |
+| Wait | (median) clicked into it: the time until they typed. The hesitation |
+| Pause before | (median) came to it from another field: the time between leaving that one and clicking into this |
+| In it | (median) clicked into it: the time spent there, every visit together |
+| Came back | clicked into it, left, and came back to it |
+| Corrected | clicked into it and deleted some of what they'd typed |
+| Refused | reached it and had the browser's validation say no (`required`, `type="email"`, `pattern`) |
+| Left empty | clicked into it and left it empty |
+| Gave up here | were given up with this the last field touched (a count; the most is in red) |
+
+Under each form are its newest attempts, how each ended and in which field, and, for a
+consented visitor, a link to watch the replay.
+
+- **Never what's typed.** No value, no length, no keystrokes. A value is read once, at the
+  end, only for whether the field had anything in it. Time the page spent hidden doesn't
+  count, and focus coming back from another tab isn't coming back to the field. A field
+  the page focuses itself (`autofocus`) starts nothing until someone types in it.
+- **Names.** A form is named by `data-cl-form`, else its `id` or `name`, else the path it
+  posts to (cartercole.com's newsletter is `/subscribe`); a field by `data-cl-field`, else
+  its `name` (a radio group's buttons are one field) or `id`, else its kind and place
+  (`select#4`). React's generated ids name nothing, since they change. A form in the layout
+  is one form on every page, with the pages it was on.
+- **Left out.** Hidden inputs and buttons, fields inside `[data-private]`, a form with
+  `data-cl-form="off"`, and every form when the script tag has `data-forms="off"`. A form
+  sent without anyone typing in it (a sign-out button) isn't an attempt.
+- **Sent.** A form's submit event counts it sent, whether the page lets it navigate or
+  sends it with `fetch` (cartercole.com's newsletter does). A form sent without one
+  (`form.submit()`, or fields outside a `<form>`, gathered by a `[data-cl-form]` box around
+  them) needs `cl("submit", form)`, by element or key. Whether the server accepted it, c.js
+  can't tell: count that with an event.
+- **Away and back.** When the page is hidden mid-form, the attempt goes as given up, since
+  a phone may never run the page again; if they come back and finish, it goes again under
+  the same random id, and the report keeps the later send.
+- **Anonymous unless consented.** Kept as events are (`l|<site>|<day>|fm`, 180 days), with
+  the page, browser, device and country; a consented visitor's carries their session. Do
+  Not Track and GPC stop it, and bots are left out. An attempt isn't an event, and doesn't
+  move a visit on.
+- **In funnels.** `form:<key>` is a step: the form begun, and with `?res=submit`, sent
+  (*Funnels*). One sent attempt is both `form:signup` and the `form:signup?res=submit`
+  after it, so a funnel can go from one to the other, and the median time between them is
+  the time it took: cartercole.com's *A post to the newsletter* does. An attempt is begun
+  when it was sent less its time on the form, so it can come a moment early for someone
+  who clicks into a field within a second of the page loading, before the page view is
+  logged.
 
 ### From a site's backend
 

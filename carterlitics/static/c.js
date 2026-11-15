@@ -27,6 +27,13 @@
    it's shown (cl() calls wait in the stub's queue, nothing is sent), and one the
    back/forward cache brings back counts again, as the same Back would without the cache.
 
+   How people fill in forms, always, never what they type: every <form> is watched by
+   itself. An attempt at one, from the first field someone clicks into, is sent when it's
+   submitted or the page view ends without: the fields reached, in order, and for each
+   how long they waited before typing, paused before it and spent in it, whether they
+   came back to it, deleted some of it, pasted, were autofilled, were refused by the
+   browser's validation or left it empty, and the field they gave up in.
+
    Options, as attributes on the script tag:
      data-mode="consent"   consent (default) · full (identify without asking) · anonymous
      data-consent-version="2"      raise it when Accept comes to cover more: visitors who
@@ -36,6 +43,8 @@
      data-exclude="/admin,/auth"   path prefixes to leave alone entirely
      data-google="off"     ignore Google Analytics calls (see below)
      data-datalayer="dataLayer"    the name gtag.js / GTM were given for their queue
+     data-hello="off"      no hello in the browser's console for whoever opens DevTools
+     data-forms="off"      don't watch forms (one form: data-cl-form="off" on it)
 
    API, safe to call before the script loads with this stub in the page:
      <script>window.cl=window.cl||function(){(cl.q=cl.q||[]).push(arguments)}</script>
@@ -47,6 +56,7 @@
      cl("identify", "user-123")                 // tie a consented visitor to your user id
      cl("identify", null)                       // signed out: forget it
      cl("who", function (who) { … })            // what the collector makes of this visitor
+     cl("submit", form)                         // a form sent some way the browser doesn't call a submit
      window.carterlitics.flush()                // send what's queued now
 
    cl("who") asks the collector once a page and is a Promise once loaded; the callback
@@ -87,6 +97,7 @@
   var RECORD = opts.record !== "off";
   var ERRORS = opts.errors !== "off";
   var GOOGLE = opts.google !== "off";
+  var FORMS = opts.forms !== "off";
   var LAYER = /^[A-Za-z_$][\w$]*$/.test(opts.datalayer || "") ? opts.datalayer : "dataLayer";
   // What Accept means, by the site's privacy policy. Raised when it comes to cover more:
   // visitors who accepted an earlier version are asked again. "Anonymous only" stands.
@@ -283,14 +294,16 @@
     return !OPTED_OUT && current !== null && !excluded(current);
   }
 
-  // The page view so far: engaged time, how it ended (when the page knows), and any sign
-  // of automation since its page view went.
-  function settle() {
+  // The page view so far: engaged time, how it ended (when the page knows), any sign of
+  // automation since its page view went, and its forms begun and not sent. `over`: the
+  // page view is, rather than the page only hidden.
+  function settle(over) {
     // Engaged time: only while the page is visible.
     if (visibleSince) {
       engaged += Date.now() - visibleSince;
       visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
     }
+    abandon(over);
     var away = going;
     going = null;
     if (counting()) {
@@ -331,12 +344,15 @@
     }
     if (current !== null) {
       going = going || { how: "page" };   // an SPA's navigation; back or forward if the navigate event said so
-      settle();
+      settle(true);
     }
     var referrer = current === null ? d.referrer : lastUrl;
     current = path;
     lastUrl = loc.href;
     visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
+    viewAt = Date.now();
+    viewAway = 0;
+    hiddenAt = visibleSince ? 0 : viewAt;
     noted = {};
     told = {};
     clicks = [];
@@ -397,7 +413,7 @@
           return;
         }
         leaving = true;
-        settle();
+        settle(true);
         ship(true);
         flush(true);
       }
@@ -427,6 +443,309 @@
     var item = { t: "ev", n: name.slice(0, 64), props: clean };
     // Google's non_interaction: it happened, but the visitor didn't do it.
     return enqueue(clean.non_interaction === true ? item : interaction(item));
+  }
+
+  /* ---------------------------------------------------------------- forms */
+
+  // How people fill in the site's forms, to make them easier. An attempt at a form begins at
+  // the first field someone clicks into, and is one item, sent when it's submitted or when
+  // the page view ends without (`abandon`). Per field, in the form's order: how long they
+  // waited before typing (`wait`), paused between the field before and this one (`gap`) and
+  // spent in it (`ms`), how often they came to it (`n`), how often they deleted some of what
+  // they'd typed (`fix`), whether they pasted or the browser autofilled it, how often the
+  // browser's validation refused it (`bad`), and whether it had anything in it at the end
+  // (`fill`). Never a value, its length or a keystroke: a value is read only for `fill`.
+  // Time the page spent hidden doesn't count.
+  //
+  // A form is named by data-cl-form, its id or name, or the page it posts to; a field by
+  // data-cl-field, its name (a radio group's buttons are one field), or its id, else its
+  // kind and place. Fields in [data-private] aren't watched; nor is a form with
+  // data-cl-form="off". Fields outside a <form> are gathered by a [data-cl-form] box around
+  // them; the browser doesn't submit one, so the page says when, with cl("submit", box).
+  var MAX_FIELDS = 30;
+  var SKIP = { hidden: 1, submit: 1, button: 1, reset: 1, image: 1 };
+  var attempts = [];            // this page view's
+  var lastField = null;         // the field the latest event was for, so typing doesn't look it up each key
+  var viewAt = Date.now();      // when the page view began,
+  var viewAway = 0;             // ... how long it has been hidden since,
+  var hiddenAt = 0;             // ... and since when it's hidden now
+
+  function attr(el, name) {
+    var v = el && el.getAttribute ? el.getAttribute(name) : null;
+    return typeof v === "string" ? v : "";
+  }
+
+  // What the collector takes as a form's or a field's key: letters, digits, _ . : - [ ] / # @
+  // and inner spaces, up to 64. React's useId ids (":r1:", "«r1»") are new each render, so
+  // they name nothing.
+  function keyOf(value) {
+    if (/^[:«]/.test(value)) return "";
+    return String(value).replace(/[^A-Za-z0-9_.:\-\[\]\/#@ ]+/g, "_").replace(/\s+/g, " ").trim().slice(0, 64).trim();
+  }
+
+  function trackable(el) {
+    var tag = el && el.nodeType === 1 ? el.tagName : "";
+    return tag === "SELECT" || tag === "TEXTAREA" || (tag === "INPUT" && !SKIP[String(el.type).toLowerCase()]);
+  }
+
+  function kindOf(el) {
+    return el.tagName === "INPUT" ? String(el.type || "text").toLowerCase() : el.tagName.toLowerCase();
+  }
+
+  // A form's fields in order, each with its key and place.
+  function layout(box) {
+    var out = [], index = Object.create(null), n = 0;
+    each(box.elements || box.querySelectorAll("input, select, textarea"), function (el) {
+      if (!trackable(el) || (el.closest && el.closest("[data-private]"))) return;
+      var key = keyOf(attr(el, "data-cl-field") || attr(el, "name") || attr(el, "id")) || kindOf(el) + "#" + n;
+      if (!(key in index)) index[key] = n++;
+      out.push({ el: el, key: key, i: index[key] });
+    });
+    return out;
+  }
+
+  function formKey(box) {
+    var key = keyOf(attr(box, "data-cl-form") || attr(box, "id") || attr(box, "name"));
+    if (!key && box.tagName === "FORM" && attr(box, "action")) {
+      try {
+        var to = new URL(attr(box, "action"), loc.href);
+        key = keyOf((to.origin === loc.origin ? "" : to.host) + to.pathname);
+      } catch (e) { /* named by its place instead */ }
+    }
+    return key || "form#" + Math.max(0, Array.prototype.indexOf.call(d.forms || [], box));
+  }
+
+  // The watched field an event is for: { el, key, i, kind, box, form }, or null.
+  function fieldOf(el) {
+    if (!FORMS || !counting() || !trackable(el)) return null;
+    if (lastField && lastField.el === el) return lastField;
+    var box = el.form || (el.closest && el.closest("[data-cl-form]"));
+    if (!box || attr(box, "data-cl-form") === "off") return null;
+    var hit = null;
+    each(layout(box), function (f) { if (f.el === el) hit = f; });
+    if (!hit) return null;
+    hit.box = box;
+    hit.form = formKey(box);
+    hit.kind = kindOf(el);
+    return (lastField = hit);
+  }
+
+  // Random, and tied to nothing: it only lets the collector keep an attempt's later send.
+  function rid() {
+    var out = "";
+    try {
+      each(crypto.getRandomValues(new Uint8Array(8)), function (b) { out += (b < 16 ? "0" : "") + b.toString(16); });
+    } catch (e) { /* no crypto */ }
+    return out.length === 16 ? out : (Math.random().toString(16).slice(2) + Date.now().toString(16)).slice(0, 16);
+  }
+
+  function open(box) {
+    for (var k = attempts.length - 1; k >= 0; k--) {
+      if (attempts[k].box === box && !attempts[k].done) return attempts[k];
+    }
+    return null;
+  }
+
+  function attempt(hit, t) {
+    var a = open(hit.box);
+    if (!a) {
+      a = { box: hit.box, key: hit.form, path: current, id: rid(), start: t, lead: t - viewAt - viewAway,
+            away: 0, fields: Object.create(null), order: [], last: "", tries: 0, left: 0, leftAway: 0 };
+      attempts.push(a);
+    }
+    a.dirty = true;
+    return a;
+  }
+
+  function field(a, hit) {
+    var f = a.fields[hit.key];
+    if (!f) {
+      f = a.fields[hit.key] = { k: hit.kind, i: hit.i, n: 0, ms: 0, fix: 0, bad: 0, at: 0 };
+      a.order.push(hit.key);
+    }
+    f.el = hit.el;
+    return f;
+  }
+
+  // Into a field: a visit to it, unless it's the same field getting focus back from another
+  // tab or app. `late`: its focus came before the visitor did anything (autofocus) or before
+  // c.js was watching, so how long they waited to type isn't known.
+  function enter(hit, t, late) {
+    var a = attempt(hit, t), f = field(a, hit), back = f.paused;
+    each(a.order, function (k) { a.fields[k].paused = false; });
+    if (!back) {
+      if (!f.n && a.left && !late) f.gap = t - a.left - (a.away - a.leftAway);
+      f.n++;
+    }
+    f.at = t;
+    f.atAway = a.away;
+    f.late = Boolean(late);
+    a.last = hit.key;
+  }
+
+  function formFocus(e) {
+    var hit = fieldOf(e.target);
+    // The page focusing a field itself (autofocus) before the visitor has done anything
+    // isn't an attempt. Typing in it is, from then.
+    if (!hit || (nav.userActivation && !nav.userActivation.hasBeenActive)) return;
+    enter(hit, Date.now(), false);
+  }
+
+  function formBlur(e) {
+    var hit = fieldOf(e.target), a = hit && open(hit.box), f = a && a.fields[hit.key], t = Date.now();
+    if (!f || !f.at) return;
+    f.ms += t - f.at - (a.away - f.atAway);
+    f.at = 0;
+    a.left = t;
+    a.leftAway = a.away;
+    a.dirty = true;
+    // The window lost focus, to another tab or app: the field gets it back when they return.
+    if (typeof d.hasFocus === "function" && !d.hasFocus()) f.paused = true;
+  }
+
+  function formInput(e) {
+    var el = e.target, hit = fieldOf(el), t = Date.now();
+    if (!hit) return;
+    var a = open(hit.box), f = a && a.fields[hit.key];
+    if (d.activeElement !== el && (hit.kind === "checkbox" || hit.kind === "radio")) {
+      // Safari doesn't focus a checkbox or radio button it clicks: a visit all the same, untimed.
+      a = attempt(hit, t);
+      f = field(a, hit);
+      if (!f.n && a.left) f.gap = t - a.left - (a.away - a.leftAway);
+      f.n = f.n || 1;
+      a.last = hit.key;
+      return;
+    }
+    if (d.activeElement !== el) {
+      // Filled in while the visitor was in another field: the browser's autofill.
+      if (!a) return;
+      field(a, hit).auto = 1;
+      a.dirty = true;
+      return;
+    }
+    if (!f || !f.at) {
+      enter(hit, t, true);
+      a = open(hit.box);
+      f = a.fields[hit.key];
+    }
+    if (f.wait === undefined && !f.late) f.wait = t - f.at - (a.away - f.atAway);
+    var type = e.inputType || "", del = type.indexOf("delete") === 0;
+    if (del && !f.del) f.fix++;
+    f.del = del;
+    if (/^insertFrom(Paste|Drop)/.test(type)) f.paste = 1;
+    if (autofilled(el)) f.auto = 1;
+    a.last = hit.key;
+    a.dirty = true;
+  }
+
+  function autofilled(el) {
+    try { return el.matches(":autofill"); } catch (e) {
+      try { return el.matches(":-webkit-autofill"); } catch (x) { return false; }
+    }
+  }
+
+  // The browser's validation refusing a field (required, its type, a pattern) as a submit is
+  // tried. One try's refusals come together, and count once in `tries`.
+  function formInvalid(e) {
+    var hit = fieldOf(e.target);
+    if (!hit || (nav.userActivation && !nav.userActivation.hasBeenActive)) return;
+    var a = attempt(hit, Date.now());
+    field(a, hit).bad++;
+    if (!a.trying) {
+      a.tries++;
+      a.trying = true;
+      setTimeout(function () { a.trying = false; }, 0);
+    }
+  }
+
+  function formSubmit(e) {
+    var a = open(e.target);
+    // A form nobody filled in (a sign-out button) isn't an attempt.
+    if (a && a.order.length) finish(a);
+  }
+
+  function finish(a) {
+    a.done = true;
+    return enqueue(attemptItem(a, "submit"));
+  }
+
+  // Whether a field has anything in it (a radio group or checkboxes: any of them checked).
+  // The one time a value is read, and only this goes.
+  function filled(a, key, f) {
+    var el = f.el, any = false;
+    if (el.type === "checkbox" || el.type === "radio") {
+      each(layout(a.box), function (x) { if (x.key === key && x.el.checked) any = true; });
+      return any;
+    }
+    return /\S/.test(el.value || "");
+  }
+
+  function cap(ms) {
+    return Math.max(0, Math.min(Math.round(ms), 3600000));
+  }
+
+  function attemptItem(a, res) {
+    var t = Date.now(), away = a.away + (hiddenAt ? t - hiddenAt : 0);
+    a.dirty = false;
+    var item = { t: "form", p: a.path, a: a.id, f: a.key, res: res, ms: cap(t - a.start - away), fields: [] };
+    each(a.order.slice(0, MAX_FIELDS), function (key) {
+      var f = a.fields[key], out = { f: key, k: f.k, i: f.i };
+      var ms = f.ms + (f.at ? t - f.at - (away - f.atAway) : 0);   // so far, if they're still in it
+      if (f.n) out.n = f.n;
+      if (ms > 0) out.ms = cap(ms);
+      if (f.wait !== undefined) out.wait = cap(f.wait);
+      if (f.gap !== undefined) out.gap = cap(f.gap);
+      if (f.fix) out.fix = f.fix;
+      if (f.bad) out.bad = f.bad;
+      if (f.paste) out.paste = 1;
+      if (f.auto) out.auto = 1;
+      if (filled(a, key, f)) out.fill = 1;
+      item.fields.push(out);
+    });
+    if (a.lead > 0) item.lead = cap(a.lead);
+    if (a.tries) item.tries = a.tries;
+    if (a.last) item.last = a.last;
+    return item;
+  }
+
+  // The page view's attempts not submitted, as given up: for good when the page view is
+  // over, and for now when the page is only hidden. A visitor who comes back to finish has
+  // the attempt sent again, under the same id, and the collector keeps the later send.
+  function abandon(over) {
+    each(attempts, function (a) {
+      if (!a.done && a.dirty) queue.push(attemptItem(a, "abandon"));
+    });
+    if (over) attempts = [];
+  }
+
+  // Back from another tab or app: time away isn't time spent on the page or its forms.
+  function back() {
+    if (!hiddenAt) return;
+    var gone = Date.now() - hiddenAt;
+    hiddenAt = 0;
+    viewAway += gone;
+    each(attempts, function (a) { a.away += gone; });
+  }
+
+  // A form sent some way the browser doesn't call a submit: by script (form.submit(), a
+  // button that fetches), or fields in a [data-cl-form] box. By element, or by its key.
+  function submitted(target) {
+    var box = target && target.nodeType === 1 ? target.form || (target.closest && target.closest("form, [data-cl-form]")) : null;
+    var a = null;
+    each(attempts, function (x) {
+      if (!x.done && x.order.length && (x.box === box || x.key === target)) a = x;
+    });
+    return a ? finish(a) : Promise.resolve();
+  }
+
+  function watchForms() {
+    if (!FORMS) return;
+    each([["focusin", formFocus], ["focusout", formBlur], ["input", formInput], ["invalid", formInvalid],
+          ["submit", formSubmit]], function (on) {
+      d.addEventListener(on[0], function (e) {
+        try { on[1](e); } catch (x) { /* never in the way of the page's own handling */ }
+      }, true);
+    });
   }
 
   /* ---------------------------------------------------------------- Google's tracking calls */
@@ -993,6 +1312,29 @@
     });
   }
 
+  /* ---------------------------------------------------------------- hello */
+
+  // For whoever opens DevTools: once a page load, what's counted about them here, in a
+  // friendly voice, and how to see the rest. The only thing c.js ever prints. A site may
+  // greet them too (cartercole.net has a cat, a wave and a cheat code, in pink, periwinkle
+  // and cyan), so this one keeps to the counter, in its own words and in green.
+  function hello() {
+    if (opts.hello === "off" || excluded(loc.pathname) || !w.console || typeof console.log !== "function") return;
+    var about = OPTED_OUT
+      ? "you've asked not to be tracked, so you aren't. only errors go, anonymously, so things get fixed."
+      : ident
+        ? "this tab has a session" + (recorder ? " and a replay" : "") +
+          (MODE === "consent" ? ", since you said yes. changed your mind? cl(\"consent\", \"essential\")" : ".")
+        : "no cookies, no ids, nothing that follows you around.";
+    try {
+      console.log("%c(\uFF61\u2022\u1D17-)\u2727 a wee page counter lives here!%c\n" +
+        "carterlitics counts this site's visits, first-party: " + about + "\n" +
+        "ask what it makes of you: await cl(\"who\")",
+        "font: 600 14px/1.8 system-ui, sans-serif; color: #22a06b",
+        "font: 12px/1.6 system-ui, sans-serif");
+    } catch (e) { /* a console that won't */ }
+  }
+
   /* ---------------------------------------------------------------- start */
 
   var api = {
@@ -1012,6 +1354,7 @@
       return true;
     },
     who: who,
+    submit: submitted,
     flush: function () { return flush(false); }
   };
   w.carterlitics = api;
@@ -1036,6 +1379,7 @@
     watchErrors();
     watchConsent();
     watchClicks();
+    watchForms();
 
     if (MODE === "full") apply("all");
     else if (MODE === "consent" && OPTED_OUT) forget();
@@ -1047,20 +1391,23 @@
     watchLeaving();
     pending.forEach(function (args) { w.cl.apply(null, args); });
     watchGoogle();
+    hello();
 
     d.addEventListener("visibilitychange", function () {
       if (d.visibilityState === "hidden") {
-        settle();
+        hiddenAt = hiddenAt || Date.now();
+        settle(false);
         ship(true);
         flush(true);
       } else {
         visibleSince = Date.now();
+        back();
       }
     });
     w.addEventListener("pagehide", function () {
       leaving = true;
       quiet();
-      settle();
+      settle(true);
       ship(true);
       flush(true);
     });

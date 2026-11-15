@@ -9,7 +9,8 @@ never see each other's data. The layout:
     v|<site>|<hash>      -              …        a visitor hash's visit in progress, for a day
     ip|<address>         -              host     its reverse DNS name, cached a week (intel.py)
     l|<site>|<day>|<k>   <ts>#<rand>    …        logs: pv (consented page views), ev, err,
-                                                 hum and bot (server requests)
+                                                 hum and bot (server requests), fm (form
+                                                 attempts: timings and counts per field, no values)
     s|<site>|<day>       <session id>   …        a consented session, keyed by its first day
     vs|<site>|<vid>      <session id>   day      a consented visitor's sessions: the index that
                                                  finds them all, to add up and play in turn
@@ -245,6 +246,58 @@ def outbound(value) -> str:
     return host[:80] if HOST.fullmatch(host) else ""
 
 
+# ---------------------------------------------------------------- forms
+
+# A form's or a field's key, as c.js makes it: its data-cl-form / data-cl-field, name, id
+# or the path it posts to.
+FORM_KEY = re.compile(r"[A-Za-z0-9_.:\-\[\]/#@ ]{1,64}")
+FIELD_KINDS = frozenset({"text", "email", "tel", "url", "number", "password", "search", "date", "datetime-local",
+                         "month", "week", "time", "color", "range", "file", "checkbox", "radio", "select",
+                         "textarea"})
+FORM_ENDS = frozenset({"submit", "abandon"})
+MAX_FIELDS = 30
+MAX_MS = 3_600_000
+
+
+def form_key(value) -> bool:
+    return isinstance(value, str) and FORM_KEY.fullmatch(value) is not None and value.strip() == value
+
+
+def form_attempt(item: dict) -> dict | None:
+    """One attempt at a form, as c.js sends it, checked: which form, how it ended, and per
+    field (in the order they were first reached) timings and counts. Anything else in the
+    item, a value included, is dropped. None if it isn't an attempt with a field in it."""
+    def count(v, high=1000):
+        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= high else 0
+
+    def ms(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_MS else None
+
+    aid, key, res = item.get("a"), item.get("f"), item.get("res")
+    if not valid_id(aid) or not form_key(key) or res not in FORM_ENDS:
+        return None
+    fields, seen = [], set()
+    for f in item.get("fields") if isinstance(item.get("fields"), list) else []:
+        if len(fields) >= MAX_FIELDS:
+            break
+        if not isinstance(f, dict) or not form_key(f.get("f")) or f["f"] in seen:
+            continue
+        seen.add(f["f"])
+        out = {"f": f["f"], "k": f.get("k") if f.get("k") in FIELD_KINDS else "other", "i": count(f.get("i"))}
+        out.update({k: count(f.get(k)) for k in ("n", "fix", "bad") if count(f.get(k))})
+        out.update({k: ms(f.get(k)) for k in ("ms", "wait", "gap") if ms(f.get(k)) is not None})
+        out.update({k: 1 for k in ("paste", "auto", "fill") if f.get(k) in (1, True)})
+        fields.append(out)
+    if not fields:
+        return None
+    out = {"a": aid.lower(), "form": key, "res": res, "fields": fields,
+           "last": item.get("last") if item.get("last") in seen else fields[-1]["f"]}
+    out.update({k: ms(item.get(k)) for k in ("ms", "lead") if ms(item.get(k)) is not None})
+    if count(item.get("tries")):
+        out["tries"] = count(item.get("tries"))
+    return out
+
+
 # ---------------------------------------------------------------- store
 
 
@@ -462,6 +515,22 @@ class Store:
                     # A session the visitor came back to with a click, not a page view.
                     if item.get("new") is True and new_session is None:
                         new_session = begin(path or "", None, classify.DIRECT)
+
+            elif kind == "form":
+                # An attempt at a form: how far into it they got and how long each field took,
+                # never what they typed. Logged as events are, with ids only after consent. An
+                # attempt sent again (the page hidden, then finished) is logged again, and the
+                # report keeps its later send.
+                if meta.opted_out or bot or not path:
+                    continue
+                attempt = form_attempt(item)
+                if not attempt:
+                    continue
+                logs.append({"pk": log_pk(site.id, day, "fm"), "sk": stamp(at, seq), "path": path, **attempt,
+                             "fields": json.dumps(attempt["fields"], separators=(",", ":")),
+                             "browser": browser, "os": system, "device": device, "country": geo.country,
+                             **who(), "expires": self.keep("events")})
+                stored += 1
 
             elif kind == "err":
                 if bot:
@@ -1023,7 +1092,7 @@ class Store:
     # -- funnels
 
     def funnels(self, site, funnels, days: int) -> dict:
-        """Each funnel over the last `days` days, from the page-view and event logs.
+        """Each funnel over the last `days` days, from the page-view, event and form logs.
 
         Only consented visitors carry a session there, so only they are counted: an
         anonymous page view isn't logged at all, and an anonymous event has nothing to
@@ -1032,16 +1101,44 @@ class Store:
         out = {"days": days, "funnels": [], "sessions": 0, "visitors": 0}
         hits: list[Hit] = []
         if self.table and funnels:
-            kinds = sorted({"pv" if s.kind == "page" else "ev" for f in funnels for s in f.steps})
+            logs = {"page": "pv", "event": "ev", "form": "fm"}
+            kinds = sorted({logs[s.kind] for f in funnels for s in f.steps})
             parts = [(d, k) for d in days_back(days) for k in kinds]
             with ThreadPoolExecutor(max_workers=16) as pool:
                 found = list(pool.map(lambda p: self.table.query(log_pk(site.id, p[0], p[1])), parts))
             for (_, kind), items in zip(parts, found):
-                hits.extend(filter(None, (Hit.of(kind, i) for i in items)))
+                if kind != "fm":
+                    hits.extend(filter(None, (Hit.of(kind, i) for i in items)))
+            for item in latest_attempts(i for (_, kind), items in zip(parts, found) if kind == "fm" for i in items):
+                hits.extend(Hit.attempt(item))
             hits.sort(key=lambda h: h.sk)
         out["sessions"] = len({h.sid for h in hits if h.sid})
         out["visitors"] = len({h.vid for h in hits if h.vid})
         out["funnels"] = [funnel_report(f, hits) for f in funnels]
+        return out
+
+    # -- forms
+
+    def forms(self, site, days: int) -> dict:
+        """How people filled in the site's forms over the last `days` days, from the form
+        log (`form_report`), the forms most attempted first. An attempt sent twice counts
+        once, as its later send says: hidden and given up, then back and submitted, is a
+        submit. Every visitor's, consented or not; only a consented one's has a session."""
+        out = {"days": days, "forms": []}
+        if not self.table:
+            return out
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            parts = list(pool.map(lambda d: self.table.query(log_pk(site.id, d, "fm")), days_back(days)))
+        by_form: dict[str, list[dict]] = {}
+        for item in latest_attempts(i for part in parts for i in part):
+            try:
+                fields = json.loads(item.get("fields") or "[]")
+            except ValueError:
+                fields = []
+            fields = [f for f in fields if isinstance(f, dict) and f.get("f")] if isinstance(fields, list) else []
+            by_form.setdefault(item.get("form") or "", []).append({**item, "fields": fields})
+        reports = (form_report(key, items) for key, items in by_form.items())
+        out["forms"] = sorted(reports, key=lambda f: (-f["started"], f["form"]))
         return out
 
 
@@ -1049,10 +1146,10 @@ class Store:
 
 
 class Hit(NamedTuple):
-    """A page view or an event, as a funnel sees it."""
+    """A page view, an event or a form attempt, as a funnel sees it."""
     sk: str            # the log's sort key: time, then order within a batch
-    kind: str          # "page" or "event"
-    value: str         # the path, or the event's name
+    kind: str          # "page", "event" or "form"
+    value: str         # the path, the event's name or the form's key
     props: dict
     sid: str
     vid: str
@@ -1075,6 +1172,21 @@ class Hit(NamedTuple):
         except ValueError:
             props = {}
         return cls(item["sk"], "event", item.get("name") or "", props if isinstance(props, dict) else {}, *ids)
+
+    @classmethod
+    def attempt(cls, item: dict) -> "list[Hit]":
+        """An attempt at a form, as two hits: the form begun, where it began (its log item's
+        time less the attempt's time on it), then how it ended (`res`, `last`), where it
+        ended. So one attempt is both a funnel's `form:signup` and, next, its
+        `form:signup?res=submit`, and the time between them is the time it took."""
+        ids = (item.get("sid") or "", item.get("vid") or "", item.get("uid") or "")
+        if not any(ids):
+            return []
+        at, _, rest = item["sk"].partition("#")
+        began = datetime.fromisoformat(at) - timedelta(milliseconds=item.get("ms") or 0)
+        began = f"{began.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23]}Z#{rest}!0"
+        key, ended = item.get("form") or "", {"res": item.get("res") or "", "last": item.get("last") or ""}
+        return [cls(began, "form", key, {}, *ids), cls(item["sk"] + "!1", "form", key, ended, *ids)]
 
 
 def _seconds(a: str, b: str) -> float:
@@ -1133,6 +1245,79 @@ def funnel_report(funnel, hits: list[Hit], sample: int = 8) -> dict:
                       "dropped": [{"at": at, "key": key, "sid": sid} for at, key, sid in recent]})
     return {"name": funnel.name, "by": funnel.by, "steps": steps, "entered": reached[0],
             "completed": reached[-1], "journeys": len(journeys)}
+
+
+# ---------------------------------------------------------------- forms
+
+
+def latest_attempts(items) -> list[dict]:
+    """Form log items, one an attempt: its latest send. An attempt sent as given up when the
+    page was hidden, then again when they came back and sent it, was sent."""
+    latest: dict[str, dict] = {}
+    for item in items:
+        aid = item.get("a")
+        if aid and (aid not in latest or item["sk"] > latest[aid]["sk"]):
+            latest[aid] = item
+    return list(latest.values())
+
+
+def _median(values) -> int | None:
+    found = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return round(statistics.median(found)) if found else None
+
+
+def form_report(key: str, attempts: list[dict], recent: int = 20) -> dict:
+    """One form's attempts (each the latest send of one): begun, submitted and given up, how
+    long a submit took, the validation's refusals, and per field, in the form's order:
+
+        reached    attempts that got to it: clicked into, autofilled or refused by validation
+        visited    ... that clicked into it
+        wait_ms    median time from clicking into it to typing: the hesitation
+        gap_ms     median pause between leaving the field before and clicking into this one
+        ms         median time spent in it, every visit together
+        back       visited it more than once
+        fixed      deleted some of what they'd typed
+        refused    the browser's validation refused it
+        empty      clicked into it and left it empty
+        dropped    attempts given up with this the last field touched
+
+    Counts, not shares: the console divides (by `started`, `reached` or `visited`)."""
+    attempts = sorted(attempts, key=lambda a: a["sk"])
+    gave_up = [a for a in attempts if a.get("res") == "abandon"]
+    sent = [a for a in attempts if a.get("res") == "submit"]
+    blocked = [a for a in attempts if a.get("tries")]
+    dropped = Counter(a.get("last") for a in gave_up)
+    per: dict[str, list[dict]] = {}
+    for a in attempts:
+        for f in a["fields"]:
+            per.setdefault(f["f"], []).append(f)
+    fields = []
+    for name, seen in per.items():
+        visited = [f for f in seen if f.get("n")]
+        fields.append({
+            "name": name, "kind": Counter(f.get("k") or "other" for f in seen).most_common(1)[0][0],
+            "order": _median(f.get("i") for f in seen), "reached": len(seen), "visited": len(visited),
+            "wait_ms": _median(f.get("wait") for f in seen), "gap_ms": _median(f.get("gap") for f in seen),
+            "ms": _median(f.get("ms") for f in visited),
+            "back": sum(1 for f in visited if f["n"] > 1), "fixed": sum(1 for f in seen if f.get("fix")),
+            "refused": sum(1 for f in seen if f.get("bad")), "empty": sum(1 for f in visited if not f.get("fill")),
+            "pasted": sum(1 for f in seen if f.get("paste")), "autofilled": sum(1 for f in seen if f.get("auto")),
+            "dropped": dropped[name],
+        })
+    fields.sort(key=lambda f: (f["order"] if f["order"] is not None else MAX_FIELDS, f["name"]))
+    return {
+        "form": key, "started": len(attempts), "submitted": len(sent), "abandoned": len(gave_up),
+        "ms": _median(a.get("ms") for a in sent), "lead": _median(a.get("lead") for a in attempts),
+        "blocked": len(blocked), "recovered": sum(1 for a in blocked if a.get("res") == "submit"),
+        "consented": sum(1 for a in attempts if a.get("sid")),
+        "pages": [{"name": p, "value": n} for p, n in Counter(a.get("path") or "" for a in attempts).most_common(10)],
+        "fields": fields,
+        "recent": [{"at": a["sk"].split("#", 1)[0], "path": a.get("path", ""), "res": a.get("res"),
+                    "last": a.get("last", ""), "ms": a.get("ms"), "fields": len(a["fields"]),
+                    "device": a.get("device", ""), "browser": a.get("browser", ""), "country": a.get("country", ""),
+                    "sid": a.get("sid", ""), "vid": a.get("vid", "")}
+                   for a in reversed(attempts[-recent:])],
+    }
 
 
 def public(item: dict) -> dict:

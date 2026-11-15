@@ -26,6 +26,7 @@ RETENTION = {          # days
 MAX_STEPS = 10
 FUNNEL_BY = ("session", "visitor")
 EVENT_NAME = re.compile(r"[A-Za-z0-9_.:\- *]{1,64}")
+FORM_NAME = re.compile(r"[A-Za-z0-9_.:\-\[\]/#@ *]{1,64}")   # a form's key (store.FORM_KEY), and *
 
 
 @dataclass(frozen=True)
@@ -36,16 +37,18 @@ class Step:
         /blog/*                   any page under /blog/ (`*` matches anything, `/` included)
         event:sign_up             an event of that name (`*` works here too)
         event:click?target=buy    ... whose properties have these values (`&` for more)
+        form:/subscribe           an attempt at the form of that key (store.py's form log), begun
+        form:/subscribe?res=submit    ... sent; res=abandon: given up, last=email: in that field
     """
     text: str
-    kind: str                                  # "page" or "event"
+    kind: str                                  # "page", "event" or "form"
     pattern: re.Pattern
     props: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def parse(cls, text) -> "Step":
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("a funnel step is a page path (/pricing) or an event (event:sign_up)")
+            raise ValueError("a funnel step is a page path (/pricing), an event (event:sign_up) or a form (form:signup)")
         text = text.strip()
         if text.startswith("event:"):
             name, _, query = text[len("event:"):].partition("?")
@@ -53,6 +56,12 @@ class Step:
                 raise ValueError(f"funnel step {text!r}: an event name is letters, digits, _ . : - and spaces")
             props = tuple(urllib.parse.parse_qsl(query, keep_blank_values=True))
             return cls(text, "event", _glob(name), props)
+        if text.startswith("form:"):
+            name, _, query = text[len("form:"):].partition("?")
+            if not FORM_NAME.fullmatch(name) or name.strip() != name:
+                raise ValueError(f"funnel step {text!r}: a form is named by its key, as the Forms tab shows it")
+            props = tuple(urllib.parse.parse_qsl(query, keep_blank_values=True))
+            return cls(text, "form", _glob(name), props)
         if text.startswith("/") and "?" not in text and "#" not in text and len(text) <= 200:
             path = text.rstrip("/") or "/"
             if path.endswith("/index.html"):
@@ -60,7 +69,7 @@ class Step:
             elif path.endswith(".html"):
                 path = path[:-5]
             return cls(text, "page", _glob(path))
-        raise ValueError(f"funnel step {text!r}: start it with / for a page or event: for an event")
+        raise ValueError(f"funnel step {text!r}: start it with / for a page, event: for an event or form: for a form")
 
     def matches(self, kind: str, value: str, props: dict | None = None) -> bool:
         if kind != self.kind or not self.pattern.fullmatch(value or ""):

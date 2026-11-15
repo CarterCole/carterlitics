@@ -960,7 +960,12 @@ class FunnelConfig(unittest.TestCase):
         self.assertFalse(event.matches("event", "sign_up_now", {"plan": "pro", "trial": True}))
         self.assertTrue(Step.parse("event:value?value=3").matches("event", "value", {"value": 3.0}))
         self.assertTrue(Step.parse("event:video_*").matches("event", "video_play"))
-        for bad in ("pricing", "", "event:", "event:a/b", "/x?y=1", 7):
+        sent = Step.parse("form:/subscribe?res=submit")
+        self.assertTrue(sent.matches("form", "/subscribe", {"res": "submit", "last": "email"}))
+        self.assertFalse(sent.matches("form", "/subscribe", {}))
+        self.assertFalse(sent.matches("event", "/subscribe", {"res": "submit"}))
+        self.assertTrue(Step.parse("form:*").matches("form", "signup", {}))
+        for bad in ("pricing", "", "event:", "event:a/b", "/x?y=1", 7, "form:", "form:a|b", "form: x"):
             with self.assertRaises(ValueError, msg=bad):
                 Step.parse(bad)
 
@@ -1052,6 +1057,30 @@ class Funnels(unittest.TestCase):
         _, d = self.funnels(steps=json.dumps(["/", "event:paid"]))
         self.assertEqual([s["count"] for s in d["funnels"][0]["steps"]], [2, 1])
 
+    def test_form_steps(self):
+        """A form begun, then sent: one attempt can be both steps, and its later send counts."""
+        def form(aid, res):
+            return {"t": "form", "p": "/", "a": aid * 4, "f": "signup", "res": res, "last": "email", "ms": 30000,
+                    "fields": [{"f": "email", "k": "email", "i": 0, "n": 1}]}
+        home = {"t": "pv", "p": "/"}
+        self.send(0, [home])                                       # SID: sent
+        self.send(1, [form("f1", "submit")])
+        self.send(0, [home], sid=SID2)                             # SID2: given up in email
+        self.send(1, [form("f2", "abandon")], sid=SID2)
+        self.send(0, [home], sid=SID3)                             # SID3: hidden, then back and sent
+        self.send(1, [form("f3", "abandon")], sid=SID3)
+        self.send(2, [form("f3", "submit")], sid=SID3)
+        self.send(0, [form("f4", "submit")], sid=SID4)             # SID4: the form before the page
+        self.send(1, [home], sid=SID4)
+        self.send(0, [home, form("f5", "submit")], sid=None)       # anonymous: not in any funnel
+        _, d = self.funnels(steps=json.dumps(["/", "form:signup", "form:signup?res=submit"]))
+        self.assertEqual([s["count"] for s in d["funnels"][0]["steps"]], [4, 3, 2])
+        self.assertEqual({x["sid"] for x in d["funnels"][0]["steps"][1]["dropped"]}, {SID2})
+        # Begun 30 s before it was sent, and half a minute after the page.
+        self.assertEqual([s["median_s"] for s in d["funnels"][0]["steps"]], [None, 30.0, 30.0])
+        _, d = self.funnels(steps=json.dumps(["/", "form:sign*?res=abandon&last=email"]))
+        self.assertEqual([s["count"] for s in d["funnels"][0]["steps"]], [4, 1])
+
     def test_explore_needs_good_steps(self):
         for steps in ("not json", json.dumps(["/"]), json.dumps(["/", "pricing"]), json.dumps({"a": 1})):
             status, d = self.funnels(steps=steps)
@@ -1059,6 +1088,109 @@ class Funnels(unittest.TestCase):
             self.assertIn("error", d)
         self.call.cookies.clear()
         self.assertEqual(self.funnels()[0], 401)
+
+
+class Forms(unittest.TestCase):
+    """Attempts at forms, field by field, and what the console makes of them."""
+
+    def setUp(self):
+        self.app = make()
+        self.call = Client(self.app)
+        self.start = store_module.now() - timedelta(hours=1)
+
+    def send(self, attempts, minute=0, ids=None, **kw):
+        at = self.start + timedelta(minutes=minute)
+        items = [{"t": "form", "p": "/join", **a} for a in attempts]
+        with mock.patch.object(store_module, "now", lambda: at):
+            self.call("POST", "/_c/i", {**(ids or {}), "items": items}, **kw)
+
+    def forms(self, **query):
+        self.call.sign_in()
+        res = self.call("GET", "/_c/api/forms", query={"site": "a.example", "days": "7", **query})
+        self.assertEqual(res.status, 200)
+        return body(res)["forms"]
+
+    @staticmethod
+    def attempt(aid, res, *fields, **extra):
+        return {"a": aid, "f": "signup", "res": res, "fields": list(fields), **extra}
+
+    def test_field_by_field(self):
+        email = {"f": "email", "k": "email", "i": 0, "n": 1, "wait": 1000, "ms": 4000, "fill": 1}
+        self.send([
+            self.attempt("a1" * 4, "submit", {**email, "fix": 2}, {"f": "plan", "k": "radio", "i": 1, "n": 1,
+                                                                  "gap": 500, "wait": 3000, "ms": 3000, "fill": 1},
+                         ms=9000, lead=20000),
+            self.attempt("a2" * 4, "submit", {**email, "wait": 3000, "bad": 1, "n": 2},
+                         {"f": "plan", "k": "radio", "i": 1, "n": 1, "gap": 1500, "wait": 1000, "ms": 1000, "fill": 1},
+                         ms=11000, tries=1, lead=40000),
+            self.attempt("a3" * 4, "abandon", {**email, "wait": 2000}, {"f": "plan", "k": "radio", "i": 1, "n": 1,
+                                                                      "gap": 900, "ms": 8000}, last="plan"),
+            self.attempt("a4" * 4, "abandon", {**email, "wait": 9000, "fill": 0}),
+        ])
+        form, = self.forms()
+        self.assertEqual({k: form[k] for k in ("form", "started", "submitted", "abandoned", "ms", "blocked", "recovered")},
+                         {"form": "signup", "started": 4, "submitted": 2, "abandoned": 2, "ms": 10000, "blocked": 1,
+                          "recovered": 1})
+        self.assertEqual(form["pages"], [{"name": "/join", "value": 4}])
+        email, plan = form["fields"]
+        self.assertEqual({k: email[k] for k in ("name", "kind", "reached", "visited", "wait_ms", "back", "fixed",
+                                                "refused", "empty", "dropped")},
+                         {"name": "email", "kind": "email", "reached": 4, "visited": 4, "wait_ms": 2500, "back": 1,
+                          "fixed": 1, "refused": 1, "empty": 1, "dropped": 1})
+        self.assertEqual({k: plan[k] for k in ("name", "reached", "gap_ms", "wait_ms", "ms", "empty", "dropped")},
+                         {"name": "plan", "reached": 3, "gap_ms": 900, "wait_ms": 2000, "ms": 3000, "empty": 1,
+                          "dropped": 1})
+        self.assertEqual([r["res"] for r in form["recent"]], ["abandon", "abandon", "submit", "submit"])
+
+    def test_the_later_send_of_an_attempt_counts(self):
+        """Hidden and given up, then back and sent: one attempt, sent."""
+        field = {"f": "email", "k": "email", "i": 0, "n": 1, "ms": 2000}
+        self.send([self.attempt("b1" * 4, "abandon", field, ms=2000)], minute=0)
+        self.send([self.attempt("b1" * 4, "submit", {**field, "ms": 5000, "fill": 1}, ms=6000)], minute=3)
+        form, = self.forms()
+        self.assertEqual((form["started"], form["submitted"], form["abandoned"], form["ms"]), (1, 1, 0, 6000))
+        self.assertEqual(form["fields"][0]["ms"], 5000)
+
+    def test_what_isnt_kept(self):
+        good = {"f": "email", "k": "email", "i": 0, "n": 1}
+        self.send([
+            # Values, lengths, anything else: dropped.
+            self.attempt("c1" * 4, "submit", {**good, "value": "pat@example.com", "len": 15, "k": "<script>"},
+                         value="pat@example.com", email="pat@example.com"),
+            self.attempt("c2" * 4, "submit"),                                 # no fields
+            self.attempt("not-hex!", "submit", good),
+            self.attempt("c3" * 4, "maybe", good),
+            {**self.attempt("c4" * 4, "submit", good), "f": "bad\nkey"},
+            self.attempt("c5" * 4, "submit", {**good, "f": "x" * 65}, {**good, "wait": -5, "ms": 10 ** 9, "n": True}),
+        ])
+        form, = self.forms()
+        self.assertEqual(form["started"], 2)
+        stored = self.app.store.table.query(store_module.log_pk("a.example", store_module.day_of(self.start), "fm"))
+        self.assertNotIn("pat@example.com", json.dumps(stored))
+        self.assertEqual([json.loads(i["fields"]) for i in stored],
+                         [[{"f": "email", "k": "other", "i": 0, "n": 1}], [{"f": "email", "k": "email", "i": 0}]])
+
+    def test_nobody_who_said_no_and_no_bots(self):
+        field = {"f": "email", "k": "email", "i": 0, "n": 1}
+        self.send([self.attempt("d1" * 4, "submit", field)], headers={"sec-gpc": "1"})
+        self.send([self.attempt("d2" * 4, "submit", field)], ua="Mozilla/5.0 (compatible; Googlebot/2.1)")
+        self.send([{**self.attempt("d3" * 4, "submit", field), "p": "/admin/x"}])   # an excluded page
+        self.assertEqual(self.forms(), [])
+
+    def test_consented_attempts_have_their_session(self):
+        field = {"f": "email", "k": "email", "i": 0, "n": 1}
+        self.send([self.attempt("e1" * 4, "abandon", field)],
+                  ids={"vid": VID, "sid": SID, "sd": store_module.day_of(self.start)})
+        self.send([self.attempt("e2" * 4, "submit", field)])
+        form, = self.forms()
+        self.assertEqual(form["consented"], 1)
+        self.assertEqual({(r["sid"], r["vid"]) for r in form["recent"]}, {(SID, VID), ("", "")})
+        anonymous, = [i for i in self.app.store.table.query(
+            store_module.log_pk("a.example", store_module.day_of(self.start), "fm")) if i["a"] == "e2" * 4]
+        self.assertFalse({"ip", "ua", "vid", "sid", "fp"} & set(anonymous))
+
+    def test_needs_an_admin(self):
+        self.assertEqual(self.call("GET", "/_c/api/forms", query={"site": "a.example"}).status, 401)
 
 
 class Page:
@@ -1513,6 +1645,152 @@ class ClientTabs(Page, unittest.TestCase):
 
     def test_anonymous_visitors_ask_nothing(self):
         self.assertEqual([e for e in self.page(tabs=99)["log"] if isinstance(e, list) and e[0] == "tab"], [])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientHello(Page, unittest.TestCase):
+    """A hello in the console for whoever opens DevTools: once a page load, saying what's
+    counted about them."""
+
+    def said(self, **spec):
+        """The text of each console.log call, its %c styles left out."""
+        return [args[0].replace("%c", "") for args in self.page(**spec)["console"]]
+
+    def test_what_it_says_to_whom(self):
+        for spec, words in (({}, "no cookies, no ids"),
+                            ({"cookies": {"consent": "all", "vid": VID}},
+                             "this tab has a session and a replay, since you said yes"),
+                            ({"dataset": {"mode": "full", "record": "off"}}, "this tab has a session."),
+                            ({"dnt": True}, "you've asked not to be tracked")):
+            said = self.said(**spec)
+            self.assertEqual(len(said), 1, spec)
+            self.assertIn("a wee page counter lives here!", said[0])
+            self.assertIn(words, said[0], spec)
+            self.assertIn('await cl("who")', said[0])
+
+    def test_once_a_page_load(self):
+        said = self.said(after="cl('page', '/next'); fire('window', 'pagehide', { persisted: true });"
+                               "fire('window', 'pageshow', { persisted: true });")
+        self.assertEqual(len(said), 1)
+
+    def test_not_while_prerendered_nor_when_asked_not_to(self):
+        self.assertEqual(self.said(prerendering=True), [])
+        self.assertEqual(len(self.said(prerendering=True, after=(
+            "document.prerendering = false; fire('document', 'prerenderingchange', {});"))), 1)
+        self.assertEqual(self.said(dataset={"hello": "off"}), [])
+        self.assertEqual(self.said(dataset={"exclude": "/start"}), [])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientForms(Page, unittest.TestCase):
+    """How people fill in forms: an attempt a form, field by field, never what was typed."""
+
+    SIGNUP = ("var f = form({ id: 'signup' }); var email = f.add('INPUT', { name: 'email', type: 'email' });"
+              "var name = f.add('INPUT', { name: 'name' }); f.add('INPUT', { type: 'hidden', name: 'csrf' });"
+              "f.add('INPUT', { type: 'submit' });")
+
+    def attempts(self, after, **spec):
+        """The form items sent, their timings to the nearest 100 ms: the page's clock is the
+        real one, moved on, so a millisecond or two of the test's own time gets in."""
+        out = self.page(after=self.SIGNUP + after, **spec)
+        self.assertNotIn("pat@example", json.dumps(out["posts"]))
+
+        def rounded(x):
+            return {k: round(v, -2) if k in ("ms", "wait", "gap", "lead") else v for k, v in x.items()}
+
+        return [{**rounded(i), "fields": [rounded(f) for f in i["fields"]]} for i in out["items"] if i["t"] == "form"]
+
+    def test_a_form_sent(self):
+        sent, = self.attempts("focus(email); advance(1500); type(email, 'pat@example.co'); advance(2000);"
+                              "type(email, 'pat@example.c', 'deleteContentBackward');"
+                              "type(email, 'pat@example.', 'deleteContentBackward'); type(email, 'pat@example.com');"
+                              "advance(500); focus(name); advance(700); type(name, 'Pat', 'insertFromPaste');"
+                              "advance(300); submit(f);")
+        self.assertEqual({k: sent[k] for k in ("p", "f", "res", "ms", "last")},
+                         {"p": "/start", "f": "signup", "res": "submit", "ms": 5000, "last": "name"})
+        self.assertRegex(sent["a"], r"^[0-9a-f]{16}$")
+        self.assertEqual(sent["fields"], [
+            {"f": "email", "k": "email", "i": 0, "n": 1, "ms": 4000, "wait": 1500, "fix": 1, "fill": 1},
+            {"f": "name", "k": "text", "i": 1, "n": 1, "ms": 1000, "wait": 700, "gap": 0, "paste": 1, "fill": 1}])
+
+    def test_given_up_as_the_page_goes(self):
+        gave_up, = self.attempts("focus(email); advance(4000); blur(email); advance(2500); focus(name);"
+                                 "advance(1000); fire('window', 'pagehide', {});")
+        self.assertEqual((gave_up["res"], gave_up["last"]), ("abandon", "name"))
+        self.assertEqual([(x["f"], x.get("gap"), x.get("wait"), x.get("fill")) for x in gave_up["fields"]],
+                         [("email", None, None, None), ("name", 2500, None, None)])
+        # A page view to another page here, in an SPA, is the end of it too.
+        self.assertEqual([a["res"] for a in self.attempts("focus(email); type(email, 'x'); cl('page', '/next');")],
+                         ["abandon"])
+
+    def test_away_and_back_to_finish(self):
+        """Hidden, the attempt goes as given up; back and sent, it goes again, and the time
+        away isn't time spent."""
+        first, second = self.attempts("focus(email); advance(1000); type(email, 'pat@example.com'); advance(1000);"
+                                      "elsewhere(60000); advance(500); focus(name); type(name, 'Pat'); submit(f);")
+        self.assertEqual((first["res"], second["res"]), ("abandon", "submit"))
+        self.assertEqual(first["a"], second["a"])
+        self.assertEqual((first["ms"], second["ms"]), (2000, 2500))
+        self.assertEqual(second["fields"][0]["n"], 1)    # getting focus back isn't coming back to it
+        self.assertEqual(second["fields"][0]["ms"], 2500)
+
+    def test_coming_back_to_a_field(self):
+        sent, = self.attempts("focus(email); type(email, 'pat@'); focus(name); type(name, 'Pat'); focus(email);"
+                              "type(email, 'pat@example.com'); submit(f);")
+        self.assertEqual([(x["f"], x["n"]) for x in sent["fields"]], [("email", 2), ("name", 1)])
+
+    def test_refused_by_validation(self):
+        sent, = self.attempts("focus(email); type(email, 'pat'); invalid(email); invalid(name);"
+                              "type(email, 'pat@example.com'); focus(name); type(name, 'Pat'); submit(f);")
+        self.assertEqual(sent["tries"], 1)   # one try, two fields refused
+        self.assertEqual([(x["f"], x.get("bad")) for x in sent["fields"]], [("email", 1), ("name", 1)])
+
+    def test_autofill_and_radio_groups(self):
+        sent, = self.page(after=(
+            "var f = form({ action: '/subscribe?from=footer' }); var email = f.add('INPUT', { name: 'email' });"
+            "var tel = f.add('INPUT', { name: 'tel', type: 'tel' });"
+            "var a = f.add('INPUT', { name: 'plan', type: 'radio' }); var b = f.add('INPUT', { name: 'plan', type: 'radio' });"
+            "var note = f.add('TEXTAREA', { id: 'note' }); var odd = f.add('SELECT', {});"
+            "var terms = f.add('INPUT', { name: 'terms', type: 'checkbox' });"
+            "focus(email); email.autofilled = true; type(email, 'pat@example.com', ''); tel.value = '555';"
+            "fire('document', 'input', { target: tel }); focus(b); b.checked = true; type(b, 'on', '');"
+            "focus(note); focus(odd); terms.checked = true; fire('document', 'input', { target: terms });"
+            "submit(f);"))["items"][-1:]
+        self.assertEqual(sent["f"], "/subscribe")
+        # tel: filled while they were in email, so autofilled. terms: clicked, but Safari
+        # doesn't focus a checkbox, so a visit without one.
+        self.assertEqual([(x["f"], x["k"], x["i"], x.get("auto"), x.get("fill"), x.get("n")) for x in sent["fields"]],
+                         [("email", "text", 0, 1, 1, 1), ("tel", "tel", 1, 1, 1, None), ("plan", "radio", 2, None, 1, 1),
+                          ("note", "textarea", 3, None, None, 1), ("select#4", "select", 4, None, None, 1),
+                          ("terms", "checkbox", 5, None, 1, 1)])
+
+    def test_what_isnt_watched(self):
+        nothing = (
+            "submit(f);",                                                       # sent, never touched
+            "var out = loose('INPUT', { name: 'q' }); focus(out); type(out, 'x');",   # in no form
+            "var p = f.add('INPUT', { name: 'card', private: true }); focus(p); type(p, '4242'); submit(f);",
+            "var off = form({ 'data-cl-form': 'off' }); var o = off.add('INPUT', { name: 'q' }); focus(o); submit(off);",
+        )
+        for after in nothing:
+            self.assertEqual(self.attempts(after), [], after)
+        typed = "focus(email); type(email, 'pat@example.com'); submit(f);"
+        self.assertEqual(self.attempts(typed, dataset={"forms": "off"}), [])
+        self.assertEqual(self.attempts(typed, dnt=True), [])
+        self.assertEqual(self.attempts(typed, dataset={"exclude": "/start"}), [])
+
+    def test_autofocus_isnt_an_attempt(self):
+        held = "navigator.userActivation = { hasBeenActive: false }; focus(email);"
+        self.assertEqual(self.attempts(held + "fire('window', 'pagehide', {});"), [])
+        typed, = self.attempts(held + "navigator.userActivation.hasBeenActive = true; advance(3000);"
+                                      "type(email, 'pat@example.com'); submit(f);")
+        self.assertNotIn("wait", typed["fields"][0])   # from a focus the visitor didn't make
+
+    def test_a_box_and_a_script_say_when(self):
+        sent, = self.attempts("var box = form({ 'data-cl-form': 'quote' }, 'DIV'); var q = box.add('INPUT', { name: 'q' });"
+                              "focus(q); type(q, 'pat@example.com'); cl('submit', box);")
+        self.assertEqual((sent["f"], sent["res"]), ("quote", "submit"))
+        sent, = self.attempts("focus(email); type(email, 'pat@example.com'); cl('submit', 'signup');")
+        self.assertEqual((sent["f"], sent["res"]), ("signup", "submit"))
 
 
 @unittest.skipUnless(os.environ.get("GEO_MMDB"), "set GEO_MMDB to test against a real database")
