@@ -441,6 +441,31 @@ class Ingest(unittest.TestCase):
                                    headers={"authorization": f"Bearer {other}"}).status, 401)
         self.assertEqual(self.report()["top"]["events"], [{"name": "signup", "value": 1}])
 
+    def test_export_daily_needs_its_own_key(self):
+        self.call("POST", "/_c/i", {"w": 1400, "items": [
+            {"t": "pv", "p": "/x/", "r": "https://news.example/item"},
+            {"t": "ev", "n": "signup"},
+        ]})
+        self.call("POST", "/_c/i", {"w": 390, "items": [{"t": "pv", "p": "/"}]}, ip="1.1.1.1")
+        self.assertEqual(self.call("GET", "/_c/export/daily").status, 401)
+        # A site's server key is for writing events, not for reading the export.
+        site_key = auth.server_key("server", "a.example")
+        self.assertEqual(self.call("GET", "/_c/export/daily", headers={"x-carterlitics-key": site_key}).status, 401)
+        res = self.call("GET", "/_c/export/daily", query={"days": "3"},
+                        headers={"authorization": f"Bearer {auth.export_key('server')}"})
+        out = body(res)
+        self.assertEqual(out["days"], 3)
+        sites = {s["site"]: s["days"] for s in out["sites"]}
+        self.assertEqual(set(sites), {"a.example", "b.example"})
+        self.assertEqual(sites["b.example"], [])               # days with nothing are left out
+        today, = sites["a.example"]
+        self.assertEqual(today["day"], time.strftime("%Y-%m-%d", time.gmtime()))
+        self.assertEqual((today["totals"]["pv"], today["totals"]["uv"], today["totals"]["ev"]), (2, 2, 1))
+        self.assertEqual(today["dims"]["path"], {"/x": 1, "/": 1})
+        self.assertEqual(today["dims"]["ev"], {"signup": 1})
+        self.assertEqual(today["dims"]["src"], {"news.example": 1, "Direct": 1})
+        self.assertLessEqual(set(today["dims"]), set(store_module.EXPORT_DIMS))
+
 
 LOG_W3C = """#Version: 1.0
 #Fields: date time x-edge-location sc-bytes c-ip cs-method cs(Host) cs-uri-stem sc-status cs(Referer) cs(User-Agent) cs-uri-query cs(Cookie) x-edge-result-type x-edge-request-id x-host-header cs-protocol cs-bytes time-taken

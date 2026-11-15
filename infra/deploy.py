@@ -10,6 +10,7 @@ on each site's CloudFront distribution.
     infra/deploy.py logging SITE [--dry-run]  CloudFront access logs for SITE -> the logs bucket
     infra/deploy.py register-client [--force] an OIDC client at the issuer, for the console
     infra/deploy.py server-key SITE           the key SITE's backend sends to /_c/server/events
+    infra/deploy.py export-key                the key a metrics store sends to /_c/export/daily
     infra/deploy.py grant-deploy [--dry-run]  let the CI role and publishing user run `code`
     infra/deploy.py search-console [--dry-run] a Google service account that reads Search Console:
                                               its project and AWS federation for the function;
@@ -69,7 +70,7 @@ CONFIG = ROOT / "carterlitics.toml"
 
 sys.path.insert(0, str(ROOT))
 from carterlitics import google  # noqa: E402
-from carterlitics.auth import server_key  # noqa: E402
+from carterlitics.auth import export_key, server_key  # noqa: E402
 from carterlitics.config import Config  # noqa: E402
 from carterlitics.intel import Ranges, build_ranges  # noqa: E402
 
@@ -857,6 +858,13 @@ def print_server_key(name: str) -> None:
     print(server_key(secret, site.id))
 
 
+def print_export_key() -> None:
+    secret = param("server-secret")
+    if not secret:
+        raise Fail("no server secret: run `infra/deploy.py provision` first")
+    print(export_key(secret))
+
+
 def grant_deploy(acct: str, dry: bool) -> None:
     policy = json.dumps({"Version": "2012-10-17", "Statement": [{
         "Effect": "Allow", "Action": ["lambda:UpdateFunctionCode", "lambda:GetFunctionConfiguration"],
@@ -1478,7 +1486,7 @@ def fetch_intel() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["code", "provision", "routes", "logging", "register-client",
-                                        "server-key", "grant-deploy", "search-console", "geo", "intel"])
+                                        "server-key", "export-key", "grant-deploy", "search-console", "geo", "intel"])
     ap.add_argument("site", nargs="?", help="routes, logging: a site id from carterlitics.toml, or all; server-key: a site")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rollback", action="store_true", help="routes: restore the config from before")
@@ -1502,6 +1510,8 @@ def main() -> int:
             logging(args.site, args.dry_run)
         elif args.command == "server-key":
             print_server_key(args.site)
+        elif args.command == "export-key":
+            print_export_key()
         elif args.command == "grant-deploy":
             grant_deploy(account(), args.dry_run)
         elif args.command == "search-console":
