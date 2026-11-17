@@ -1,3 +1,5 @@
+![CARTERLITICS](.github/banner.png)
+
 # carterlitics
 
 First-party, self-hosted analytics for a handful of sites: who visits, which bots crawl,
@@ -588,6 +590,23 @@ curl -X POST https://cartercole.com/_c/server/events \
 ```
 
 The key is derived per site from one secret, so a leaked key only speaks for its own site.
+
+### To a metrics store
+
+`GET /_c/export/daily?days=N` (1–400, default 2) is every site's counters by day, for a
+time-series database to pull: each day's totals (the console's series: `pv`, `uv`, `ses`,
+`bnc`, `ev`, `err`, `req`, `hum`, `bot`, …) and the 15 biggest values of a few
+dimensions (paths, sources, channels, countries, devices, browsers, systems, events, bots,
+bot categories, statuses). Days with nothing counted are left out. It takes its own key,
+which neither writes events nor opens the console; a site's server key doesn't open it.
+
+```bash
+curl --compressed https://cartercole.net/_c/export/daily?days=7 \
+  -H "x-carterlitics-key: $(AWS_PROFILE=carter-admin infra/deploy.py export-key)"
+```
+
+gputy's Grafana (`~/Code/graphana`) pulls today and yesterday every few minutes, and all
+400 days once.
 
 ## Search Console
 

@@ -49,7 +49,7 @@ from .config import Config, Funnel
 from .geo import Geolocator
 from .google import GoogleError, SearchConsole, plan
 from .intel import Intelligence
-from .store import LOG_KINDS, Meta, Store
+from .store import EXPORT_DIMS, LOG_KINDS, Meta, Store
 from .web import NO_STORE, Request, Response, from_lambda, no_content, plain, redirect, reply_json, to_lambda
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -238,6 +238,18 @@ class App:
             data = req.json()
             events = data.get("events") if isinstance(data, dict) else None
             return reply_json({"stored": self.store.server_events(site, events or [], self.meta(req))})
+
+        if route == ("GET", "/export/daily"):
+            # Every site's daily counters for a metrics store, pulled with the export key
+            # (auth.export_key). Read-only, and never more than the console itself shows.
+            key = req.headers.get("x-carterlitics-key") or \
+                req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            if not cfg.server_secret or not hmac.compare_digest(
+                    key.encode(), auth.export_key(cfg.server_secret).encode()):
+                return reply_json({"error": "unauthorized"}, 401)
+            days = self.clamp(req.query.get("days"), 2, 1, 400)
+            return self.big_json({"days": days, "dims": list(EXPORT_DIMS),
+                                  "sites": [self.store.daily(s, days) for s in cfg.sites.values()]})
 
         if path in ("/admin", "/admin/", "/admin/replay"):
             if req.method != "GET":

@@ -66,6 +66,13 @@ def server_key(secret: str, site: str) -> str:
     return hmac.new(secret.encode(), f"server-key:{site}".encode(), hashlib.sha256).hexdigest()[:40]
 
 
+def export_key(secret: str) -> str:
+    """The bearer key for /_c/export/*: every site's daily counts, read-only, for a metrics
+    store (gputy's Grafana). Derived from the same secret under its own purpose, so a site
+    backend's key can't read the export and the export's key can't write events."""
+    return hmac.new(secret.encode(), b"export-key", hashlib.sha256).hexdigest()[:40]
+
+
 def page(status: int, title: str, text: str, cookies: list[str] | None = None, home: str = "/") -> Response:
     """Sign-in errors. Static text only, never input."""
     body = (
