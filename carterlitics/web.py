@@ -7,6 +7,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 
 NO_STORE = {"Cache-Control": "no-store"}
+# JSON that carries what visitors sent: a browser takes it for JSON and nothing else.
+JSON_TYPE = {"Content-Type": "application/json; charset=utf-8", "X-Content-Type-Options": "nosniff"}
 
 
 @dataclass
@@ -51,7 +53,7 @@ class Response:
 
 def reply_json(data, status: int = 200, headers: dict | None = None) -> Response:
     return Response(status, json.dumps(data, separators=(",", ":"), default=str),
-                    {"Content-Type": "application/json; charset=utf-8", **NO_STORE, **(headers or {})})
+                    {**JSON_TYPE, **NO_STORE, **(headers or {})})
 
 
 def no_content() -> Response:

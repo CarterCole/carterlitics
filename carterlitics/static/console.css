@@ -1,5 +1,6 @@
 /* carterlitics console. Chart colors are the validated reference palette's first two
-   categorical slots (people = blue, bots = orange), stepped separately for dark. */
+   categorical slots (people = blue, bots = orange), stepped separately for dark; an
+   experiment's arms take all eight, in its fixed order (--x1 … --x8). */
 :root {
   color-scheme: light;
   --page: #f9f9f7;
@@ -18,6 +19,8 @@
   --link: #1c5cab;
   --good: #006300;
   --critical: #d03b3b;
+  --x1: #2a78d6; --x2: #eb6834; --x3: #1baf7a; --x4: #eda100;
+  --x5: #e87ba4; --x6: #008300; --x7: #6250d6; --x8: #e34948;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -39,6 +42,8 @@
     --link: #86b6ef;
     --good: #0ca30c;
     --critical: #e66767;
+    --x1: #3987e5; --x2: #d95926; --x3: #199e70; --x4: #c98500;
+    --x5: #d55181; --x6: #0ca30c; --x7: #9085e9; --x8: #e66767;
   }
 }
 :root[data-theme="dark"] {
@@ -46,6 +51,8 @@
   --page: #0d0d0d; --surface: #1a1a19; --raised: #222220; --ink: #f0efec; --ink-2: #c3c2b7;
   --grid: #2c2c2a; --axis: #383835; --ring: rgba(255, 255, 255, 0.10); --wash: rgba(255, 255, 255, 0.05);
   --people: #3987e5; --bots: #d95926; --share: rgba(57, 135, 229, 0.24); --link: #86b6ef; --good: #0ca30c; --critical: #e66767;
+  --x1: #3987e5; --x2: #d95926; --x3: #199e70; --x4: #c98500;
+  --x5: #d55181; --x6: #0ca30c; --x7: #9085e9; --x8: #e66767;
 }
 
 * { box-sizing: border-box; }
@@ -147,6 +154,10 @@ main.is-loading { opacity: 0.55; transition: opacity 0.15s; }
 .seg-fill:first-child { border-radius: 4px 4px 0 0; }
 .seg-fill--people { background: var(--people); }
 .seg-fill--bots { background: var(--bots); }
+.seg-fill--x1 { background: var(--x1); } .seg-fill--x2 { background: var(--x2); }
+.seg-fill--x3 { background: var(--x3); } .seg-fill--x4 { background: var(--x4); }
+.seg-fill--x5 { background: var(--x5); } .seg-fill--x6 { background: var(--x6); }
+.seg-fill--x7 { background: var(--x7); } .seg-fill--x8 { background: var(--x8); }
 .col.is-on .seg-fill { filter: brightness(1.15); }
 .axis {
   display: flex; justify-content: space-between; margin: 6px 0 0 44px; color: var(--muted); font-size: 11.5px;
@@ -282,6 +293,37 @@ pre.stack {
 .explore + div { margin-top: 6px; }
 .hint { color: var(--muted); font: 12px var(--mono); }
 .more { margin-top: 6px; padding-left: 6px; }
+
+/* experiments: an arm per row, its rate's interval as a strip on a scale the rows share */
+.experiment-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.experiment-head h2 { margin: 0; }
+.experiment .sub { margin-top: 4px; }
+.verdict { font-size: 15px; font-weight: 600; margin: 4px 0 4px; }
+.verdict--winner { color: var(--good); }
+.verdict--loser { color: var(--critical); }
+.metric-pick { margin: 4px 0 10px; flex-wrap: wrap; }
+.arms { min-width: 860px; }
+.arms td { vertical-align: middle; }
+.arms tr.is-lead td { background: var(--wash); }
+.arm { display: inline-flex; align-items: center; gap: 8px; max-width: 30ch; }
+.swatch { width: 10px; height: 10px; border-radius: 3px; background: var(--key); flex: none; }
+.ci-cell { width: 180px; min-width: 140px; }
+.lift { white-space: nowrap; }
+.lift .range { display: block; color: var(--muted); font-size: 11.5px; }
+.muted { color: var(--muted); }
+.ci { position: relative; display: block; height: 14px; border-left: 1px solid var(--axis); }
+.ci-band {
+  position: absolute; top: 4px; height: 6px; min-width: 2px; border-radius: 3px;
+  background: var(--key); opacity: 0.45;
+}
+.ci-dot {
+  position: absolute; top: 3px; width: 8px; height: 8px; margin-left: -4px; border-radius: 50%;
+  background: var(--key); box-shadow: 0 0 0 2px var(--surface);
+}
+.ci-base { position: absolute; top: -2px; bottom: -2px; border-left: 1px dashed var(--muted); }
+.experiment-days { margin-top: 16px; }
+.experiment h3, .effect h3 { font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
+.previews { margin-top: 12px; }
 
 /* replay */
 .player { margin-top: 12px; display: flow-root; }

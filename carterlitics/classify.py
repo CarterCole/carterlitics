@@ -6,6 +6,7 @@ CloudFront log line. Nothing here touches storage.
 from __future__ import annotations
 
 import re
+import urllib.parse
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------- bots
@@ -358,6 +359,21 @@ def referrer_of(url, own_hosts: frozenset[str]) -> str:
     if not host or host in own_hosts:
         return "direct"
     return host
+
+
+def bare_url(url, limit: int = 300) -> str:
+    """`https://user@a.example/reset?token=x#y` -> `https://a.example/reset`: a referrer's
+    site and page, never what that page was given. "" for anything without a host."""
+    if not isinstance(url, str) or "://" not in url:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return ""
+    host = parts.netloc.rpartition("@")[2]
+    if not parts.scheme or not host:
+        return ""
+    return dim(f"{parts.scheme}://{host}{parts.path}", limit)
 
 
 # ---------------------------------------------------------------- sources

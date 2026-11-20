@@ -4,3 +4,5 @@ __pycache__/
 infra/.state/
 # .mmdb files for the Lambda package (infra/deploy.py geo); licensed, not committed
 geo/
+# written into the Lambda package by infra/deploy.py from carterlitics.toml
+carterlitics/experiments.json

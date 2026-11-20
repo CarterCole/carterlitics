@@ -425,8 +425,11 @@ class Proof:
     asns: tuple[str, ...] = ()     # from one of these networks, which rent nothing to others
 
 
-GOOGLE = Proof((".googlebot.com", ".google.com", ".googleusercontent.com"),
-               ("Googlebot", "Google special crawlers", "Google fetchers"))
+# Not `.googleusercontent.com`: every Google Cloud VM is named under bc.googleusercontent.com,
+# forward-confirmed, so a $5 VM calling itself Googlebot would pass. Google's own fetchers a
+# person sets off (Read Aloud) are named under gae.googleusercontent.com.
+GOOGLE = Proof((".googlebot.com", ".google.com"), ("Googlebot", "Google special crawlers", "Google fetchers"))
+GOOGLE_USER = Proof((".google.com", ".gae.googleusercontent.com"), GOOGLE.ranges)
 BING = Proof((".search.msn.com",), ("Bingbot",))
 APPLE = Proof((".applebot.apple.com",), ("Applebot",))
 META = Proof(asns=("32934",))
@@ -435,7 +438,7 @@ META = Proof(asns=("32934",))
 # check against, and facebookexternalhit, which iMessage also sends from people's phones.
 PROOFS: dict[str, Proof] = {
     "Googlebot": GOOGLE, "Google-InspectionTool": GOOGLE, "GoogleOther": GOOGLE, "Storebot-Google": GOOGLE,
-    "AdsBot-Google": GOOGLE, "Google-CloudVertexBot": GOOGLE, "Google Read Aloud": GOOGLE,
+    "AdsBot-Google": GOOGLE, "Google-CloudVertexBot": GOOGLE, "Google Read Aloud": GOOGLE_USER,
     "Bingbot": BING, "BingPreview": BING,
     "Applebot": APPLE, "Applebot-Extended": APPLE,
     "DuckDuckBot": Proof(ranges=("DuckDuckBot",)),

@@ -12,8 +12,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+from . import experiments as experiments_module
 from . import store as store_module
-from .config import Funnel
+from .config import Experiment, Funnel
 from .geo import Geo
 from .google import SearchConsole, pacific_today
 from .intel import Intelligence, Ranges, build_ranges
@@ -146,6 +147,40 @@ FUNNELS = {
     "cartercole.net": [{"name": "Project to source", "steps": ["/", "/rollopolis", "event:outbound?target=github.com"]}],
 }
 GO_ON = (0.74, 0.55, 0.42, 0.8, 0.8)   # the share of a step's visitors who take the next one
+# Experiments for the sites that have none, and how each arm truly does at each metric (the
+# demo's visitors convert at these rates; the console has to find out which is best). A
+# value is the sum an event carries, on average.
+EXPERIMENTS = {
+    "cartercole.com": [
+        {"key": "hero", "name": "Home page headline", "status": "running", "pages": ["/"],
+         "goal": "event:post_read", "metrics": ["/blog/*", "form:/subscribe?res=submit"],
+         "variant": [{"id": "a", "name": "Original"},
+                     {"id": "b", "name": "Shorter intro", "text": {".hero h1": "Notes on building small, fast things"}}]},
+        {"key": "newsletter", "name": "Newsletter box", "status": "running", "pages": ["/blog/*"],
+         "goal": "form:/subscribe?res=submit", "metrics": ["event:support"],
+         "factor": [{"id": "headline", "variant": [{"id": "a", "name": "Get new posts"},
+                                                   {"id": "b", "name": "One email a month",
+                                                    "text": {".newsletter h2": "One email a month"}}]},
+                    {"id": "button", "variant": [{"id": "plain", "name": "Plain"},
+                                                 {"id": "bold", "name": "Bold",
+                                                  "css": ".newsletter button { font-weight: 700 }"}]}]},
+    ],
+    "cartercole.net": [
+        {"key": "cta", "name": "Project card button", "status": "running", "allocation": "thompson",
+         "pages": ["/"], "goal": "event:outbound?kind=site", "metrics": ["event:dossier_open"],
+         "variant": [{"id": "a", "name": "Visit"}, {"id": "b", "name": "Try it", "text": {".card .go": "Try it"}},
+                     {"id": "c", "name": "Open", "text": {".card .go": "Open"}}]},
+        {"key": "dossier", "name": "Dossier layout", "status": "draft", "goal": "event:outbound",
+         "variant": [{"id": "a", "name": "List"}, {"id": "b", "name": "Grid", "css": ".dossier ul { display: grid }"}]},
+    ],
+}
+TRUE_RATES = {
+    ("cartercole.com", "hero"): {"a": (0.08, 0.30, 0.02), "b": (0.11, 0.34, 0.02)},
+    ("cartercole.com", "newsletter"): {"a.plain": (0.03, 0.01), "a.bold": (0.036, 0.01),
+                                       "b.plain": (0.045, 0.012), "b.bold": (0.052, 0.012)},
+    ("cartercole.net", "cta"): {"a": (0.04, 0.15), "b": (0.075, 0.15), "c": (0.03, 0.14)},
+}
+VALUES = {("cartercole.com", "newsletter", "event:support"): 5.0}
 ERRORS = [
     ("error", "TypeError", "Cannot read properties of undefined (reading 'width')",
      "TypeError: Cannot read properties of undefined (reading 'width')\n    at layout (https://{host}/app-3f9a1c2e.js:112:18)\n    at render (https://{host}/app-3f9a1c2e.js:80:5)"),
@@ -194,10 +229,45 @@ def _form_attempt(rng, path: str, key: str, fields) -> dict:
 
 
 def configure(cfg):
-    """The config with the demo's funnels on the sites that have none."""
+    """The config with the demo's funnels and experiments on the sites that have none."""
     sites = {k: dataclasses.replace(s, funnels=tuple(Funnel.parse(f, k) for f in FUNNELS[k]))
              if k in FUNNELS and not s.funnels else s for k, s in cfg.sites.items()}
+    sites = {k: dataclasses.replace(s, experiments=tuple(Experiment.parse(e, k) for e in EXPERIMENTS[k]))
+             if k in EXPERIMENTS and not s.experiments else s for k, s in sites.items()}
     return dataclasses.replace(cfg, sites=sites)
+
+
+def _experiments(store, cfg, now: datetime, days: int, seed: int) -> None:
+    """Each demo experiment's visitors, day by day: shown an arm by its shares that day (a
+    bandit's move as it learns, from what the store has counted so far), then converting at
+    the arm's true rates. Through the store, as c.js's batches would arrive."""
+    rng = random.Random(seed)
+    for site in cfg.sites.values():
+        for exp in site.experiments:
+            rates = TRUE_RATES.get((site.id, exp.key))
+            if not rates or exp.status != "running":
+                continue
+            metrics = [m.text for m in exp.all_metrics]
+            arms = [a.id for a in exp.arms]
+            for back in range(days - 1, -1, -1):
+                day = now - timedelta(days=back)
+                counts = experiments_module.totals(experiments_module.tally(store.experiment(site, exp.key)))
+                shares = experiments_module.weights(exp, counts)
+                items = []
+                for _ in range(rng.randint(25, 60) if back else rng.randint(5, 20)):
+                    arm = rng.choices(arms, [shares[a] for a in arms])[0]
+                    items.append({"t": "x", "e": exp.key, "v": arm})
+                    for metric, p in zip(metrics, rates[arm]):
+                        if rng.random() < p:
+                            value = VALUES.get((site.id, exp.key, metric))
+                            for n in range(1 if rng.random() < 0.8 else 2):
+                                items.append({"t": "xc", "e": exp.key, "v": arm, "g": metric, **({"u": 1} if not n else {}),
+                                              **({"val": round(rng.uniform(0.5, 2) * value, 2)} if value else {})})
+                at = min(day.replace(hour=12), now)
+                with mock.patch.object(store_module, "now", lambda at=at: at):
+                    for i in range(0, len(items), 50):
+                        store.ingest(site, {"w": 1280, "items": items[i:i + 50]},
+                                     Meta(ip="198.51.100.20", user_agent=PEOPLE[0], country="US"))
 
 
 def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
@@ -319,6 +389,7 @@ def fill(store, cfg, days: int = 30, seed: int = 7) -> None:
                                      404 if path in PROBES else 200, "", ua, edge="Miss" if path in PROBES else "Hit",
                                      country=country, asn=asn))
             store.ingest_log(lines)
+    _experiments(store, cfg, now, days, seed + 2)   # apart, so they leave the rest of the demo as it was
 
 
 def _journey(store, site, rng, at, now, ids, meta, width, ref, tags) -> list[tuple[datetime, str]]:

@@ -15,6 +15,9 @@ never see each other's data. The layout:
     vs|<site>|<vid>      <session id>   day      a consented visitor's sessions: the index that
                                                  finds them all, to add up and play in turn
     g|<site>             <group id>     …        an error group: first/last seen, a sample
+    x|<site>|<key>       <day>#<k>#<arm>…  n     an experiment's counters: visitors exposed (e),
+                                                 converted (c), conversions (n), value (v) a
+                                                 metric (experiments.py)
     o|<site>|<group>     <ts>#<rand>    …        that group's occurrences
     salt|<day>           -              salt     the day's visitor-hash salt, gone in 2 days
     f|<s3 key>           -                       a CloudFront log file already counted
@@ -43,12 +46,18 @@ out of `bnc`; a move to another page moves its `exit#`. The hash changes at midn
 a visit does too. Where a visit came from is counted when it begins, from its first page
 view's referrer and campaign tags (classify.source_of): `src#<source>`, `ch#<channel>`,
 `cmp#<utm_campaign>`, each with a bounce counter (`bsrc#`, `bch#`, `bcmp#`) kept like `bnc#`.
+
+Experiments are counted the same way, in a partition of their own so one query reads a
+test's whole run: c.js says once per visitor (per tab, without consent) that it showed
+them an arm, and once per metric that they then reached it, and the counters add up.
 """
 from __future__ import annotations
 
 import gzip
 import hashlib
+import ipaddress
 import json
+import math
 import re
 import secrets
 import statistics
@@ -68,7 +77,8 @@ from .intel import PROOFS, Intel, Intelligence, canonical, clock_elsewhere, veri
 DAY = 86400
 MAX_ITEMS = 50                 # per browser batch
 MAX_CHUNK_BYTES = 2_000_000    # one recording chunk, as JSON, before gzip
-MAX_CHUNKS = 100_000
+MAX_CHUNKS = 1000              # a session's recording chunks: c.js stops at 400
+MAX_ERRORS = 25                # per browser batch: c.js sends at most 25 a page
 MAX_PROPS = 2000               # an event's properties, as JSON
 TOP = 25
 BEACON_DNS = 0.8               # seconds a browser batch may wait on reverse DNS
@@ -148,6 +158,10 @@ def rec_prefix(site: str, session: str) -> str:
     return f"rec/{site}/{session.lower()}/"
 
 
+def experiment_pk(site: str, key: str) -> str:
+    return f"x|{site}|{key}"
+
+
 LOG_KINDS = ("pv", "ev", "err", "hum", "bot")
 
 
@@ -218,6 +232,19 @@ def group_id(kind: str, name: str, message: str, stack: str, source: str) -> str
 
 
 ERROR_KINDS = {"error", "rejection", "resource", "csp", "manual", "console"}
+
+# An address in an error, up to its query or fragment (kept: the line and column after
+# one), and an email address. c.js takes them out too; this covers an older copy of it.
+ADDRESS = re.compile(r"\b([a-z][a-z0-9+.-]*://[^\s?#()'\"<>]*)[?#][^\s()'\"<>]*?((?::\d+){1,2})?(?=[\s()'\"<>]|$)",
+                     re.I)
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+
+
+def scrub(value: str, emails: bool = False) -> str:
+    """An error's message, stack or source without what a page was given: an inline
+    script's frames name the page, query and all; a failed image its signed URL."""
+    out = ADDRESS.sub(lambda m: m.group(1) + (m.group(2) or ""), value or "")
+    return EMAIL.sub("[email]", out) if emails else out
 
 
 # ---------------------------------------------------------------- automation, and leaving
@@ -412,6 +439,9 @@ class Store:
         stored = 0
         viewed = False
         W = web(site.id, day)
+        tested: dict[str, str] = {}   # the consented session's experiments, and the arm it was shown
+        running = {e.key: e for e in site.experiments if e.status == "running"}
+        arms: dict[str, set[str]] = {}
 
         about: dict | None = None
 
@@ -466,7 +496,7 @@ class Store:
                 stored += 1
                 if consented:
                     logs.append({"pk": log_pk(site.id, day, "pv"), "sk": stamp(at, seq), "path": path,
-                                 "ref": text(item.get("r"), 300), "browser": browser, "os": system,
+                                 "ref": classify.bare_url(item.get("r")), "browser": browser, "os": system,
                                  "device": device, **({"sig": sig} if sig else {}), **who(),
                                  "expires": self.keep("visits")})
                     session["pages"] += 1
@@ -537,8 +567,40 @@ class Store:
                              **who(), "expires": self.keep("events")})
                 stored += 1
 
+            elif kind in ("x", "xc"):
+                # An experiment's visitor exposed to their arm (x), or reaching one of its
+                # metrics after (xc). c.js sends each once a visitor (`u`: the first time for
+                # this metric); counts only, plus the arm on a consented session.
+                exp = running.get(item.get("e")) if not (meta.opted_out or bot) else None
+                arm = item.get("v")
+                if not exp or not isinstance(arm, str):
+                    continue
+                if exp.key not in arms:
+                    arms[exp.key] = {a.id for a in exp.arms}
+                if arm not in arms[exp.key]:
+                    continue
+                X = experiment_pk(site.id, exp.key)
+                if kind == "x":
+                    counts[(X, f"{day}#e#{arm}")] += 1
+                    if consented:
+                        tested[f"x:{exp.key}"] = arm
+                else:
+                    metric = item.get("g")
+                    if metric not in {m.text for m in exp.all_metrics}:
+                        continue
+                    counts[(X, f"{day}#n#{arm}#{metric}")] += 1
+                    if item.get("u") is True or item.get("u") == 1:
+                        counts[(X, f"{day}#c#{arm}#{metric}")] += 1
+                    val = item.get("val")
+                    if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) \
+                            and 0 < val <= 10_000_000:
+                        counts[(X, f"{day}#v#{arm}#{metric}")] += round(val * 100)
+                stored += 1
+
             elif kind == "err":
-                if bot:
+                # c.js sends at most MAX_ERRORS a page; a batch with more was written by hand,
+                # and each error is a group and two log items.
+                if bot or len(groups) >= MAX_ERRORS:   # one entry an error stored
                     continue
                 err = self._error(item)
                 if not err:
@@ -581,10 +643,10 @@ class Store:
             if new_session:
                 self.table.put_new(new_session)
                 self.index_session(site.id, vid, start_day, sid, new_session["started"], new_session["expires"])
-            if session:
+            if session or tested:
                 self.table.update(sessions_pk(site.id, start_day), sid, add=dict(session),
                                   set_={"last": iso(at), **({"exit": exit_path} if exit_path else {}),
-                                        **({"uid": uid} if uid else {}), **({"cv": cv} if cv else {})},
+                                        **({"uid": uid} if uid else {}), **({"cv": cv} if cv else {}), **tested},
                                   must_exist=True)
         return {"stored": stored}
 
@@ -642,7 +704,7 @@ class Store:
     @staticmethod
     def _error(item: dict) -> dict | None:
         kind = item.get("k") if item.get("k") in ERROR_KINDS else "error"
-        message = text(item.get("m"), 500).strip()
+        message = scrub(text(item.get("m"), 500), emails=True).strip()
         if not message:
             return None
 
@@ -650,7 +712,7 @@ class Store:
             return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10_000_000 else 0
 
         return {"kind": kind, "name": text(item.get("name"), 80), "message": message,
-                "stack": text(item.get("st"), 4000), "src": text(item.get("src"), 300),
+                "stack": scrub(text(item.get("st"), 4000)), "src": scrub(text(item.get("src"), 300)),
                 "line": num(item.get("ln")), "col": num(item.get("col"))}
 
     # -- what the collector makes of a visitor, for the page that asks (c.js's cl("who"))
@@ -751,6 +813,11 @@ class Store:
             raise ValueError("invalid identifier")
         if not isinstance(events, list) or not events:
             raise ValueError("invalid recording chunk")
+        # A page the site excludes is never recorded: c.js stops there, and an older copy of
+        # it that doesn't has its chunks dropped here.
+        page = data.get("p")
+        if isinstance(page, str) and clean_path(page) and not clean_path(page, site.exclude):
+            return False
         blob = json.dumps(events, separators=(",", ":"))
         if len(blob) > MAX_CHUNK_BYTES:
             raise ValueError("recording chunk too large")
@@ -865,18 +932,24 @@ class Store:
             if not site or line.path.startswith("/_c/") or classify.is_asset(line.path):
                 skipped += 1
                 continue
-            rows.append((site, line))
-        # Every address in the file at once, in parallel. A site that keeps addresses
-        # truncated gets no reverse DNS: the names often spell the address out.
-        found = self.intel.lookup_many({line.ip for site, line in rows if site.server_ip != "truncate"}, LOG_DNS)
+            rows.append((site, line, classify.bot_of(line.user_agent, line.path)))
+
+        def whole(site, bot) -> bool:
+            """Whether a request's address is kept whole (config.Site.server_ip)."""
+            return site.server_ip == "full" or (site.server_ip == "bots" and bot is not None)
+
+        # Every address kept whole in the file at once, in parallel: a bot's (by its user
+        # agent, to prove a crawler is the real one), and a person's only with "full". The
+        # rest get no reverse DNS, nor a place in its cache: the names often spell the
+        # address out.
+        found = self.intel.lookup_many({line.ip for site, line, bot in rows if whole(site, bot)}, LOG_DNS)
         has_ranges = self.intel.ranges is not None
-        for site, line in rows:
+        for site, line, bot in rows:
             day = day_of(line.at)
             S = srv(site.id, day)
             geo = self.locate(line.ip, line.country, line.asn)
-            about = found.get(line.ip) if site.server_ip != "truncate" else None
+            about = found.get(line.ip) if whole(site, bot) else None
             about = about or self.intel.local(line.ip)
-            bot = classify.bot_of(line.user_agent, line.path)
             claimed = ver = ""
             if bot:
                 ver = verify(bot.name, about, geo.asn, has_ranges)
@@ -895,7 +968,8 @@ class Store:
                 counts[(S, f"sb#{bot.name}")] += 1
                 counts[(S, f"sc#{bot.category}")] += 1
                 counts[(S, f"sp#{shown}")] += 1
-                counts[(S, f"sip#{line.ip}")] += 1
+                # Kept 400 days as a counter: whole only where the log keeps it whole.
+                counts[(S, f"sip#{line.ip if whole(site, bot) else truncate_ip(line.ip)}")] += 1
                 if geo.network:
                     counts[(S, f"sasn#{classify.dim(geo.network, 80)}")] += 1
                 if about.domain:
@@ -918,14 +992,12 @@ class Store:
                     counts[(S, "dc")] += 1
             if about.abuse:
                 counts[(S, "abuse")] += 1
-            ip = line.ip
-            if site.server_ip == "truncate":
-                ip = truncate_ip(ip)
+            ip = line.ip if whole(site, bot) else truncate_ip(line.ip)
             logs.append({
                 "pk": log_pk(site.id, day, "bot" if bot else "hum"), "sk": stamp(line.at),
                 "at": iso(line.at), "ip": ip, "method": line.method[:10], "path": classify.dim(line.path, 300),
                 "query": classify.dim(redact_query(line.query), 300), "status": line.status,
-                "ref": classify.dim(line.referrer, 300), "ua": classify.dim(line.user_agent, 500),
+                "ref": classify.dim(redact_url(line.referrer), 300), "ua": classify.dim(line.user_agent, 500),
                 "bytes": line.bytes, "edge": line.edge[:24], "ms": int(line.seconds * 1000),
                 **self.profile(geo, about),
                 "bot": bot.name if bot else "", "cat": bot.category if bot else "",
@@ -949,8 +1021,6 @@ class Store:
         with ThreadPoolExecutor(max_workers=16) as pool:
             webs = list(pool.map(lambda d: self.table.query(web(site.id, d)), keys))
             srvs = list(pool.map(lambda d: self.table.query(srv(site.id, d)), keys))
-            groups = pool.submit(self.table.query, groups_pk(site.id))
-            groups = groups.result()
 
         dims: dict[str, Counter] = {}
         totals: Counter = Counter()
@@ -1028,12 +1098,16 @@ class Store:
         }
         out["intel"] = {"ranges": self.intel.ranges.built if self.intel.ranges else "",
                         "dns": self.intel.dns, "geo": [r.database_type for r in self.geo.readers]}
-        info = {g["sk"]: g for g in groups}
+        # The range's 100 biggest groups, read by key: never the whole partition, which anyone
+        # sending made-up errors can grow.
+        biggest = sorted((dims.get("eg") or {}).items(), key=lambda kv: -kv[1])[:100]
+        found = self.table.get_many([(groups_pk(site.id), gid) for gid, _ in biggest]) if biggest else {}
+        info = {sk: g for (_, sk), g in found.items()}
         out["groups"] = [
             {"id": gid, "count": n, "total": info.get(gid, {}).get("n", n),
              **{k: info.get(gid, {}).get(k, "") for k in ("kind", "name", "message", "src", "first",
                                                            "last", "last_path")}}
-            for gid, n in sorted((dims.get("eg") or {}).items(), key=lambda kv: -kv[1])[:100]
+            for gid, n in biggest
         ]
         return out
 
@@ -1153,6 +1227,12 @@ class Store:
         out["visitors"] = len({h.vid for h in hits if h.vid})
         out["funnels"] = [funnel_report(f, hits) for f in funnels]
         return out
+
+    # -- experiments
+
+    def experiment(self, site, key: str) -> list[dict]:
+        """An experiment's counter items, its whole run (experiments.tally reads them)."""
+        return self.table.query(experiment_pk(site.id, key)) if self.table else []
 
     # -- forms
 
@@ -1373,27 +1453,42 @@ def public(item: dict) -> dict:
 
 
 SECRET_PARAMS = re.compile(
-    r"(?i)^(code|state|token|access_token|id_token|refresh_token|password|passwd|pass|secret|key|api_key|apikey"
-    r"|signature|sig|x-amz-signature|x-amz-credential|x-amz-security-token|auth|session|session_id|sid|otp"
-    r"|client_secret|code_verifier|ticket|jwt|assertion)$")
+    r"(?i)^(code|state|nonce|password|passwd|pass|secret|key|api_?key|signature|sig|x-(amz|goog)-[a-z-]+"
+    r"|auth|authorization|session|session_?id|sid|otp|ticket|jwt|assertion|code_verifier|invite|magic"
+    r"|login_hint|id_token_hint|e-?mail|phone|tel|mobile"
+    r"|\w*token|\w*_secret|\w*_?password|\w*_?email)$")
+# A value that is an email address, whatever its parameter is called (`?u=pat@example.com`).
+EMAILISH = re.compile(r"(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}", re.I)
 
 
 def redact_query(query: str) -> str:
-    """A query string for the request log, with the values of anything credential-like
-    replaced: OAuth callbacks carry codes and state, signed URLs carry signatures."""
+    """A query string for the request log, with the values of anything credential-like or
+    personal replaced: OAuth callbacks carry codes and state, signed URLs signatures, an
+    identity provider's sign-in a login_hint, a newsletter link the subscriber's address."""
     if not query:
         return ""
     out = []
     for part in query.split("&"):
-        name, eq, _ = part.partition("=")
-        out.append(f"{name}=…" if eq and SECRET_PARAMS.match(name) else part)
+        name, eq, value = part.partition("=")
+        out.append(f"{name}=…" if eq and (SECRET_PARAMS.match(name) or EMAILISH.search(value)) else part)
     return "&".join(out)
 
 
+def redact_url(url: str) -> str:
+    """A URL for the request log (a Referer, which is the page's own address, query and
+    all): its query redacted as redact_query does, and no fragment."""
+    base, q, query = (url or "").split("#", 1)[0].partition("?")
+    return f"{base}?{redact_query(query)}" if q else base
+
+
 def truncate_ip(ip: str) -> str:
-    """198.51.100.7 -> 198.51.100.0, and an IPv6 address to its /48."""
-    if ":" in ip:
-        parts = ip.split(":")
-        return ":".join(parts[:3]) + "::"
-    parts = ip.split(".")
-    return ".".join(parts[:3] + ["0"]) if len(parts) == 4 else ip
+    """198.51.100.7 -> 198.51.100.0, and an IPv6 address to its /48 (`2600::1:2:3` ->
+    `2600::`, however it's written). "" for anything that isn't an address: never kept whole."""
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return ""
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    bits = 24 if addr.version == 4 else 48
+    return str(ipaddress.ip_network(f"{addr}/{bits}", strict=False).network_address)

@@ -11,7 +11,7 @@
   var MOUNT = root.dataset.mount || "/_c";
   var API = MOUNT + "/api";
   var RANGES = [1, 7, 30, 90];
-  var TABS = ["overview", "traffic", "search", "bots", "visitors", "events", "funnels", "forms", "errors"];
+  var TABS = ["overview", "traffic", "search", "bots", "visitors", "events", "funnels", "experiments", "forms", "errors"];
   var params = new URLSearchParams(location.search);
   var state = {
     site: params.get("site") || "",
@@ -615,7 +615,7 @@
       return get("/sessions", { days: Math.min(state.days, 30) }).then(function (d) { return d.items; });
     }).then(function (items) {
       sessions.replaceChildren.apply(sessions, searchable(
-        ["Started (UTC)", "Length", "#Pages", "#Events", "#Errors", "Landed on", "Left from", "From", "IP", "Where", "Browser", "Visitor", "User", "Consent", ""],
+        ["Started (UTC)", "Length", "#Pages", "#Events", "#Errors", "Landed on", "Left from", "From", "IP", "Where", "Browser", "Visitor", "User", "Tests", "Consent", ""],
         items.map(function (s) {
           return row([el("span", { class: "when", text: stamp(s.started) }), span(s.started, s.last),
             td(num(s.pages), "num"), td(num(s.events), "num"),
@@ -623,7 +623,7 @@
             clip(s.path), clip(s.exit), clip(s.src ? [s.src, s.cmp].filter(Boolean).join(" · ") : s.ref),
             ipCell(s.ip), where(s, true),
             clip([s.browser, s.os, s.device].filter(Boolean).join(" · ")), visitorLink(s.vid), clip(s.uid),
-            consentCell(s.cv), s.rec ? replayLink(s.id, null, s.vid) : el("span", { class: "empty", text: "no recording" })], s);
+            clip(tests(s)), consentCell(s.cv), s.rec ? replayLink(s.id, null, s.vid) : el("span", { class: "empty", text: "no recording" })], s);
         }), "No consented sessions yet."));
     }, function (e) { sessions.replaceChildren(el("p", { class: "empty bad", text: e.message })); });
     logOf("pv").then(function (items) {
@@ -642,6 +642,13 @@
         ((state.me && state.me.retention.recordings) || 30) + " days.", sessions),
       card("Consented page views", "With address, network, visitor cookie and device fingerprint.", views)
     ];
+  }
+
+  /* The experiments a session was in, and the arm it was shown: "hero b, grid a.green". */
+  function tests(s) {
+    return Object.keys(s).filter(function (k) { return k.indexOf("x:") === 0; }).sort().map(function (k) {
+      return k.slice(2) + " " + s[k];
+    }).join(", ");
   }
 
   function events(r) {
@@ -808,6 +815,171 @@
       card("Try a funnel", "Steps in order, one per line. Counted over the consented sessions in this range; " +
         "anonymous visits carry nothing that ties one page to the next.", [form, result])
     ];
+  }
+
+  /* ---------------------------------------------------------------- experiments */
+
+  /* A/B, multivariate and bandit tests (experiments.py). Each card is one experiment's
+     whole run, whatever the range above: its arms on the goal (or another metric), each
+     against the original, the visitors it took in each day, and links to preview each arm. */
+  var EXPERIMENT_EXAMPLE = [
+    "[[site.experiment]]            # under the site's [[site]] table; ships with infra/deploy.py code",
+    "key = \"hero\"",
+    "status = \"running\"             # draft (preview only) · running · paused · done (with winner = \"b\")",
+    "pages = [\"/\"]",
+    "goal = \"event:sign_up\"         # a funnel step: /pricing, event:name?k=v, form:key?res=submit",
+    "allocation = \"split\"           # or \"thompson\", \"greedy\": a bandit",
+    "",
+    "[[site.experiment.variant]]",
+    "id = \"a\"                       # the first is the original",
+    "[[site.experiment.variant]]",
+    "id = \"b\"",
+    "text = { \".hero h1\" = \"Less, faster\" }"
+  ].join("\n");
+  var ALLOCATIONS = { split: "Fixed split", thompson: "Bandit: Thompson sampling", greedy: "Bandit: epsilon-greedy" };
+  var ARM_SLOTS = 8;            // the categorical palette's; past it, a test's days show as one series
+  var experimentMetric = {};    // key -> the metric its table shows
+
+  function armColor(i) { return "var(--x" + (i + 1) + ")"; }
+
+  function signed(x) { return x === null || x === undefined ? "—" : (x > 0 ? "+" : x < 0 ? "−" : "") + pct.format(Math.abs(x)); }
+
+  /* The lift, whether it's called better or worse, and its interval on a line of its own. */
+  function lift(m) {
+    if (m.lift === undefined) return el("span", { class: "muted", text: "the original" });
+    return [el("span", { text: signed(m.lift) }), m.significant ? " " : null, verdictPill(m),
+      m.lift_low !== null && m.lift_high !== null
+        ? el("span", { class: "range", text: signed(m.lift_low) + " to " + signed(m.lift_high) }) : null];
+  }
+
+  /* A rate's interval as a strip: the band its interval covers, a dot at the rate, and a
+     line at the original's rate, on a scale shared by every arm in the table. */
+  function strip(m, top, base, color) {
+    if (m.rate === null) return el("span", { class: "ci" });
+    var at = function (v) { return Math.max(0, Math.min(100, v / top * 100)) + "%"; };
+    return el("span", { class: "ci", "aria-hidden": "true" },
+      base !== null ? el("span", { class: "ci-base", style: "left:" + at(base) }) : null,
+      el("span", { class: "ci-band", style: "left:" + at(m.low) + ";width:calc(" + at(m.high) + " - " + at(m.low) +
+        ");--key:" + color }),
+      el("span", { class: "ci-dot", style: "left:" + at(m.rate) + ";--key:" + color }));
+  }
+
+  function verdictPill(m) {
+    if (m.significant === "better") return el("span", { class: "pill pill--good", text: "better", title: "Significant: an always-valid p of " + m.p });
+    if (m.significant === "worse") return el("span", { class: "pill pill--bad", text: "worse", title: "Significant: an always-valid p of " + m.p });
+    return null;
+  }
+
+  function armTable(x, metric) {
+    var rows = x.arms, base = rows[0].metrics[metric].rate;
+    var top = Math.max.apply(null, rows.map(function (r) { return r.metrics[metric].high || 0; }).concat([0.01])) * 1.08;
+    var valued = rows.some(function (r) { return r.metrics[metric].value; });
+    var head = ["Variant", "#Share now", "#Visitors", "#Converted", "#Rate", "", "#Lift", "#Chance it beats the original",
+      "#Chance it's best"].concat(valued ? ["#Value per visitor"] : []);
+    return el("div", { class: "table-wrap" }, el("table", { class: "log arms" },
+      el("thead", null, el("tr", null, head.map(function (h) {
+        return el("th", { class: h.charAt(0) === "#" ? "num" : null, text: h.replace(/^#/, "") });
+      }))),
+      el("tbody", null, rows.map(function (r, i) {
+        var m = r.metrics[metric], color = i < ARM_SLOTS ? armColor(i) : "var(--muted)";
+        var interval = m.low !== null ? pct.format(m.low) + " to " + pct.format(m.high) : "";
+        return el("tr", { class: x.winner === r.id || (x.verdict.state === "winner" && x.verdict.arm === r.id) ? "is-lead" : null },
+          el("td", null, el("span", { class: "arm" }, el("i", { class: "swatch", style: "--key:" + color }),
+            el("span", { class: "clip", text: r.name, title: r.id + (i ? "" : " (the original)") }),
+            i ? null : el("span", { class: "pill", text: "original" }))),
+          el("td", { class: "num", text: x.status === "running" ? pct.format(r.share) : "—",
+                     title: x.allocation === "split" ? "Fixed by its weight" : "Where the bandit sends new visitors now" }),
+          el("td", { class: "num", text: num(r.units) }),
+          el("td", { class: "num", text: num(m.converted), title: num(m.conversions) + " conversions in all" }),
+          el("td", { class: "num", text: m.rate === null ? "—" : pct.format(m.rate), title: interval ? (x.confidence * 100) + "% interval: " + interval : null }),
+          el("td", { class: "ci-cell" }, strip(m, top, i ? base : null, color)),
+          el("td", { class: "num lift" }, lift(m)),
+          el("td", { class: "num", text: m.beat === undefined ? "—" : rate(m.beat) }),
+          el("td", { class: "num", text: rate(m.best) }),
+          valued ? el("td", { class: "num", text: m.per_visitor === null ? "—" : m.per_visitor.toFixed(2),
+                              title: m.value + " in all" }) : null);
+      }))));
+  }
+
+  function effectsTable(x) {
+    return x.effects.map(function (f) {
+      return el("div", { class: "effect" }, el("h3", { text: f.factor }),
+        table(["Variant", "#Visitors", "#Rate", "#Lift", "#Chance it beats " + f.levels[0].name], f.levels.map(function (l, i) {
+          return [l.name, td(num(l.units), "num"), td(l.rate === null ? "—" : pct.format(l.rate), "num"),
+            td(i ? lift(l) : "the first", "num lift"), td(i ? rate(l.beat) : "—", "num")];
+        })));
+    });
+  }
+
+  function previewLinks(x, url) {
+    var page = (x.pages.filter(function (p) { return p.indexOf("*") < 0; })[0]) || "/";
+    return el("p", { class: "sub previews" }, "Preview in this browser, never counted: ",
+      x.arms.map(function (a, i) {
+        return [i ? " · " : "", el("a", { href: url.replace(/\/$/, "") + page + "?cl_x=" + encodeURIComponent(x.key + ":" + a.id),
+          target: "_blank", rel: "noopener", text: a.name })];
+      }), " · ", el("a", { href: url.replace(/\/$/, "") + page + "?cl_x=", target: "_blank", rel: "noopener", text: "end the preview" }));
+  }
+
+  function experimentCard(x, url) {
+    var metric = x.metrics.indexOf(experimentMetric[x.key]) >= 0 ? experimentMetric[x.key] : x.goal;
+    var tableHolder = el("div");
+    function drawTable() { refill(tableHolder, armTable(x, metric)); }
+    var picker = x.metrics.length > 1 ? el("div", { class: "seg metric-pick", role: "group", "aria-label": "Metric" },
+      x.metrics.map(function (m) {
+        var b = el("button", { type: "button", "aria-pressed": String(m === metric), text: m === x.goal ? m + " (goal)" : m,
+          onclick: function () {
+            metric = experimentMetric[x.key] = m;
+            picker.querySelectorAll("button").forEach(function (n) { n.setAttribute("aria-pressed", String(n === b)); });
+            drawTable();
+          } });
+        return b;
+      })) : null;
+    drawTable();
+
+    var about = [x.key, x.multivariate ? "multivariate, " + x.arms.length + " combinations" : x.arms.length + " arms",
+      ALLOCATIONS[x.allocation] + (x.allocation !== "split" ? " (" + pct.format(x.explore) + " split evenly)" : ""),
+      x.pages.length ? "on " + x.pages.join(", ") : x.changes ? "on every page" : "where its markup is, or the page asks",
+      x.audience === "consented" ? "consented visitors only" : "",
+      x.traffic < 1 ? pct.format(x.traffic) + " of visitors" : ""].filter(Boolean).join(" · ");
+    var since = x.since ? num(x.units) + " visitors in " + x.days + " day" + (x.days === 1 ? "" : "s") + ", since " +
+      dayLabel(x.since) + ". " : "";
+    var keys = x.arms.length <= ARM_SLOTS ? x.arms.map(function (a, i) {
+      return { key: a.id, label: a.name, cls: "x" + (i + 1), color: armColor(i) };
+    }) : null;
+    var series = keys ? x.series : x.series.map(function (d) {
+      var total = 0;
+      Object.keys(d).forEach(function (k) { if (k !== "day") total += d[k]; });
+      return { day: d.day, all: total };
+    });
+
+    return el("section", { class: "card experiment" },
+      el("div", { class: "experiment-head" }, el("h2", { text: x.name }),
+        el("span", { class: "pill" + (x.status === "running" ? " pill--good" : ""), text: x.status })),
+      el("p", { class: "sub", text: about }),
+      el("p", { class: "verdict verdict--" + x.verdict.state, text: x.verdict.text }),
+      el("p", { class: "sub", text: since + "Each variant against the original: visitors who reached the metric over " +
+        "those shown the variant, each counted once. Better or worse is called at " + pct.format(x.confidence) +
+        " by an always-valid test, so it can be read on any day without inflating it." }),
+      picker, tableHolder,
+      x.multivariate ? el("details", { class: "table-view" }, el("summary", { text: "Each factor on its own (every arm with that variant, added up)" }),
+        effectsTable(x)) : null,
+      x.series.length ? el("div", { class: "experiment-days" }, el("h3", { text: "New visitors a day, by arm" }),
+        columns(series, keys || [{ key: "all", label: "Visitors", cls: "people", color: "var(--people)" }])) : null,
+      previewLinks(x, url));
+  }
+
+  function experimentsTab() {
+    var holder = el("div", { class: "cards" }, el("p", { class: "empty", text: "Loading experiments…" }));
+    cached("experiments", function () { return get("/experiments"); }).then(function (d) {
+      if (!d.experiments.length) {
+        refill(holder, card("Experiments", "None are set up for " + state.site + ". Add one to carterlitics.toml " +
+          "and ship it with infra/deploy.py code; c.js shows each visitor their arm and counts what they do next.",
+          el("pre", { class: "stack", text: EXPERIMENT_EXAMPLE })));
+        return;
+      }
+      refill(holder, d.experiments.map(function (x) { return experimentCard(x, d.url); }));
+    }, failed(holder));
+    return holder;
   }
 
   /* ---------------------------------------------------------------- forms */
@@ -1105,7 +1277,7 @@
   }
 
   var VIEWS = { overview: overview, traffic: traffic, search: search, bots: bots, visitors: visitors, events: events,
-    funnels: funnels, forms: forms, errors: errors };
+    funnels: funnels, experiments: experimentsTab, forms: forms, errors: errors };
 
   /* ---------------------------------------------------------------- shell */
 

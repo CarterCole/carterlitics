@@ -3,7 +3,9 @@
    <script async src="/_c/c.js"></script>
 
    Always, with no cookie and nothing stored on the device: page views (and SPA
-   navigations), engaged time per page, custom events, and JavaScript errors.
+   navigations), engaged time per page, custom events, and JavaScript errors. The one
+   exception is an experiment: a tab remembers which version of the page it showed
+   (sessionStorage, the variant alone, no id), so the next page shows the same one.
 
    Only after the visitor accepts (the consent banner, or cl("consent", "all")): a
    visitor cookie, a session id, a device fingerprint, and a session recording (rrweb,
@@ -34,6 +36,23 @@
    came back to it, deleted some of it, pasted, were autofilled, were refused by the
    browser's validation or left it empty, and the field they gave up in.
 
+   Experiments (A/B, multivariate and bandit tests, `[[site.experiment]]` in the collector's
+   carterlitics.toml) come inside this file, put in for the site that serves it. Each visitor
+   in one is shown the same arm every time, as far as anything allows: a consented visitor's
+   from their visitor cookie, anyone else's from their network and browser (the collector
+   hashes them and keeps nothing). The arm shown is counted once (per tab, without consent),
+   and so is reaching each of the experiment's metrics after. A variant may bring CSS, text,
+   attributes or a redirect; markup can carry variants too:
+
+     <h1 data-cl-x="hero:a">The original</h1>
+     <h1 data-cl-x="hero:b" hidden>The variant</h1>       // shown, and the original hidden, for b
+
+   An anti-flicker class, which c.js takes off once the page's experiments are shown, and the
+   page itself after 2 s in case c.js never comes:
+     <style>.cl-wait [data-cl-x] { visibility: hidden }</style>
+     <script>(function (h) { h.classList.add("cl-wait");
+       setTimeout(function () { h.classList.remove("cl-wait"); }, 2000); })(document.documentElement)</script>
+
    Options, as attributes on the script tag:
      data-mode="consent"   consent (default) · full (identify without asking) · anonymous
      data-consent-version="2"      raise it when Accept comes to cover more: visitors who
@@ -56,6 +75,7 @@
      cl("identify", "user-123")                 // tie a consented visitor to your user id
      cl("identify", null)                       // signed out: forget it
      cl("who", function (who) { … })            // what the collector makes of this visitor
+     cl("variant", "hero", function (v) { … })  // this visitor's arm ("b"), or null: the original
      cl("submit", form)                         // a form sent some way the browser doesn't call a submit
      window.carterlitics.flush()                // send what's queued now
 
@@ -104,6 +124,12 @@
   var CONSENT_VERSION = /^[1-9]\d{0,5}$/.test(opts.consentVersion || "") ? parseInt(opts.consentVersion, 10) : 1;
   var EXCLUDE = (opts.exclude || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean)
     .concat([BASE]);
+  // The site's own `exclude` in carterlitics.toml (an admin area, sign-in, an API), put in by
+  // the collector as it serves this file. Never recorded, whatever the tag's data-exclude says.
+  var SITE_EXCLUDE = /*__EXCLUDE__*/[];
+  var UNRECORDED = EXCLUDE.concat((Array.isArray(SITE_EXCLUDE) ? SITE_EXCLUDE : []).filter(function (p) {
+    return typeof p === "string" && p.charAt(0) === "/";
+  }));
 
   var OPTED_OUT = nav.globalPrivacyControl === true || nav.doNotTrack === "1" || w.doNotTrack === "1";
   var SECURE = loc.protocol === "https:" ? "; Secure" : "";
@@ -121,7 +147,7 @@
   var ident = null;             // { vid, sid, sd, fp, uid, fresh } once consented
   var wanted = null;            // the page's user id, given before consent: in memory only
   var current = null;           // the path being viewed
-  var lastUrl = d.referrer || "";
+  var lastUrl = bare(d.referrer);  // the page before, for an SPA's next page view's referrer
   var visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
   var engaged = 0;
   var errors = 0;
@@ -151,8 +177,42 @@
     return null;
   }
 
+  function within(prefixes, path) {
+    return prefixes.some(function (p) {
+      var q = p.replace(/\/$/, "");
+      return path === p || path === q || path.indexOf(q + "/") === 0;
+    });
+  }
+
   function excluded(path) {
-    return EXCLUDE.some(function (p) { return path === p || path.indexOf(p.replace(/\/$/, "") + "/") === 0; });
+    return within(EXCLUDE, path);
+  }
+
+  // A page the recording stops for: the tag's data-exclude and the site's own exclude.
+  function unrecorded(path) {
+    return within(UNRECORDED, path);
+  }
+
+  // An address without its query or fragment: a referrer is a site and a page (the collector
+  // reads its host), never what that page was given (a reset token, an email address, an
+  // OAuth #access_token). "" for none.
+  function bare(url) {
+    if (typeof url !== "string" || !url) return "";
+    try {
+      var u = new URL(url);
+      return u.host ? u.protocol + "//" + u.host + u.pathname : "";
+    } catch (e) { return ""; }
+  }
+
+  // Addresses in an error, the same way: an inline script's frames name the page it's on, a
+  // failed image its signed URL. The line and column after one stay. And email addresses,
+  // which a message can hold, become [email].
+  var ADDRESS = /\b([a-z][a-z0-9+.-]*:\/\/[^\s?#()'"<>]*)[?#][^\s()'"<>]*?((?::\d+){1,2})?(?=[\s()'"<>]|$)/gi;
+  var EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g;
+
+  function scrub(text, emails) {
+    var out = String(text || "").replace(ADDRESS, "$1$2");
+    return emails ? out.replace(EMAIL, "[email]") : out;
   }
 
   /* ---------------------------------------------------------------- transport */
@@ -306,7 +366,7 @@
     abandon(over);
     var away = going;
     going = null;
-    if (counting()) {
+    if (counting() && !redirecting) {
       var item = { t: "leave", p: current }, sig = signs();
       if (engaged >= 1000) item.ms = Math.min(Math.round(engaged), 3600000);
       if (away) item.how = away.how;
@@ -346,9 +406,9 @@
       going = going || { how: "page" };   // an SPA's navigation; back or forward if the navigate event said so
       settle(true);
     }
-    var referrer = current === null ? d.referrer : lastUrl;
+    var referrer = current === null ? handedOn() : lastUrl;
     current = path;
-    lastUrl = loc.href;
+    lastUrl = bare(loc.href);
     visibleSince = d.visibilityState === "visible" ? Date.now() : 0;
     viewAt = Date.now();
     viewAway = 0;
@@ -357,11 +417,51 @@
     told = {};
     clicks = [];
     leaving = false;
+    if (ident) record();   // stops on a page it doesn't record, and starts again after
     mark(path);
+    run();
+    if (redirecting) return away(referrer);
     if (!counting()) return Promise.resolve();
     var item = { t: "pv", p: path, r: referrer || null }, u = tags();
     if (u) item.u = u;
-    return enqueue(interaction(item));
+    // A split-URL test still waiting on the collector may send this page elsewhere, and a page
+    // they're sent away from isn't a page they saw: its view waits for the answer.
+    if (pending.some(function (x) { return x.f.length === 1 && x.f[0].lv.some(function (lv) { return lv.go; }); })) {
+      held = { item: item, path: path, referrer: referrer };
+      return Promise.resolve();
+    }
+    return view(item, path);
+  }
+
+  function view(item, path) {
+    var sent = enqueue(interaction(item));
+    reached("page", norm(path));
+    return sent;
+  }
+
+  function release() {
+    var h = held;
+    held = null;
+    if (!h) return;
+    if (redirecting) away(h.referrer);
+    else view(h.item, h.path);
+  }
+
+  // A split-URL test sending this page to its variant's: the exposure goes now, by beacon, and
+  // the page view is the page they land on, which keeps this one's referrer (and its campaign
+  // tags, on the address).
+  function away(referrer) {
+    session("cl_xr", JSON.stringify({ to: redirecting, ref: referrer || "" }));
+    flush(true);
+    try { loc.replace(redirecting); } catch (e) { /* stays on the original */ }
+    return Promise.resolve();
+  }
+
+  // The referrer a split-URL test's redirect handed on, if this page is where it went.
+  function handedOn() {
+    var got = parsed(session("cl_xr"));
+    session("cl_xr", null);
+    return typeof got.to === "string" && got.to === loc.href && typeof got.ref === "string" ? bare(got.ref) : bare(d.referrer);
   }
 
   function watchNavigation() {
@@ -442,7 +542,9 @@
     }
     var item = { t: "ev", n: name.slice(0, 64), props: clean };
     // Google's non_interaction: it happened, but the visitor didn't do it.
-    return enqueue(clean.non_interaction === true ? item : interaction(item));
+    var sent = enqueue(clean.non_interaction === true ? item : interaction(item));
+    reached("event", item.n, clean, clean.value);
+    return sent;
   }
 
   /* ---------------------------------------------------------------- forms */
@@ -552,6 +654,7 @@
       a = { box: hit.box, key: hit.form, path: current, id: rid(), start: t, lead: t - viewAt - viewAway,
             away: 0, fields: Object.create(null), order: [], last: "", tries: 0, left: 0, leftAway: 0 };
       attempts.push(a);
+      reached("form", a.key, {});
     }
     a.dirty = true;
     return a;
@@ -666,7 +769,9 @@
 
   function finish(a) {
     a.done = true;
-    return enqueue(attemptItem(a, "submit"));
+    var sent = enqueue(attemptItem(a, "submit"));
+    reached("form", a.key, { res: "submit", last: a.last });
+    return sent;
   }
 
   // Whether a field has anything in it (a radio group or checkboxes: any of them checked).
@@ -714,6 +819,7 @@
   function abandon(over) {
     each(attempts, function (a) {
       if (!a.done && a.dirty) queue.push(attemptItem(a, "abandon"));
+      if (over && !a.done && a.order.length) reached("form", a.key, { res: "abandon", last: a.last });
     });
     if (over) attempts = [];
   }
@@ -748,14 +854,482 @@
     });
   }
 
+  /* ---------------------------------------------------------------- experiments */
+
+  // The site's experiments, put in by the collector as it serves this file
+  // (experiments.client): [{ k: key, s: "run" | "done" | "draft", f: [{ id, lv: [{ id, css, text,
+  // attrs, go }] }] (factors, each with its variants), arms: [{ id, w }], m: [{ t, k, n, p }]
+  // (the goal, then its other metrics), pages, tr (traffic), aud, win }].
+  //
+  // An experiment touches a page view when the page is one of its `pages` (every page, for one
+  // with no pages that changes CSS, text or attributes), when its markup (data-cl-x) is on the
+  // page, or when the page asks for it (cl("variant")). Then the visitor gets their arm, sees it,
+  // and is counted as exposed, once. Which arm is the same every time, as far as anything
+  // allows: a number from 0 to 1, cut by the arms' shares, from the visitor cookie for a
+  // consented visitor, else from the collector (GET /x: their network and browser, hashed; it
+  // keeps nothing). The arm shown is remembered for the tab (sessionStorage: only that, no id),
+  // and with consent for good (localStorage), so neither a new network nor a bandit moving its
+  // shares changes what someone has already seen. Do Not Track, GPC and automation see the
+  // original, and nothing is kept or sent.
+  //
+  // After exposure, each metric reached (a page, an event, a form, as funnel steps say them) is
+  // sent: every time, and the first time marked (`u`), so the collector counts visitors who
+  // converted. ?cl_x=key:variant previews a variant in this tab (a draft's too), never counted;
+  // ?cl_x= ends the preview.
+  var EXPERIMENTS = /*__EXPERIMENTS__*/null;
+  var XS = Array.isArray(EXPERIMENTS) ? EXPERIMENTS : [];
+  var BY_KEY = {};
+  each(XS, function (x) { BY_KEY[x.k] = x; });
+  var XWAIT = 1500;             // ms a page view waits for the collector before showing the original
+  var shown = {};               // this page view's experiments: key -> the arm shown ("" for the original)
+  var pending = [];             // ... waiting on the collector's answer
+  var asks = [];                // cl("variant") calls waiting with them
+  var buckets = null;           // the collector's answer: null (not asked), "asking", false (none), { key: 0..1 }
+  var preview = null;           // ?cl_x: key -> arm, for this tab
+  var sheets = {};              // key -> its <style>
+  var rules = [];               // text and attribute changes in force: [selector, change(el)]
+  var redirecting = "";         // where a split-URL test is sending this page
+  var held = null;              // this page's view, while a split-URL test waits on the collector
+  var revealed = false;
+  var RE = {};
+
+  function local(key, value) {
+    try {
+      if (value === undefined) return localStorage.getItem(key);
+      if (value === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, value);
+    } catch (e) { /* storage blocked */ }
+    return null;
+  }
+
+  // Whether the tab can remember an arm. Without that, a visitor would be counted again on
+  // every page, so they aren't put in experiments at all. Asked only when an experiment needs
+  // it: a site running none never touches storage for this.
+  var keeps = null;
+
+  function canKeep() {
+    if (keeps === null) {
+      try {
+        sessionStorage.setItem("cl_t", "1");
+        sessionStorage.removeItem("cl_t");
+        keeps = true;
+      } catch (e) { keeps = false; }
+    }
+    return keeps;
+  }
+
+  function parsed(raw) {
+    try {
+      var out = JSON.parse(raw || "{}");
+      return out && typeof out === "object" && !Array.isArray(out) ? out : {};
+    } catch (e) { return {}; }
+  }
+
+  // Each experiment's arm for this tab, and with consent the visitor's: { key: { v: arm or "",
+  // s: exposure sent, c: [metrics sent] } }. A consented visitor's own come first.
+  function records() {
+    var all = parsed(session("cl_x"));
+    if (ident) {
+      var mine = parsed(local("cl_x"));
+      Object.keys(mine).forEach(function (k) { all[k] = mine[k]; });
+    }
+    return all;
+  }
+
+  function keep(all) {
+    var raw = JSON.stringify(all);
+    session("cl_x", raw);
+    if (ident) local("cl_x", raw);
+  }
+
+  // MurmurHash3 (32-bit) of a consented visitor's cookie and the experiment, from 0 to 1.
+  function murmur(text) {
+    var h = 0, n = text.length, i = 0, k;
+    function mix(v) {
+      v = Math.imul(v, 0xcc9e2d51);
+      v = (v << 15) | (v >>> 17);
+      return Math.imul(v, 0x1b873593);
+    }
+    for (; i + 4 <= n; i += 4) {
+      k = (text.charCodeAt(i) & 0xff) | ((text.charCodeAt(i + 1) & 0xff) << 8) |
+        ((text.charCodeAt(i + 2) & 0xff) << 16) | ((text.charCodeAt(i + 3) & 0xff) << 24);
+      h ^= mix(k);
+      h = (h << 13) | (h >>> 19);
+      h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    }
+    k = 0;
+    if (n - i === 3) k ^= (text.charCodeAt(i + 2) & 0xff) << 16;
+    if (n - i >= 2) k ^= (text.charCodeAt(i + 1) & 0xff) << 8;
+    if (n - i >= 1) h ^= mix(k ^ (text.charCodeAt(i) & 0xff));
+    h ^= n;
+    h ^= h >>> 16;
+    h = Math.imul(h, 0x85ebca6b);
+    h ^= h >>> 13;
+    h = Math.imul(h, 0xc2b2ae35);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  }
+
+  function armOf(x, id) {
+    var hit = null;
+    each(x.arms, function (a) { if (a.id === id) hit = a; });
+    return hit;
+  }
+
+  // Where `u` (0 to 1) falls: past the experiment's traffic, the original and no test;
+  // otherwise along the arms' shares, in order.
+  function pick(x, u) {
+    var traffic = x.tr || 1, at = 0, out = x.arms[x.arms.length - 1].id;
+    if (u >= traffic) return "";
+    u = u / traffic;
+    for (var i = 0; i < x.arms.length; i++) {
+      at += x.arms[i].w;
+      if (u < at) { out = x.arms[i].id; break; }
+    }
+    return out;
+  }
+
+  function forced() {
+    if (!preview) preview = parsed(session("cl_xf"));
+    return preview;
+  }
+
+  // ?cl_x=hero:b,cta:c previews those arms in this tab; ?cl_x= ends it.
+  function forcing() {
+    var q = null;
+    try { q = new URL(loc.href).searchParams.get("cl_x"); } catch (e) { /* no URL */ }
+    if (q === null) return;
+    var out = {};
+    each(q.split(","), function (pair) {
+      var at = pair.lastIndexOf(":"), x = BY_KEY[pair.slice(0, at)], v = pair.slice(at + 1);
+      if (at > 0 && x && armOf(x, v)) out[x.k] = v;
+    });
+    preview = out;
+    session("cl_xf", Object.keys(out).length ? JSON.stringify(out) : null);
+  }
+
+  function previewing(x) { return forced()[x.k] !== undefined; }
+
+  function eligible(x) {
+    return !OPTED_OUT && !nav.webdriver && canKeep() && !DRIVER && (x.aud !== "consent" || Boolean(ident));
+  }
+
+  // The arm this visitor sees, "" for the original, or null: not known until the collector answers.
+  function arm(x) {
+    if (previewing(x)) return forced()[x.k];
+    if (x.s === "done") return x.win || "";
+    if (x.s !== "run" || !eligible(x)) return "";
+    var all = records(), r = all[x.k];
+    if (r && typeof r.v === "string" && (r.v === "" || armOf(x, r.v))) return r.v;
+    var u = ident ? murmur(ident.vid + "|" + x.k) : buckets && typeof buckets === "object" ? buckets[x.k] : undefined;
+    if (typeof u !== "number") return buckets === null || buckets === "asking" ? null : "";
+    all[x.k] = { v: pick(x, Math.max(0, Math.min(u, 0.999999))) };
+    keep(all);
+    return all[x.k].v;
+  }
+
+  function levels(x, v) {
+    var ids = v ? v.split(".") : [], out = [];
+    each(x.f, function (f, i) {
+      each(f.lv, function (lv) { if (lv.id === ids[i]) out.push(lv); });
+    });
+    return out;
+  }
+
+  // The experiment on this page view: its arm, shown, and counted once.
+  function touch(x) {
+    if (x.k in shown) return shown[x.k];
+    var v = arm(x);
+    if (v === null) {
+      if (pending.indexOf(x) < 0) pending.push(x);
+      place();
+      return null;
+    }
+    shown[x.k] = v;
+    show(x, v);
+    expose(x, v);
+    return v;
+  }
+
+  function show(x, v) {
+    var css = [];
+    each(levels(x, v), function (lv) {
+      if (lv.css) css.push(lv.css);
+      each(lv.text || [], function (t) {
+        rules.push([t[0], function (el) { if (el.textContent !== t[1]) el.textContent = t[1]; }]);
+      });
+      each(lv.attrs || [], function (a) {
+        rules.push([a[0], function (el) {
+          each(a[1], function (p) { if (el.getAttribute(p[0]) !== p[1]) el.setAttribute(p[0], p[1]); });
+        }]);
+      });
+      if (lv.go && !redirecting && onPage(x)) {
+        var to = new URL(lv.go, loc.href);
+        if (!to.search) to.search = loc.search;   // campaign tags go along
+        // A path on this site only, whatever the config let through: never another site.
+        if (to.origin === loc.origin && to.pathname !== loc.pathname) redirecting = to.href;
+      }
+    });
+    if (css.length) sheet(x.k, css.join("\n"));
+  }
+
+  // The page brought up to date: markup shown or hidden (touching experiments it belongs to),
+  // then every text and attribute change applied.
+  function paint() {
+    scan(d);
+    fix(d);
+  }
+
+  function sheet(key, css) {
+    var el = sheets[key];
+    if (!el) {
+      el = sheets[key] = d.createElement("style");
+      el.setAttribute("data-cl-style", key);
+      (d.head || d.documentElement).appendChild(el);
+    }
+    el.stale = false;
+    if (el.textContent !== css) el.textContent = css;
+  }
+
+  function expose(x, v) {
+    if (!v || x.s !== "run" || previewing(x)) return;
+    var all = records(), r = all[x.k];
+    if (!r || r.v !== v || r.s) return;
+    r.s = 1;
+    keep(all);
+    enqueue({ t: "x", e: x.k, v: v });
+  }
+
+  // A `*` pattern (config.Step), matched without a regex: `.*a.*b.*c` backtracks for seconds
+  // on a long enough path, which anyone can link to. The first part starts it, the last ends
+  // it, and each part between is found after the one before: the same answer, in one pass.
+  function glob(text) {
+    if (!RE[text]) {
+      var parts = text.split("*");
+      RE[text] = { test: function (value) {
+        value = String(value);
+        var first = parts[0], last = parts[parts.length - 1];
+        if (parts.length === 1) return value === first;
+        if (value.length < first.length + last.length || value.slice(0, first.length) !== first ||
+            value.slice(value.length - last.length) !== last) return false;
+        var at = first.length, end = value.length - last.length;
+        for (var i = 1; i < parts.length - 1; i++) {
+          var found = value.indexOf(parts[i], at);
+          if (found < 0 || found + parts[i].length > end) return false;
+          at = found + parts[i].length;
+        }
+        return true;
+      } };
+    }
+    return RE[text];
+  }
+
+  // A path as the collector counts it: /x, /x/, /x.html and /x/index.html are all /x.
+  function norm(path) {
+    path = String(path || "/").split("?")[0].split("#")[0];
+    if (/\/index\.html$/.test(path)) path = path.slice(0, -10);
+    else if (/\.html$/.test(path)) path = path.slice(0, -5);
+    path = path.replace(/\/+$/, "") || "/";
+    return path === "/index" ? "/" : path;
+  }
+
+  function onPage(x) {
+    if (!x.pages) {
+      return x.f.some(function (f) { return f.lv.some(function (lv) { return lv.css || lv.text || lv.attrs; }); });
+    }
+    var path = norm(current);
+    return x.pages.some(function (p) { return glob(p).test(path); });
+  }
+
+  // A property as a metric's key=value compares it: the text JSON would give.
+  function propText(v) {
+    if (v === null) return "null";
+    return typeof v === "boolean" ? (v ? "true" : "false") : String(v);
+  }
+
+  // A page view, event or form reached: a conversion for every experiment this visitor was
+  // exposed to that has it as a metric, the first time marked.
+  function reached(kind, name, props, value) {
+    if (!XS.length) return;
+    var all = records(), changed = false;
+    each(XS, function (x) {
+      var r = all[x.k];
+      if (x.s !== "run" || !r || !r.s || !r.v || previewing(x)) return;
+      each(x.m, function (m) {
+        if (m.k !== kind || !glob(m.n).test(name || "")) return;
+        if ((m.p || []).some(function (p) { return !props || !(p[0] in props) || propText(props[p[0]]) !== p[1]; })) return;
+        var item = { t: "xc", e: x.k, v: r.v, g: m.t };
+        r.c = r.c || [];
+        if (r.c.indexOf(m.t) < 0) {
+          r.c.push(m.t);
+          item.u = 1;
+          changed = true;
+        }
+        if (typeof value === "number" && isFinite(value) && value > 0) item.val = value;
+        enqueue(item);
+      });
+    });
+    if (changed) keep(all);
+  }
+
+  // Markup that carries variants: data-cl-x="key:variant" (in a multivariate test,
+  // "key.factor:variant"). The page as written is what the original shows, its variants'
+  // markup `hidden`; for a visitor shown a variant, its markup shows and the rest hides.
+  // Markup on the page touches its experiment.
+  function scan(root) {
+    if (!XS.length || !root || current === null || excluded(current)) return;
+    var found = [];
+    try {
+      if (root.matches && root.matches("[data-cl-x]")) found.push(root);
+      each(root.querySelectorAll ? root.querySelectorAll("[data-cl-x]") : [], function (el) { found.push(el); });
+    } catch (e) { return; }
+    each(found, function (el) {
+      var hide = null;
+      each(String(attr(el, "data-cl-x")).split(/\s+/), function (token) {
+        var at = token.indexOf(":"), name = token.slice(0, at).split("."), x = BY_KEY[name[0]];
+        if (at < 1 || !x) return;
+        var i = -1;
+        each(x.f, function (f, n) { if (f.id === (name[1] || "")) i = n; });
+        var v = i < 0 ? "" : touch(x);
+        if (v) hide = Boolean(hide) || v.split(".")[i] !== token.slice(at + 1);
+      });
+      if (hide !== null && el.hidden !== hide) el.hidden = hide;
+    });
+  }
+
+  // Text and attribute changes, on `root` and in it: the page as it is, and what it adds later.
+  function fix(root) {
+    each(rules, function (rule) {
+      try {
+        if (root.matches && root.matches(rule[0])) rule[1](root);
+        each(root.querySelectorAll ? root.querySelectorAll(rule[0]) : [], rule[1]);
+      } catch (e) { /* a selector this browser won't take */ }
+    });
+  }
+
+  // Each page view: the experiments it touches, from scratch. A sheet no experiment wants
+  // now goes; text and attributes already changed stay, as an SPA renders its next page anew.
+  function run() {
+    shown = {};
+    rules = [];
+    each(Object.keys(sheets), function (k) { sheets[k].stale = true; });
+    if (XS.length && !excluded(current)) {
+      each(XS, function (x) { if (onPage(x)) touch(x); });
+      paint();
+    }
+    each(Object.keys(sheets), function (k) {
+      if (!sheets[k].stale) return;
+      if (sheets[k].parentNode) sheets[k].parentNode.removeChild(sheets[k]);
+      delete sheets[k];
+    });
+    if (!pending.length) reveal();
+  }
+
+  // Where this visitor falls in each experiment, asked of the collector once a page load, for
+  // a visitor without consent who has no arm yet. An answer later than XWAIT leaves this page
+  // view with the original, uncounted, and picks their arms for the pages after.
+  function place() {
+    if (buckets !== null) return;
+    buckets = "asking";
+    var late = false;
+    var timer = setTimeout(function () {
+      late = true;
+      each(pending, function (x) { if (!(x.k in shown)) shown[x.k] = ""; });
+      release();
+      answer();
+      reveal();
+    }, XWAIT);
+    // Given up on after a while, so a collector that never answers can't keep the asks
+    // (and a page awaiting cl("variant")) waiting for the rest of the visit.
+    var ctl = typeof w.AbortController === "function" ? new w.AbortController() : null;
+    var limit = ctl ? setTimeout(function () { ctl.abort(); }, 10 * XWAIT) : 0;
+    fetch(BASE + "/x", { credentials: "omit", cache: "no-store", signal: ctl ? ctl.signal : undefined }).then(function (res) {
+      return res.ok ? res.json() : null;
+    }).then(null, function () { return null; }).then(function (got) {
+      clearTimeout(timer);
+      clearTimeout(limit);
+      buckets = got && got.u && typeof got.u === "object" ? got.u : false;
+      var list = pending;
+      pending = [];
+      each(list, function (x) {
+        if (late) {
+          arm(x);                         // kept for the next page view
+          if (!(x.k in shown)) shown[x.k] = "";   // this one, asked of since, keeps the original
+        } else if (!(x.k in shown)) touch(x);
+      });
+      if (!late) {
+        paint();
+        release();
+      }
+      answer();
+      reveal();
+    });
+  }
+
+  function answer() {
+    var list = asks;
+    asks = [];
+    each(list, function (a) {
+      if (a.x.k in shown) a.resolve(variantOf(a.x, shown[a.x.k], a.factor));
+      else asks.push(a);
+    });
+  }
+
+  function variantOf(x, v, factor) {
+    if (!v) return null;
+    if (factor === undefined) return v;
+    var i = -1;
+    each(x.f, function (f, n) { if (f.id === factor) i = n; });
+    return i < 0 ? null : v.split(".")[i];
+  }
+
+  // cl("variant", "hero") -> "b" (a multivariate test's arm, "a.blue"; "hero.button" -> "blue"),
+  // or null: the original, as the page is written. Asking touches the experiment.
+  function variant(name, callback) {
+    var parts = String(name || "").split("."), x = BY_KEY[parts[0]];
+    var out = new Promise(function (resolve) {
+      if (!x || excluded(current || loc.pathname)) return resolve(null);
+      var fresh = !(x.k in shown), v = touch(x);
+      if (v === null) return asks.push({ x: x, factor: parts[1], resolve: resolve });
+      if (fresh) paint();
+      resolve(variantOf(x, v, parts[1]));
+    });
+    if (typeof callback === "function") out.then(callback);
+    return out;
+  }
+
+  // Off with the page's anti-flicker class, once its experiments are shown (or given up on).
+  function reveal() {
+    if (revealed) return;
+    revealed = true;
+    try { d.documentElement.classList.remove("cl-wait"); } catch (e) { /* no class to take off */ }
+  }
+
+  function watchExperiments() {
+    if (!XS.length) return reveal();
+    if (d.readyState === "loading") {
+      d.addEventListener("DOMContentLoaded", paint);
+    }
+    if (typeof w.MutationObserver !== "function") return;
+    new w.MutationObserver(function (list) {
+      each(list, function (m) {
+        each(m.addedNodes || [], function (n) {
+          if (n.nodeType !== 1) return;
+          scan(n);
+          fix(n);
+        });
+      });
+    }).observe(d.documentElement, { childList: true, subtree: true });
+  }
+
   /* ---------------------------------------------------------------- Google's tracking calls */
 
   var GA_SKIP = { event: 1, event_callback: 1, event_timeout: 1, eventCallback: 1, eventTimeout: 1,
     send_to: 1, hitCallback: 1 };
 
   function each(list, fn) {
-    Array.prototype.forEach.call(list, function (item) {
-      try { fn(item); } catch (e) { /* a page's odd call must never break its own push */ }
+    Array.prototype.forEach.call(list, function (item, i) {
+      try { fn(item, i); } catch (e) { /* a page's odd call must never break its own push */ }
     });
   }
 
@@ -933,12 +1507,12 @@
     var message = extra.m || (err && err.message) || (typeof err === "string" ? err : "") ||
       (err !== undefined ? String(err) : "Unknown error");
     var item = {
-      t: "err", k: kind, m: String(message).slice(0, 500),
+      t: "err", k: kind, m: scrub(message, true).slice(0, 500),
       name: (err && err.name) || extra.name || "",
-      st: err && err.stack ? String(err.stack).slice(0, 4000) : "",
-      src: extra.src || "", ln: extra.ln || 0, col: extra.col || 0
+      st: err && err.stack ? scrub(err.stack).slice(0, 4000) : "",
+      src: scrub(extra.src), ln: extra.ln || 0, col: extra.col || 0
     };
-    if (extra.context) item.st = (item.st ? item.st + "\n" : "") + "context: " + JSON.stringify(extra.context).slice(0, 500);
+    if (extra.context) item.st = (item.st ? item.st + "\n" : "") + "context: " + scrub(safe(extra.context), true).slice(0, 500);   // safe: a circular one doesn't throw into the page
     var key = kind + "|" + item.m + "|" + item.st.slice(0, 300);
     if (seen[key]) return Promise.resolve();
     seen[key] = 1;
@@ -1158,6 +1732,7 @@
   function forget() {
     quiet();
     cookie("vid", "", 0);
+    local("cl_x", null);
     ["cl_sid", "cl_sd", "cl_seq", "cl_uid", "cl_at"].forEach(function (k) { session(k, null); });
     ident = null;
   }
@@ -1175,21 +1750,75 @@
     });
   }
 
+  // The recording follows the page: it starts with consent, stops on a page it doesn't record
+  // (`unrecorded`: an admin area, sign-in) and starts again, from a fresh snapshot, on the next
+  // page it does. Stopping drops what it hadn't sent yet, which may already hold the new page.
   function record() {
-    if (!RECORD || recorder || !ident || excluded(loc.pathname)) return;
+    if (!RECORD || !ident) return;
+    if (unrecorded(here())) return pause();
+    if (recorder) return resume();
     recorder = { buffer: [] };
     load(RRWEB).then(function () {
-      if (!ident || !w.rrweb) return;
-      recorder.stop = w.rrweb.record({
-        emit: function (event) { recorder.buffer.push(event); },
-        maskAllInputs: true,
-        blockSelector: "[data-private]",
-        maskTextSelector: "[data-mask]",
-        sampling: { mousemove: 50, scroll: 150, input: "last" }
-      });
+      if (!recorder || !ident || !w.rrweb) return;
+      recorder.ready = true;
       recorder.timer = setInterval(ship, 5000);
+      resume();
     }, function () { recorder = null; });
   }
+
+  function here() {
+    return current !== null ? current : loc.pathname;
+  }
+
+  function resume() {
+    if (!recorder || !recorder.ready || recorder.stop || !ident || unrecorded(here())) return;
+    recorder.stop = w.rrweb.record({
+      emit: function (event) {
+        // A page load's Meta event names its address: the page alone, as a referrer is.
+        if (event && event.type === 4 && event.data && typeof event.data.href === "string") {
+          event.data.href = bare(event.data.href);
+        }
+        recorder.buffer.push(event);
+      },
+      // Every kind of input masked (rrweb's maskAllInputs leaves out hidden ones, which carry
+      // CSRF and reset tokens), and to the same length whatever was typed: no password's length.
+      maskInputOptions: MASKED_INPUTS,
+      maskInputFn: function (value) { return value ? "*****" : ""; },
+      blockSelector: BLOCKED,
+      // Every text goes through maskText, which decides: all of it in [data-mask], and an
+      // email address anywhere, since a signed-in page shows its visitor's.
+      maskTextSelector: "*",
+      maskTextFn: maskText,
+      sampling: { mousemove: 50, scroll: 150, input: "last" }
+    });
+  }
+
+  function pause() {
+    if (!recorder || !recorder.stop) return;
+    try { recorder.stop(); } catch (e) { /* stopped already */ }
+    recorder.stop = null;
+    recorder.buffer = [];
+  }
+
+  function stars(text) {
+    return text.replace(/\S/g, "*");
+  }
+
+  // rrweb gives the text's element; without one, nothing says it isn't in [data-mask].
+  function maskText(text, el) {
+    if (typeof text !== "string") return "";
+    // Text typed into a rich-text editor is text, not an input's value: masked like one.
+    if (!el || typeof el.closest !== "function" || el.closest(TYPED)) return stars(text);
+    return text.replace(EMAIL, stars);
+  }
+
+  var TYPED = "[data-mask],[contenteditable]:not([contenteditable=false])";
+  var MASKED_INPUTS = { color: true, date: true, "datetime-local": true, email: true, month: true, number: true,
+    range: true, search: true, tel: true, text: true, time: true, url: true, week: true, textarea: true,
+    select: true, password: true, hidden: true };
+  // Left out of a recording altogether: what the page marks private, and the tokens a page
+  // keeps in its markup for its own requests.
+  var BLOCKED = "[data-private],meta[name*=csrf i],meta[name*=token i]";
 
   // A fresh snapshot of the whole page for the replay to go on from: under a new session,
   // or for a page the back/forward cache brought back, whose changes would otherwise land
@@ -1266,10 +1895,11 @@
 
   function apply(value) {
     if (value === "all" && MODE !== "anonymous" && identify()) {
+      if (XS.length && canKeep()) keep(records());   // the arms this tab has shown are the visitor's from now on
       // Consent given on this page: its view was already counted, so log it once more
       // for the session only (`dup`), then start recording.
       if (current !== null && counting()) {
-        enqueue(interaction({ t: "pv", p: current, r: d.referrer || null, dup: true }));
+        enqueue(interaction({ t: "pv", p: current, r: bare(d.referrer) || null, dup: true }));
       }
       record();
     } else if (value !== "all") {
@@ -1354,6 +1984,7 @@
       return true;
     },
     who: who,
+    variant: variant,
     submit: submitted,
     flush: function () { return flush(false); }
   };
@@ -1380,6 +2011,8 @@
     watchConsent();
     watchClicks();
     watchForms();
+    forcing();
+    watchExperiments();
 
     if (MODE === "full") apply("all");
     else if (MODE === "consent" && OPTED_OUT) forget();

@@ -20,6 +20,13 @@
    wait (ms to let the page's own timers run before the last flush), probe (an expression
    evaluated last).
 
+   Experiments: `experiments` is what the collector puts in c.js for the site (a list), and
+   `local` the localStorage to start with, and `delay` how long (ms) a GET's answer takes. For page code, `node(tag, attrs, selectors)` is an
+   element on the page: attrs are its attributes (`data-cl-x`, `hidden`, `text` for its
+   text), selectors the CSS selectors it answers to. The output adds `session` and `local` (the
+   storage as c.js left it), `styles` ([key, css] of each <style> c.js put in), `nodes` (each
+   element's hidden, text and attributes, in order) and `classes` (<html>'s classes).
+
    Forms, for page code: `form(attrs)` is a stand-in <form> (`form(attrs, "DIV")` a box
    that isn't one, for [data-cl-form]), and `form.add(tag, attrs)` a field in it ("INPUT",
    "SELECT", "TEXTAREA"; attrs are its attributes, with `type`, `value`, `checked` and
@@ -39,6 +46,7 @@ const posts = [];
 const log = [];
 const cookies = Object.assign({}, spec.cookies || {});
 const stored = Object.assign({}, spec.session || {});
+const kept = Object.assign({}, spec.local || {});
 const gets = [];
 const answers = [].concat(spec.answers === undefined ? [null] : spec.answers);
 const address = new URL(spec.url || "https://a.example/start");
@@ -75,7 +83,7 @@ const page = {
   innerWidth: 1280,
   Blob: class { constructor(parts) { this.text = parts.join(""); } },
   location: { href: address.href, pathname: address.pathname, search: address.search, protocol: address.protocol,
-              host: address.host, origin: address.origin },
+              host: address.host, origin: address.origin, replace(url) { log.push(["replace", url]); } },
   navigator: {
     userAgent: "harness", languages: ["en"], doNotTrack: spec.dnt ? "1" : null,
     sendBeacon(url, blob) {
@@ -90,15 +98,24 @@ const page = {
     setItem: (k, v) => { stored[k] = String(v); },
     removeItem: (k) => { delete stored[k]; }
   },
+  localStorage: {
+    getItem: (k) => (k in kept ? kept[k] : null),
+    setItem: (k, v) => { kept[k] = String(v); },
+    removeItem: (k) => { delete kept[k]; }
+  },
   // 11111111-2222-4333-8444-555555555555 first (the tests' SID), then the next ones.
   crypto: { randomUUID: () => "11111111-2222-4333-8444-" + (0x555555555555 + uuids++).toString(16) },
   fetch(url, init) {
     if (init.method !== "POST") {
       gets.push(url);
       const answer = answers.length > 1 ? answers.shift() : answers[0];
-      if (answer === null) return Promise.reject(new TypeError("Failed to fetch"));
-      if (typeof answer === "number") return Promise.resolve({ ok: false, status: answer });
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(JSON.parse(JSON.stringify(answer))) });
+      // A slow collector: the answer comes `delay` ms later.
+      const later = spec.delay ? new Promise((resolve) => setTimeout(resolve, spec.delay)) : Promise.resolve();
+      return later.then(() => {
+        if (answer === null) throw new TypeError("Failed to fetch");
+        if (typeof answer === "number") return { ok: false, status: answer };
+        return { ok: true, status: 200, json: () => Promise.resolve(JSON.parse(JSON.stringify(answer))) };
+      });
     }
     posts.push({ url, body: JSON.parse(init.body) });
     return Promise.resolve({});
@@ -137,12 +154,25 @@ page.document = {
     cookies[pair.slice(0, i)] = pair.slice(i + 1);
   },
   querySelector: () => null,
+  querySelectorAll: (sel) => nodes.filter((n) => n.matches(sel)),
   addEventListener: listen("document"),
-  createElement: () => ({ getContext: () => null }),
+  createElement: (tag) => (tag === "style" ? element("STYLE", {}, null) : { getContext: () => null }),
+  documentElement: {
+    classes: new Set(spec.classes || []),
+    get classList() {
+      const c = this.classes;
+      return { add: (k) => c.add(k), remove: (k) => c.delete(k), contains: (k) => c.has(k) };
+    }
+  },
   head: {
     appendChild(el) {
+      if (el.tagName === "STYLE") {
+        styles.push(el);
+        el.parentNode = { removeChild: (x) => styles.splice(styles.indexOf(x), 1) };
+        return;
+      }
       if (!spec.rrweb || !el.src || !el.onload) return;
-      const record = () => { log.push("record"); return () => {}; };
+      const record = (options) => { log.push("record"); page.rrwebOptions = options; return () => { log.push("stop"); }; };
       record.takeFullSnapshot = () => { log.push("snapshot"); };
       record.addCustomEvent = (tag, payload) => { log.push(["custom", tag, payload]); };
       page.rrweb = { record };
@@ -151,8 +181,10 @@ page.document = {
   }
 };
 
-// Stand-in forms and fields: what c.js asks of them, no more.
+// Stand-in forms and fields, and elements on the page: what c.js asks of them, no more.
 const forms = [];
+const nodes = [];
+const styles = [];
 page.document.forms = forms;
 page.document.activeElement = null;
 let windowFocus = true;
@@ -165,17 +197,29 @@ function element(tag, attrs, box) {
     nodeType: 1, tagName: tag, box: box || null, form: box && box.tagName === "FORM" ? box : null,
     type: attrs.type || (tag === "INPUT" ? "text" : tag === "SELECT" ? "select-one" : tag.toLowerCase()),
     value: attrs.value || "", checked: Boolean(attrs.checked), autofilled: false,
-    getAttribute: (k) => (k in attrs && !["value", "checked", "private"].includes(k) ? String(attrs[k]) : null),
+    hidden: Boolean(attrs.hidden), textContent: attrs.text || "", selectors: [],
+    getAttribute: (k) => (k in attrs && !["value", "checked", "private", "hidden", "text"].includes(k) ? String(attrs[k]) : null),
+    setAttribute: (k, v) => { attrs[k] = String(v); },
+    attributes: () => attrs,
     closest(sel) {
       if (sel === "[data-private]") return flags.private ? {} : null;
       if (!el.box) return null;
       if (sel === "[data-cl-form]") return el.box.tagName !== "FORM" && el.box.getAttribute("data-cl-form") !== null ? el.box : null;
       return el.box;
     },
-    matches: (sel) => (/autofill/.test(sel) ? el.autofilled : false)
+    matches: (sel) => (/autofill/.test(sel) ? el.autofilled
+      : sel === "[data-cl-x]" ? "data-cl-x" in attrs : el.selectors.includes(sel)),
+    querySelectorAll: () => []
   };
   return el;
 }
+
+page.node = (tag, attrs, selectors) => {
+  const el = element(tag, attrs, null);
+  el.selectors = selectors || [];
+  nodes.push(el);
+  return el;
+};
 
 page.form = (attrs, tag) => {
   const box = element(tag || "FORM", attrs);
@@ -225,7 +269,8 @@ page.elsewhere = (ms) => {
 };
 
 vm.createContext(page);
-const client = fs.readFileSync(path.join(__dirname, "..", "carterlitics", "static", "c.js"), "utf8");
+let client = fs.readFileSync(path.join(__dirname, "..", "carterlitics", "static", "c.js"), "utf8");
+if (spec.experiments) client = client.replace("/*__EXPERIMENTS__*/null", JSON.stringify(spec.experiments));
 
 (async () => {
   vm.runInContext(spec.before || "", page, { filename: "before.js" });
@@ -243,7 +288,12 @@ const client = fs.readFileSync(path.join(__dirname, "..", "carterlitics", "stati
     gets,
     log,
     console: said,
-    probe
+    probe,
+    session: stored,
+    local: kept,
+    styles: styles.map((el) => [el.getAttribute("data-cl-style"), el.textContent]),
+    nodes: nodes.map((el) => ({ hidden: el.hidden, text: el.textContent, attrs: el.attributes() })),
+    classes: [...page.document.documentElement.classes]
   }));
   process.exit(0);   // c.js's own fallback timers (2 s callback timeouts) needn't run out
 })().catch((e) => {

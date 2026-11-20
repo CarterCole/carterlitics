@@ -183,6 +183,60 @@
 
   /* ---------------------------------------------------------------- pages and stitching */
 
+  // A recording is whatever was posted to /_c/r, and anyone can post one: so only what c.js
+  // records is played, and nothing in it may run or call out. rrweb builds some of a
+  // recording's nodes in this page's own document while it seeks, where the CSP is all that
+  // stands between an onerror attribute and the console. Kept: the DOM's events (load,
+  // snapshot, its changes, Meta) and c.js's `page` marks; not canvas, fonts or console logs
+  // (rrweb rebuilds those by calling whatever a recording names), nor captions or other
+  // custom events, which the player draws over the console. Each node loses its handlers,
+  // script URLs, srcdoc, a refresh, and a link that isn't a stylesheet (a preconnect would
+  // tell its host the recording was watched).
+  var KEPT_TYPES = { 0: true, 1: true, 2: true, 3: true, 4: true };
+  var DROPPED_SOURCES = { 9: true, 10: true, 11: true };   // CanvasMutation, Font, Log
+  var SCRIPT_URL = /^(javascript|vbscript|data:text\/html)/i;
+
+  function sane(e) {
+    return e && typeof e === "object" && typeof e.timestamp === "number" && isFinite(e.timestamp) &&
+      Math.abs(e.timestamp) < 8.64e15;   // new Date() takes it: the page list shows its time
+  }
+
+  function cleanAttrs(attrs, tag) {
+    if (!attrs || typeof attrs !== "object") return;
+    Object.keys(attrs).forEach(function (name) {
+      var key = name.toLowerCase(), value = attrs[name];
+      var bare = typeof value === "string" ? value.replace(/[\u0000- ]/g, "") : "";
+      if (key.slice(0, 2) === "on" || key === "srcdoc" || SCRIPT_URL.test(bare) ||
+          (key === "http-equiv" && /refresh/i.test(bare)) ||
+          (tag === "link" && key === "href" && !/stylesheet/i.test(String(attrs.rel || "")))) {
+        delete attrs[name];
+      }
+    });
+  }
+
+  function cleanNode(node, depth) {
+    if (!node || typeof node !== "object" || depth > 500) return;
+    if (node.type === 2) cleanAttrs(node.attributes, String(node.tagName || "").toLowerCase());
+    if (Array.isArray(node.childNodes)) node.childNodes.forEach(function (c) { cleanNode(c, depth + 1); });
+  }
+
+  function clean(events) {
+    if (!Array.isArray(events)) return null;
+    return events.filter(function (e) {
+      if (!sane(e)) return false;
+      var data = e.data || {};
+      if (e.type === 5) return data.tag === "page";
+      if (!KEPT_TYPES[e.type]) return false;
+      if (e.type === 2) cleanNode(data.node, 0);
+      if (e.type === 3) {
+        if (DROPPED_SOURCES[data.source]) return false;
+        (Array.isArray(data.adds) ? data.adds : []).forEach(function (a) { cleanNode(a && a.node, 0); });
+        (Array.isArray(data.attributes) ? data.attributes : []).forEach(function (a) { cleanAttrs(a && a.attributes, ""); });
+      }
+      return true;
+    });
+  }
+
   // One session's events after another's, each moved to begin GAP after the one before
   // ended: a visitor's sessions can be days apart, or overlap (two tabs at once).
   function stitch(parts) {
@@ -315,6 +369,7 @@
       return Promise.all(recorded.map(function (s) { return api("/recording", { id: s.id }); })).then(function (all) {
         var parts = [];
         all.forEach(function (events, k) {
+          events = clean(events);
           if (events && events.length >= 2) parts.push({ session: recorded[k], events: events });
         });
         if (!parts.length) throw new Error("Its recordings are past their days.");
@@ -330,6 +385,7 @@
   }
 
   api("/recording", { id: id }).then(function (events) {
+    events = clean(events);
     if (!events) throw new Error("Not found. Recordings are only kept for a while, and only with consent.");
     var shown = play(events, [0], [0], null);
     when.textContent = site + " · " + utc(events[0].timestamp) + " UTC · " + shown.seconds + " s · " +

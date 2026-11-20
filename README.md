@@ -28,6 +28,11 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   Google works unchanged.
 - **With consent, more.** A visitor cookie, a session, a device fingerprint, the IP and
   user agent per page view, and an rrweb session recording you can replay.
+- **Experiments.** A/B, multivariate and multi-armed bandit tests, run by c.js: visitors
+  split between the original and its variants (CSS, copy, attributes, a redirect, or markup
+  the page carries), each shown the same one every time, and which does better at a goal,
+  with an always-valid significance test that can be read on any day. A bandit moves traffic
+  to the winner as it learns.
 - **Funnels.** Steps in order (pages, events, a backend's events, forms), counted over
   consented sessions or visitors, with drop-off per step and replays of the sessions that
   stopped.
@@ -35,7 +40,7 @@ site, so cartercole.com and cartercole.net share the code, the storage and the c
   query, page, country and device, with sitemaps, for each site's own hosts. A Google
   service account reads it, and the collector reaches that account with no stored key.
 - **One console** at `/_c/admin/`: overview, traffic, search, bots, visitors and sessions,
-  events, funnels, forms, errors, replays, for every site. Click any address for everything
+  events, funnels, experiments, forms, errors, replays, for every site. Click any address for everything
   known about it, its registry record (RDAP) included.
 
 Stdlib Python on Lambda (no dependencies beyond the runtime's boto3), one DynamoDB table,
@@ -51,7 +56,8 @@ carterlitics/        the collector (a Python package; Lambda handler carterlitic
   intel.py           what an address is: reverse DNS, published ranges, crawler checks, RDAP
   google.py          Search Console, as a service account: AWS -> Google federation, the reports
   auth.py            console sign-in: OpenID Connect + PKCE, admins only; server keys
-  config.py          sites, retention, secrets
+  config.py          sites, retention, secrets, funnels and experiments
+  experiments.py     experiments: who sees which arm, bandits' shares, and the statistics
   backends.py        DynamoDB and S3, and in-memory twins for tests and dev
   dev.py, demo.py    the local server, and 30 days of fake traffic (and funnels) for it
   static/
@@ -89,17 +95,18 @@ country and ASN, and blockers that target third-party analytics hosts don't appl
 
 | | When | What | Kept |
 |---|---|---|---|
-| Server requests | always | IP, user agent, method, path, query, status, referrer, country, network, reverse DNS name, kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
+| Server requests | always | IP (a person's cut to its /24 or /48 by default, below), user agent, method, path, query and referrer (credential-like and personal values redacted, below), status, country, network, reverse DNS name (bots' by default), kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
 | Page counters | always, unless DNT/GPC | daily counts per page, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; how page views ended and the other sites they left for (host only); signs of automation; pages seen without JavaScript; bots that run JS are counted apart | 400 days |
 | Unique visitors | always, unless DNT/GPC | `sha256(daily salt, site, IP, UA)`; the salt is random and deleted after 2 days, so hashes can't be reversed afterwards | 400 days (as a count) |
 | Visits | always, unless DNT/GPC | daily counts of visits, bounces, landing and exit pages, and where visits came from: source, channel, campaign. The visit in progress is one item per visitor hash: when it was last seen, how many page views and events, its first and latest page, its source; no address or user agent (`v\|<site>\|<hash>`) | 400 days (as counts); the item a day |
 | Events | always, unless DNT/GPC | name, properties (≤ 2 KB), page | 180 days |
+| Experiments | always, unless DNT/GPC or automation | which arm of an experiment a visitor was shown, and each of its metrics they reached after, counted once per visitor (per tab without consent), plus every time; a consented session keeps its arms. In the tab, the arm shown (sessionStorage: the arm alone, no id), and with consent for good (localStorage). Nothing stored for the arm a visitor without consent gets: the collector hashes their network and browser each time it's asked | 400 days (as counts) |
 | Form attempts | always, unless DNT/GPC | each attempt at a form, and per field, in order: time before typing, between fields and in it; whether they came back, corrected, pasted, were autofilled, refused by validation or left it empty; how it ended and the last field; page, browser, device, country. Never a value or its length | 180 days |
-| Errors | always | message, type, stack, source, page, user agent; no identifier unless consented | 90 days |
-| Consented visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view | 400 days |
+| Errors | always | message, type, stack, source, page, user agent; no identifier unless consented. Addresses in them lose their query and fragment (an inline script's frames name its page), and email addresses in a message become `[email]` | 90 days |
+| Consented visits | consent only | visitor cookie (`vid`), session, fingerprint, IP, UA, geo (city and region too), reverse DNS name, kind of connection, browser time zone, per page view; its referrer as a site and page, never a query or fragment (a reset token, an email address, an OAuth `#access_token`) | 400 days |
 | Visitor index | consent only | each consented visitor's session ids and the day each began (`vs\|<site>\|<vid>`), to find all their sessions | as long as the sessions |
 | Address names | with the above | an address's reverse DNS name, as a cache (`ip\|<address>`) | 7 days |
-| Recordings | consent only | rrweb: DOM, mouse, scroll; inputs masked, `[data-private]` blocked, `[data-mask]` text masked | 30 days |
+| Recordings | consent only | rrweb: DOM, mouse, scroll; inputs masked, `[data-private]` blocked, `[data-mask]` text and email addresses anywhere masked; the page's address without its query or fragment; nothing on an excluded path (the site's `exclude` or the tag's `data-exclude`) | 30 days |
 
 **Radio events.** A page running a Virtual Radio player can send two events, under its own and the
 radios' consent (Virtual Radio's `PRIVACY.md` and SPEC 6.5.9): `radio.nearby` `{radios, window_s}`, a
@@ -108,10 +115,14 @@ to be reported to this site, by a token that is this site's alone and changes da
 events (`non_interaction`), so DNT and GPC stop them like any other.
 
 Retention is `[retention]` in `carterlitics.toml`; everything expires through the table's
-TTL or a bucket lifecycle rule. A site with `server_ip = "truncate"` keeps server-log
-addresses at /24 (IPv4) and /48 (IPv6). Query strings in the request log have the values
-of credential-like parameters (`code`, `state`, `token`, signatures, …) replaced, since
-OAuth callbacks carry them.
+TTL or a bucket lifecycle rule. A site's `server_ip` says how the request log keeps
+addresses: `"bots"` (the default) keeps a bot's whole, to prove a crawler is the real one,
+and a person's at /24 (IPv4) or /48 (IPv6), with no reverse DNS lookup; `"full"` keeps
+everyone's whole; `"truncate"` cuts everyone's. Query strings and Referers in the request log
+have the values of credential-like and personal parameters (`code`, `state`, `token`,
+`login_hint`, `email`, signatures, …) and of any email address replaced, and a Referer
+loses its fragment: OAuth callbacks, sign-ins and newsletter links carry them, and a
+Referer is the page's own address.
 
 ### Visits, bounces and exits
 
@@ -160,6 +171,12 @@ page on its timeline and lists them under the player, with the time each began, 
 to. A page load's marker comes from its snapshot; c.js marks the rest (an SPA's
 navigation, a page Back brought back) with an rrweb `page` event. Older recordings get
 markers for their page loads only.
+
+**A recording stops on an excluded path**: the site's `exclude` in `carterlitics.toml`
+(the collector puts it in the c.js it serves) or the tag's `data-exclude`. Going to one
+stops rrweb and drops what it hadn't sent, which may already hold the new page; the next
+page it records starts it again from a fresh snapshot. The collector drops a chunk sent
+from an excluded path too, for a copy of c.js from before this.
 
 **A visitor's sessions** are found through an index kept beside them: each consented
 session goes into its visitor's (`vs|<site>|<vid>`, by the visitor cookie) as it begins,
@@ -244,9 +261,10 @@ any lookup service:
 - **Reverse DNS**: the name its owner gives it (`c-73-22-1-9.hsd1.il.comcast.net`,
   `crawl-66-249-66-1.googlebot.com`), from AWS's resolver, cached a week. Its domain
   is counted too (Traffic: *Host domains*), which names companies with their own
-  networks as well as ISPs. Only addresses that are stored anyway are looked up: server
-  logs, consented visits, and backend events that carry an IP. A site with
-  `server_ip = "truncate"` gets none, since the names spell the address out.
+  networks as well as ISPs. Only addresses that are stored whole anyway are looked up:
+  bots in the server logs (and people too with `server_ip = "full"`), consented visits,
+  and backend events that carry an IP. A person in the server log gets none by default,
+  and nobody with `server_ip = "truncate"`, since the names spell the address out.
 - **Published ranges**, built into `geo/ranges.bin` by `infra/deploy.py intel` from
   about thirty public lists: the ranges Google, Bing, OpenAI, Perplexity, Apple,
   DuckDuckGo, Common Crawl, UptimeRobot and Pingdom crawl from; AWS, Google Cloud,
@@ -402,6 +420,7 @@ cl("identify", "user-123");                              // tie a consented visi
 cl("identify", null);                                    // signed out: forget it
 const who = await cl("who");                             // what the collector makes of this visitor
 cl("submit", form);                                      // a form sent without a submit event (Forms)
+const arm = await cl("variant", "hero");                 // this visitor's arm, or null: the original (Experiments)
 carterlitics.flush();                                    // send what's queued now
 ```
 
@@ -581,6 +600,163 @@ consented visitor, a link to watch the replay.
   who clicks into a field within a second of the page loading, before the page view is
   logged.
 
+### Experiments
+
+An experiment shows visitors versions of the site and counts which does better at a goal.
+Each site lists its own in `carterlitics.toml`, under its `[[site]]` table:
+
+```toml
+[[site.experiment]]
+key = "hero"                      # lower-case letters, digits, - and _: the id markup and cl() use
+name = "Home page headline"
+status = "running"                # draft · running · paused · done
+pages = ["/"]                     # where it runs (as funnel pages: /blog/* too)
+goal = "event:sign_up"            # what it's for: a funnel step (a page, an event, a form)
+metrics = ["/pricing", "event:purchase"]   # up to five more, reported, not optimised for
+allocation = "split"              # split by weight · thompson · greedy (bandits)
+traffic = 1.0                     # the share of visitors in the test; the rest see the original
+audience = "everyone"             # or "consented"
+
+[[site.experiment.variant]]
+id = "a"                          # the first is the original
+name = "Original"
+
+[[site.experiment.variant]]
+id = "b"
+name = "Shorter"
+weight = 1                        # a split's share, relative to the others
+css = ".hero h1 { letter-spacing: -0.02em }"
+text = { ".hero h1" = "Less, faster" }
+attrs = { ".hero a.cta" = { href = "/start", class = "cta cta--big" } }
+# redirect = "/home-b"            # a split-URL test: send them to this page instead
+```
+
+Experiments ship inside the code package (`infra/deploy.py code`, *Deploy*), not the
+function's configuration: with their CSS and copy they'd outgrow Lambda's 4 KB environment.
+So starting one, pausing it or naming its winner is an edit to `carterlitics.toml` and a
+`code` deploy. Visitors see the change within about six minutes: c.js is cached five, and the
+collector rebuilds it once a minute.
+
+| Status | What visitors see |
+|---|---|
+| `draft` | the original; `?cl_x=hero:b` on any page previews an arm in that tab, and `?cl_x=` ends it. Previews are never counted |
+| `running` | their arm, counted |
+| `paused` | the original, counted no more; their arms are kept, so running it again carries on |
+| `done` | everyone sees `winner = "b"`, counted no more, until it's built into the site and removed |
+
+**Variants.** A variant can bring a stylesheet (`css`, in force while it's shown), text
+(`text`, a selector's elements' text replaced), attributes (`attrs`, set; not `on…` handlers
+or script URLs) or a `redirect` to another page on the site, which keeps the address's query
+(campaign tags too) and hands on the original referrer, so the visit's source stays right.
+Text and attributes are applied again to whatever the page adds later (an SPA's next render).
+A site with a Content-Security-Policy needs `style-src 'unsafe-inline'` for `css`.
+
+The page can carry variants itself, in markup, and then a variant needs none of the above:
+
+```html
+<h1 data-cl-x="hero:a">The original</h1>
+<h1 data-cl-x="hero:b" hidden>The variant</h1>
+```
+
+The page as written is what the original shows. For a visitor shown `b`, c.js shows `b`'s
+markup and hides the rest. Or the page's own code decides:
+
+```js
+cl("variant", "hero", function (arm) {   // through the stub too; once loaded, also a Promise
+  if (arm === "b") showShorterHeadline(); // null: not in the test (or not yet running): the original
+});
+```
+
+**Multivariate tests.** Instead of variants, two to four factors, each with its variants;
+every combination is an arm (up to 16), split evenly. Markup names the factor
+(`data-cl-x="hero.button:green"`), `cl("variant", "hero")` answers with the combination
+(`"b.green"`) and `cl("variant", "hero.button")` with one factor's (`"green"`). The console
+shows each combination, and each factor on its own: every arm with that variant, added up.
+
+```toml
+[[site.experiment]]
+key = "signup-box"
+goal = "form:/subscribe?res=submit"
+[[site.experiment.factor]]
+id = "headline"
+variant = [{ id = "a" }, { id = "b", text = { ".signup h2" = "One email a month" } }]
+[[site.experiment.factor]]
+id = "button"
+variant = [{ id = "plain" }, { id = "bold", css = ".signup button { font-weight: 700 }" }]
+```
+
+**Who is in it, and the same arm every time.** Everyone but visitors with Do Not Track or
+GPC and browsers driven by automation, who see the original and send nothing. An
+experiment touches a page view where it runs (`pages`; every page for one without pages that
+changes CSS, text or attributes), where its markup is, or when the page asks `cl("variant")`.
+Then the visitor gets their arm, the same one every time as far as anything allows:
+
+- A consented visitor's comes from their visitor cookie (MurmurHash3 of it and the key), and
+  is remembered in localStorage: the same in every tab, on every visit, from any network.
+- Anyone else's comes from the collector, `GET /_c/x`, once a page load and only when a tab
+  has no arm yet: a keyed hash (HMAC with the server secret) of their address's network (its
+  /24, or /48) and their browser. The same network and browser always land in the same arm,
+  in any tab, on any day, and nothing is stored to do it. A visitor on another network may
+  land in another arm.
+- Either way, the tab remembers the arm it showed (sessionStorage, the arm and nothing else),
+  so neither a new network nor a bandit moving its shares changes a page mid-visit. A visitor
+  who accepts keeps the arms their tab showed.
+
+Changing a split's weights, or a bandit's shares moving, sends new tabs of visitors near the
+boundaries to the next arm; a remembered arm doesn't move. A new key starts afresh.
+
+**Flicker.** c.js loads `async`, so a page can show its original for a moment before c.js
+shows the arm. CSS goes in as soon as c.js runs; for the rest, a page can hide what an
+experiment changes until then, with its own timeout in case c.js never comes:
+
+```html
+<style>.cl-wait [data-cl-x], .cl-wait .hero h1 { visibility: hidden }</style>
+<script>(function (h) { h.classList.add("cl-wait");
+  setTimeout(function () { h.classList.remove("cl-wait"); }, 2000); })(document.documentElement)</script>
+```
+
+c.js takes `cl-wait` off once the page's experiments are shown. A visitor without consent
+waits for `/_c/x` on their first page of a test; if it takes more than 1.5 s, that page view
+shows the original and isn't counted, and their arm is ready for the next one. A split-URL
+test holds the page view until then, since a page they're sent away from isn't one they saw.
+
+**What's counted.** When a visitor is first shown their arm, c.js sends it once (`x|<site>|<key>`
+in the table, by day); then each of the experiment's metrics they reach, every time, the
+first marked, so the collector counts both converted visitors and conversions. An event's
+numeric `value` property is added up too (*value per visitor*). The unit is the visitor for
+a consented one and the tab for anyone else, so someone without consent who opens three tabs
+counts three times, in the same arm. A consented session keeps the arms it was shown (the
+Sessions table's *Tests*), so a replay of someone who saw `b` is a click away. Events from a
+site's backend aren't counted: nothing ties them to an arm.
+
+**Reading it.** The Experiments tab shows each experiment's whole run, whatever the range:
+
+| | |
+|---|---|
+| Share now | where new visitors go: the split, or a bandit's latest |
+| Rate | converted visitors over visitors shown the arm, with its interval (Wilson) |
+| Lift | the rate against the original's, with an always-valid interval |
+| Chance it beats the original | from Beta posteriors, exactly |
+| Chance it's best | of all the arms, by 5,000 seeded draws |
+| better / worse | the always-valid p-value under 1 − `confidence` (0.95 unless set) |
+
+The significance test is a mixture sequential probability ratio test (Johari, Pekelis and
+Walsh, *Always Valid Inference*, 2017; what Optimizely's Stats Engine is built on), taken at
+each day's running totals and tuned to effects about a quarter of the rate. An ordinary
+t-test read every day calls false winners far more often than it claims; this one can be read
+whenever, and a result it calls stays called. It asks for more evidence in exchange: at a few
+dozen conversions an arm, expect *No clear result yet*. The verdict names a winner when an
+arm beats the original on the goal; `done` and `winner` are yours to set.
+
+**Bandits.** `allocation = "thompson"` gives each arm the chance it's the best at the goal,
+so traffic moves to what works while the test runs; `greedy` gives the arm with the best
+rate so far everything (each scored as if it had begun with one success: the
+epsilon-greedy bandit of MathWorks' *Multi-Armed Bandit Problem and Exploration vs.
+Exploitation Trade-off*). Both keep `explore` (0.1 unless set) of visitors split evenly,
+whatever they've learned. A bandit earns while it learns, at the cost of a slower, less
+certain answer about the arms it starves; when traffic shifts over time and the arms' rates
+drift with it, its comparisons lean, so a split is the one to trust for a decision.
+
 ### From a site's backend
 
 ```bash
@@ -702,14 +878,15 @@ infra/deploy.py routes cartercole.net --dry-run --drop '/api/*' '/auth/*'
 infra/deploy.py routes cartercole.net --drop '/api/*' '/auth/*'   # replaces the old per-site API routes
 infra/deploy.py routes all                      # /_c/* on every site with client = true
 infra/deploy.py logging all                     # CloudFront access logs -> collector, every site
-infra/deploy.py grant-deploy                    # let CI and site-publisher run `code`
+infra/deploy.py grant-deploy                    # `code` rights for deploy_role/deploy_user (neither is set),
+                                                # and none for anyone else
 infra/deploy.py search-console                  # Search Console's service account (README: Search Console)
 ```
 
 Then deploy each site (its `deploy.sh`) so its pages load `/_c/c.js`. After that,
 `infra/deploy.py code` ships a changed collector: a deterministic zip of the package (and
-any `.mmdb` and `ranges.bin` in `geo/`), uploaded only when its SHA-256 differs from what
-Lambda runs.
+any `.mmdb` and `ranges.bin` in `geo/`, and the sites' experiments as `experiments.json`),
+uploaded only when its SHA-256 differs from what Lambda runs.
 
 The first deploy with visitor pages should be followed, once, by indexing the sessions
 already kept (it only adds what's missing, so running it again does nothing):

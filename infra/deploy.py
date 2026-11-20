@@ -11,7 +11,8 @@ on each site's CloudFront distribution.
     infra/deploy.py register-client [--force] an OIDC client at the issuer, for the console
     infra/deploy.py server-key SITE           the key SITE's backend sends to /_c/server/events
     infra/deploy.py export-key                the key a metrics store sends to /_c/export/daily
-    infra/deploy.py grant-deploy [--dry-run]  let the CI role and publishing user run `code`
+    infra/deploy.py grant-deploy [--dry-run]  let deploy_role/deploy_user run `code` (neither is set),
+                                              and take it from anyone else
     infra/deploy.py search-console [--dry-run] a Google service account that reads Search Console:
                                               its project and AWS federation for the function;
                                               which properties it reads, and which sites it can't
@@ -24,13 +25,15 @@ on each site's CloudFront distribution.
 
 Settings are carterlitics.toml's [aws] table and its site list. Every step looks before it
 creates, so re-running is safe. It drives the AWS CLI (no boto3) with whatever credentials
-the environment selects: AWS_PROFILE=carter-admin for everything but `code`. Run as the
-deploy user or role (which may only ship code), the other commands stop before touching
-anything and say so; a call AWS refuses always stops, naming who made it.
+the environment selects: AWS_PROFILE=carter-admin for everything, `code` included unless
+[aws] names a deploy_role or deploy_user. Run as one of those (which may only ship code), the
+other commands stop before touching anything and say so; a call AWS refuses always stops,
+naming who made it.
 
-Secrets live in SSM Parameter Store under [aws].params and reach the function as
-environment variables. They go to the CLI in files readable only by you, never on a
-command line.
+Secrets live in SSM Parameter Store under [aws].params. The function reads them there
+when it starts (its environment names only the path), so the function's configuration,
+which the deploy role and user may read, holds none of them. They go to the CLI in files
+readable only by you, never on a command line.
 
 `search-console` also drives Google Cloud, as gcloud's application default credentials
 (`gcloud auth application-default login`): [google] in carterlitics.toml says where.
@@ -70,8 +73,8 @@ CONFIG = ROOT / "carterlitics.toml"
 
 sys.path.insert(0, str(ROOT))
 from carterlitics import google  # noqa: E402
-from carterlitics.auth import export_key, server_key  # noqa: E402
-from carterlitics.config import Config  # noqa: E402
+from carterlitics.auth import FLOW_COOKIE, SESSION_COOKIE, export_key, server_key  # noqa: E402
+from carterlitics.config import SECRETS, Config  # noqa: E402
 from carterlitics.intel import Ranges, build_ranges  # noqa: E402
 
 RAW = tomllib.loads(CONFIG.read_text())
@@ -82,9 +85,13 @@ FUNCTION = AWS.get("function", "carterlitics")
 ROLE = AWS.get("role", FUNCTION)
 TABLE = AWS.get("table", "carterlitics")
 PARAMS = AWS.get("params", "/carterlitics").rstrip("/")
+SECRET_NAMES = [name for _, name in SECRETS.values()]   # origin, session, server, then the OIDC client's
 LOG_GROUP = f"/aws/lambda/{FUNCTION}"
 DEPLOY_ROLE = AWS.get("deploy_role", "")
 DEPLOY_USER = AWS.get("deploy_user", "")
+# Who may ship code: an inline policy of this name on each. grant-deploy takes it from anyone else.
+DEPLOYERS = [w for w in (DEPLOY_ROLE and ("role", DEPLOY_ROLE), DEPLOY_USER and ("user", DEPLOY_USER)) if w]
+CODE_POLICY = "carterlitics-code"
 ADMIN_PROFILE = AWS.get("admin_profile", "carter-admin")
 # How the CLI says a call was refused, as opposed to failed. A refusal is never "not there".
 DENIED = ("AccessDenied", "UnauthorizedOperation", "not authorized to perform", "is not authorized to")
@@ -106,6 +113,7 @@ FORWARDED_HEADERS = [
     "cloudfront-viewer-time-zone",
 ]
 MAX_POLICY_HEADERS = 10
+FORWARDED_COOKIES = [SESSION_COOKIE, FLOW_COOKIE]   # auth.py: the only cookies the collector reads
 ORIGIN_ID = "carterlitics"
 # The access log fields the collector reads (no cookies: they never leave CloudFront).
 LOG_FIELDS = ["timestamp(ms)", "c-ip", "cs-method", "x-host-header", "cs-uri-stem", "cs-uri-query", "sc-status",
@@ -134,9 +142,11 @@ def rerun_as_admin() -> str:
 
 def refused(args, stderr: str) -> Fail:
     reason = stderr.strip().splitlines()[-1] if stderr.strip() else ""
-    if sys.argv[1:2] == ["code"]:
-        hint = (f"`code` runs as {DEPLOY_USER or 'the deploy user'} or {DEPLOY_ROLE or 'the deploy role'} once "
+    if sys.argv[1:2] == ["code"] and DEPLOYERS:
+        hint = (f"`code` runs as {' or '.join(n for _, n in DEPLOYERS)} once "
                 f"`AWS_PROFILE={ADMIN_PROFILE} infra/deploy.py grant-deploy` has allowed it; or: {rerun_as_admin()}")
+    elif sys.argv[1:2] == ["code"]:
+        hint = f"No deploy_role or deploy_user is set, so `code` needs administrator credentials: {rerun_as_admin()}"
     else:
         hint = f"Commands other than `code` need administrator credentials: {rerun_as_admin()}"
     return Fail(f"AWS refused `aws {' '.join(args[:2])}`: this shell acts as {caller()}.\n{reason}\n{hint}")
@@ -231,19 +241,26 @@ def site_of(name: str):
 
 
 def package() -> bytes:
-    """The collector and its static files, plus any .mmdb and the ranges table in geo/.
-    Byte-identical for identical inputs, so CodeSha256 says whether Lambda already runs it."""
+    """The collector and its static files, plus any .mmdb and the ranges table in geo/, and
+    the sites' experiments from carterlitics.toml as carterlitics/experiments.json (too big
+    for the function's environment, where the rest of the configuration goes). Byte-identical
+    for identical inputs, so CodeSha256 says whether Lambda already runs it: an experiment
+    started, paused or finished in carterlitics.toml ships with `code`."""
+    packaged = PACKAGE / "experiments.json"
     files = sorted(p for p in PACKAGE.rglob("*") if p.is_file() and "__pycache__" not in p.parts
-                   and not p.name.startswith("."))
+                   and not p.name.startswith(".") and p != packaged)
     files += sorted(GEO_DIR.glob("*.mmdb")) if GEO_DIR.exists() else []
     files += [RANGES] if RANGES.exists() else []
+    entries = [(path.relative_to(ROOT).as_posix(), path.read_bytes()) for path in files]
+    experiments = json.dumps(CFG.experiments_data(), separators=(",", ":"), sort_keys=True).encode()
+    entries.append((packaged.relative_to(ROOT).as_posix(), experiments))
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for path in files:
-            info = zipfile.ZipInfo(path.relative_to(ROOT).as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
+        for name, data in sorted(entries):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.external_attr = 0o644 << 16
             info.compress_type = zipfile.ZIP_DEFLATED
-            z.writestr(info, path.read_bytes())
+            z.writestr(info, data)
     return buf.getvalue()
 
 
@@ -349,6 +366,16 @@ def ensure_table(dry: bool) -> str:
         aws("dynamodb", "update-time-to-live", "--table-name", TABLE,
             "--time-to-live-specification", "Enabled=true,AttributeName=expires")
         log("table", "turned on TTL for `expires`")
+    if dry:
+        log("table", "would keep point-in-time recovery and deletion protection on")
+        return arn
+    # Applied on every run: a dropped table or a bad write can be undone (35 days back).
+    aws("dynamodb", "update-continuous-backups", "--table-name", TABLE,
+        "--point-in-time-recovery-specification", "PointInTimeRecoveryEnabled=true")
+    if not (got or {}).get("Table", {}).get("DeletionProtectionEnabled"):
+        aws("dynamodb", "update-table", "--table-name", TABLE, "--deletion-protection-enabled")
+        aws("dynamodb", "wait", "table-exists", "--table-name", TABLE)
+    log("table", "point-in-time recovery and deletion protection are on")
     return arn
 
 
@@ -431,6 +458,10 @@ def ensure_role(table_arn: str, bucket_arn: str, logs_arn: str, acct: str, dry: 
         {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": bucket_arn,
          "Condition": {"StringLike": {"s3:prefix": "rec/*"}}},
         {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"{logs_arn}/*"},
+        # Its secrets, by name (config.ssm_secrets). SecureStrings under the account's
+        # aws/ssm key, which lets any principal allowed the parameter decrypt it through SSM.
+        {"Effect": "Allow", "Action": "ssm:GetParameters",
+         "Resource": [f"arn:aws:ssm:{REGION}:{acct}:parameter{PARAMS}/{name}" for name in SECRET_NAMES]},
         {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
          "Resource": [f"arn:aws:logs:{REGION}:{acct}:log-group:{LOG_GROUP}",
                       f"arn:aws:logs:{REGION}:{acct}:log-group:{LOG_GROUP}:*"]},
@@ -442,7 +473,9 @@ def ensure_role(table_arn: str, bucket_arn: str, logs_arn: str, acct: str, dry: 
 
 
 def environment(dry: bool) -> dict:
-    client_id, client_secret = param("oidc-client-id"), param("oidc-client-secret")
+    for name in SECRET_NAMES[:3]:   # the OIDC client's comes from `register-client`
+        ensure_secret(name, dry)
+    client_id = param("oidc-client-id")
     if not client_id:
         log("signin", "no OIDC client yet: the console's sign-in stays off until `register-client`")
     env = {
@@ -452,11 +485,11 @@ def environment(dry: bool) -> dict:
         "GEO_MMDB": ",".join(f"/var/task/geo/{p.name}" for p in sorted(GEO_DIR.glob("*.mmdb")))
         if GEO_DIR.exists() else "",
         "INTEL_RANGES": f"/var/task/geo/{RANGES.name}" if RANGES.exists() else "",
-        "ORIGIN_SECRET": ensure_secret("origin-secret", dry),
-        "SESSION_SECRET": ensure_secret("session-secret", dry),
-        "SERVER_SECRET": ensure_secret("server-secret", dry),
+        # The secrets stay in Parameter Store: the function reads them at a cold start
+        # (config.ssm_secrets), so its configuration, which the deploy role and user may
+        # read, holds none of them.
+        "SECRETS_PATH": PARAMS,
         "OIDC_CLIENT_ID": client_id or "",
-        "OIDC_CLIENT_SECRET": client_secret or "",
         "ADMIN_IDS": param("admin-ids") or "",
         "GOOGLE_AUDIENCE": param("google-audience") or "",
     }
@@ -484,10 +517,12 @@ def ensure_function(role_arn: str, env: dict, dry: bool) -> str:
         log("function", f"would {'update' if exists else 'create'} {FUNCTION} (python3.13, arm64)")
         return f"arn:aws:lambda:{REGION}:000000000000:function:{FUNCTION}"
     if exists:
+        # The code first: it reads its secrets from either place, while code from before
+        # SECRETS_PATH, given an environment without them, would run with none.
+        ship_code(dry)
         aws("lambda", "update-function-configuration", payload=config)
         wait_updated()
         log("function", f"updated {FUNCTION} configuration")
-        ship_code(dry)
     else:
         blob = package()
         code = code_args(blob)
@@ -502,7 +537,25 @@ def ensure_function(role_arn: str, env: dict, dry: bool) -> str:
             time.sleep(5)
         wait_updated()
         log("function", f"created {FUNCTION}")
+    limit_concurrency()
     return aws("lambda", "get-function-configuration", "--function-name", FUNCTION)["FunctionArn"]
+
+
+def limit_concurrency() -> None:
+    """At most [aws] concurrency copies at once (0: no limit). Its Function URL is public,
+    so this caps what a flood of made-up beacons can cost, and keeps it from taking the
+    account's other functions' share. Throttled beacons are lost; real traffic is far below."""
+    n = int(AWS.get("concurrency", 25))
+    if n <= 0:
+        error_of("lambda", "delete-function-concurrency", "--function-name", FUNCTION)
+        log("function", f"{FUNCTION}: no concurrency limit")
+        return
+    err = error_of("lambda", "put-function-concurrency", "--function-name", FUNCTION,
+                   "--reserved-concurrent-executions", str(n))
+    if err:   # an account with a small concurrency quota can't reserve any
+        log("function", f"could not limit {FUNCTION} to {n} at once: {err.strip().splitlines()[-1]}")
+    else:
+        log("function", f"{FUNCTION}: at most {n} at once")
 
 
 def ensure_url(dry: bool) -> str:
@@ -587,10 +640,12 @@ def ensure_origin_request_policy(dry: bool) -> str:
     listing = aws("cloudfront", "list-origin-request-policies", "--type", "custom")["OriginRequestPolicyList"]
     config = {
         "Name": ORIGIN_REQUEST_POLICY,
-        "Comment": "carterlitics: cookies, query, and the headers the collector reads. No Host.",
+        "Comment": "carterlitics: its own cookies, query, and the headers the collector reads. No Host.",
         "HeadersConfig": {"HeaderBehavior": "whitelist",
                           "Headers": {"Quantity": len(FORWARDED_HEADERS), "Items": FORWARDED_HEADERS}},
-        "CookiesConfig": {"CookieBehavior": "all"},
+        # The console's sign-in cookies only: a site's own (its sign-in session) never reaches the collector.
+        "CookiesConfig": {"CookieBehavior": "whitelist",
+                          "Cookies": {"Quantity": len(FORWARDED_COOKIES), "Items": FORWARDED_COOKIES}},
         "QueryStringsConfig": {"QueryStringBehavior": "all"},
     }
     for item in listing.get("Items", []):
@@ -835,7 +890,7 @@ def register_client(force: bool) -> None:
     })
     # The registration token never leaves the hub's machine: curl runs there.
     remote = ("set -a; . ~/kith-hub/hub.env; set +a; "
-              f"curl -sS --fail-with-body {CFG.issuer}/oauth/register "
+              f"curl -sS --fail-with-body {shlex.quote(CFG.issuer + '/oauth/register')} "
               '-H "authorization: Bearer $KITH_REGISTRATION_TOKEN" -H "content-type: application/json" -d @-')
     host = AWS.get("hub_ssh")
     if not host:
@@ -865,19 +920,39 @@ def print_export_key() -> None:
     print(export_key(secret))
 
 
+def code_holders() -> list[tuple[str, str]]:
+    """Every user and role holding the code policy, as ("user" | "role", name)."""
+    got = aws("iam", "get-account-authorization-details", "--filter", "User", "Role", "--query",
+              "{user: UserDetailList[].[UserName, UserPolicyList[].PolicyName],"
+              " role: RoleDetailList[].[RoleName, RolePolicyList[].PolicyName]}")
+    return [(kind, name) for kind in ("user", "role") for name, policies in (got.get(kind) or [])
+            if CODE_POLICY in (policies or [])]
+
+
 def grant_deploy(acct: str, dry: bool) -> None:
+    """Make the holders of the code policy exactly deploy_role and deploy_user: grant it to
+    them, and take it from anyone else (a user or role since dropped from the config)."""
+    for kind, name in code_holders():
+        if (kind, name) in DEPLOYERS:
+            continue
+        if dry:
+            log("deploy", f"would stop {kind} {name} updating {FUNCTION}'s code")
+            continue
+        aws("iam", f"delete-{kind}-policy", f"--{kind}-name", name, "--policy-name", CODE_POLICY)
+        log("deploy", f"{kind} {name} may no longer update {FUNCTION}'s code")
     policy = json.dumps({"Version": "2012-10-17", "Statement": [{
         "Effect": "Allow", "Action": ["lambda:UpdateFunctionCode", "lambda:GetFunctionConfiguration"],
         "Resource": f"arn:aws:lambda:{REGION}:{acct}:function:{FUNCTION}"}]})
-    who = [w for w in (DEPLOY_ROLE and ("role", DEPLOY_ROLE), DEPLOY_USER and ("user", DEPLOY_USER)) if w]
-    if dry or not who:
-        log("deploy", f"would let {', '.join(n for _, n in who) or 'nobody (set deploy_role/deploy_user)'} "
-            f"update {FUNCTION}'s code")
+    if not DEPLOYERS:
+        log("deploy", f"no deploy_role or deploy_user: only administrators may update {FUNCTION}'s code")
         return
-    for kind, name in who:
-        aws("iam", f"put-{kind}-policy", f"--{kind}-name", name, "--policy-name", "carterlitics-code",
+    if dry:
+        log("deploy", f"would let {', '.join(n for _, n in DEPLOYERS)} update {FUNCTION}'s code")
+        return
+    for kind, name in DEPLOYERS:
+        aws("iam", f"put-{kind}-policy", f"--{kind}-name", name, "--policy-name", CODE_POLICY,
             "--policy-document", policy)
-    log("deploy", f"{', '.join(n for _, n in who)} may update {FUNCTION}'s code, nothing else")
+    log("deploy", f"{', '.join(n for _, n in DEPLOYERS)} may update {FUNCTION}'s code, nothing else")
 
 
 # ---------------------------------------------------------------- search console

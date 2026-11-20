@@ -184,7 +184,8 @@ def callback(req: Request, cfg, fetch=http_json) -> Response:
     q = req.query
     if q.get("error"):
         return page(400, "Sign-in cancelled", "The account service did not sign you in.", clear, home)
-    if not flow or not q.get("state") or not hmac.compare_digest(q["state"], flow["state"]):
+    # As bytes: compare_digest refuses str with non-ASCII in it, which a made-up state may have.
+    if not flow or not q.get("state") or not hmac.compare_digest(q["state"].encode(), str(flow["state"]).encode()):
         return page(400, "Sign-in expired", "That sign-in link is stale. Start again from the console.", clear, home)
     if q.get("iss") and q["iss"] != cfg.issuer:  # RFC 9207
         return page(400, "Sign-in refused", "The reply came from the wrong issuer.", clear, home)

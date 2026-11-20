@@ -85,6 +85,23 @@ steps = ["event:login_view", "event:login_start", "event:login"]
 name = "A post to the newsletter"
 steps = ["/blog/*", "form:/subscribe", "form:/subscribe?res=submit"]
 
+# Experiments go under their site as well (README: Experiments), and ship inside the code
+# package with `infra/deploy.py code`, not `provision`. For example:
+#
+# [[site.experiment]]
+# key = "hero"
+# status = "draft"                 # previews only (?cl_x=hero:b) until it's "running"
+# pages = ["/"]
+# goal = "event:post_read"
+# metrics = ["form:/subscribe?res=submit"]
+#
+# [[site.experiment.variant]]
+# id = "a"                         # the original
+#
+# [[site.experiment.variant]]
+# id = "b"
+# text = { "main h1" = "Notes on building small, fast things" }
+
 # ---------------------------------------------------------------- project sites
 
 [[site]]
@@ -119,6 +136,15 @@ url = "https://bond.cartercole.net"
 [[site]]
 id = "badge.cartercole.net"
 url = "https://badge.cartercole.net"
+
+# Bamboo Watch: a public map people drop pins on, so its pages run c.js in anonymous mode
+# (no banner, and no session recordings that could capture a pin). Events, from web/app.js
+# in ~/Code/ai/bamboo: locate {result: ok|refused|unavailable|unsupported} and
+# sighting_logged {kind, spread, size}. Its API isn't behind this distribution, so only page
+# loads are counted here.
+[[site]]
+id = "bamboo.cartercole.net"
+url = "https://bamboo.cartercole.net"
 
 # ---------------------------------------------------------------- server logs only
 
@@ -164,5 +190,7 @@ function = "carterlitics"
 table = "carterlitics"
 params = "/carterlitics"     # SSM prefix for the secrets
 hub_ssh = "gputy"            # where the issuer runs, for register-client
-deploy_role = "cartercole-net-deploy"   # CI roles that may ship code (see `grant-deploy`)
-deploy_user = "site-publisher"
+concurrency = 25             # copies of the function at once: caps a flood's cost (0: no limit)
+# deploy_role and deploy_user would name a CI role and an IAM user that may ship code
+# without admin (see `grant-deploy`). Neither is set: whoever can ship code can rewrite the
+# script every site loads, and `code` is run by hand as admin anyway.

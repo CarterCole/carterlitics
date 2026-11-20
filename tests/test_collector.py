@@ -43,7 +43,8 @@ DATA = {
     "console": "a.example",
     "auth": {"issuer": "https://issuer.example", "admin_role": "god"},
     "site": [
-        {"id": "a.example", "url": "https://a.example", "aliases": ["www.a.example"], "exclude": ["/admin"]},
+        {"id": "a.example", "url": "https://a.example", "aliases": ["www.a.example"], "exclude": ["/admin"],
+         "server_ip": "full"},
         {"id": "b.example", "url": "https://b.example", "server_ip": "truncate"},
     ],
 }
@@ -207,6 +208,37 @@ class Classify(unittest.TestCase):
         self.assertEqual(redact_query("X-Amz-Signature=f00&page=2"), "X-Amz-Signature=…&page=2")
         self.assertEqual(redact_query(""), "")
 
+    def test_redact_query_takes_out_what_names_someone(self):
+        self.assertEqual(redact_query("login_hint=pat@example.com&client_id=x"), "login_hint=…&client_id=x")
+        self.assertEqual(redact_query("email=pat%40example.com&nonce=n&reset_token=t&page=2"),
+                         "email=…&nonce=…&reset_token=…&page=2")
+        # An address is redacted whatever its parameter is called.
+        self.assertEqual(redact_query("u=pat%40example.com&utm_source=news"), "u=…&utm_source=news")
+
+    def test_redact_url(self):
+        """A Referer is the page's own address: its query redacted, and no fragment."""
+        self.assertEqual(store_module.redact_url("https://a.example/reset?token=abc&page=2#frag"),
+                         "https://a.example/reset?token=…&page=2")
+        self.assertEqual(store_module.redact_url("https://a.example/#access_token=x"), "https://a.example/")
+        self.assertEqual(store_module.redact_url(""), "")
+
+    def test_bare_url(self):
+        self.assertEqual(classify.bare_url("https://user:pw@a.example/reset?token=x#y"), "https://a.example/reset")
+        self.assertEqual(classify.bare_url("android-app://com.google.android.gm/"),
+                         "android-app://com.google.android.gm/")
+        self.assertEqual((classify.bare_url("not a url"), classify.bare_url(None)), ("", ""))
+
+    def test_an_error_keeps_no_query_fragment_or_email(self):
+        """An inline script's frames name its page, query and all; a failed image its signed
+        URL. The line and column stay, for grouping and for finding the bug."""
+        err = Store._error({
+            "k": "resource", "m": "Failed to load <img> https://cdn.example/a.png?X-Amz-Signature=f00 for pat@example.com",
+            "st": "Error: x\n    at go (https://a.example/reset?token=abc:12:5)\n    at https://a.example/app.js?v=3:1:2",
+            "src": "https://a.example/reset?token=abc#y"})
+        self.assertEqual(err["message"], "Failed to load <img> https://cdn.example/a.png for [email]")
+        self.assertEqual(err["stack"], "Error: x\n    at go (https://a.example/reset:12:5)\n    at https://a.example/app.js:1:2")
+        self.assertEqual(err["src"], "https://a.example/reset")
+
     def test_wildcard_hosts(self):
         cfg = Config.from_data({"site": [{"id": "*.a.example", "url": "https://a.example", "aliases": ["*.a.example"]},
                                          {"id": "a.example", "url": "https://a.example"}]})
@@ -217,6 +249,22 @@ class Classify(unittest.TestCase):
     def test_truncate(self):
         self.assertEqual(truncate_ip("198.51.100.7"), "198.51.100.0")
         self.assertEqual(truncate_ip("2001:db8:1:2::5"), "2001:db8:1::")
+        # Compressed early, the address's own bits used to survive (`2600::1::`).
+        self.assertEqual(truncate_ip("2600::1:2:3"), "2600::")
+        self.assertEqual(truncate_ip("2a00:1450::200e"), "2a00:1450::")
+        self.assertEqual(truncate_ip("::ffff:198.51.100.7"), "198.51.100.0")
+        self.assertEqual(truncate_ip("not an address"), "")
+
+    def test_a_truncating_site_keeps_no_whole_address_even_for_bots(self):
+        """The 400-day counter of bot addresses (`sip#`) too, not only the 30-day log."""
+        app = make()
+        line = LogLine(at=datetime.now(timezone.utc), host="b.example", ip="198.51.100.77", method="GET",
+                       path="/wp-login.php", query="", status=404, referrer="", user_agent="curl/8.4.0")
+        app.store.ingest_log([line])
+        kept = [sk for part in app.store.table.items.values() for sk in part] + \
+            [str(v) for part in app.store.table.items.values() for item in part.values() for v in item.values()]
+        self.assertFalse([k for k in kept if "198.51.100.77" in k])
+        self.assertIn("sip#198.51.100.0", kept)
 
 
 class Ingest(unittest.TestCase):
@@ -676,6 +724,12 @@ class AddressIntel(unittest.TestCase):
         self.assertEqual(verify("Googlebot", google), "verified")
         self.assertEqual(verify("Googlebot", Intel("crawl-1.googlebot.com", True)), "verified")   # by name alone
         self.assertEqual(verify("Googlebot", Intel("crawl-1.googlebot.com", False), ranges_loaded=False), "spoofed")
+        # Any Google Cloud VM's own name, which resolves back: not Googlebot, ranges or not.
+        vm = Intel("34.123.45.67.bc.googleusercontent.com", True, ("cloud:Google Cloud",))
+        self.assertEqual(verify("Googlebot", vm), "spoofed")
+        self.assertEqual(verify("Googlebot", vm, ranges_loaded=False), "spoofed")
+        self.assertEqual(verify("Google Read Aloud", Intel("1-2-3-4.gae.googleusercontent.com", True),
+                                ranges_loaded=False), "verified")
         self.assertEqual(verify("Googlebot", Intel("ec2-1.amazonaws.com")), "spoofed")
         self.assertEqual(verify("Googlebot", Intel(None), ranges_loaded=False), "")                 # nothing known
         self.assertEqual(verify("Googlebot", Intel(None)), "spoofed")                               # not in the list
@@ -785,6 +839,52 @@ class Enrichment(unittest.TestCase):
         other = body(self.call("GET", "/_c/api/log", query={"site": "b.example", "kind": "hum"}))["items"]
         self.assertNotIn("host", other[0])
 
+    def test_by_default_a_persons_address_is_cut_and_never_looked_up(self):
+        """server_ip's default, "bots": a bot's address whole, to prove a crawler is the real
+        one; a person's cut to its /24, with no reverse DNS (nor a lookup, which its cache would
+        keep), and their Referer with its query redacted and no fragment."""
+        data = {**DATA, "site": [{k: v for k, v in DATA["site"][0].items() if k != "server_ip"}, DATA["site"][1]]}
+        cfg = Config.from_data(data, session_secret=SECRET, origin_secret="origin", server_secret="server",
+                               client_id="client", client_secret="shh")
+        table, calls = MemoryTable(), []
+        app = App(cfg, Store(cfg, table, MemoryBlobs(), intel=fake_intel(table, calls)))
+        now = datetime.now(timezone.utc)
+        google = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        app.store.ingest_log([
+            LogLine(now, "a.example", "66.249.66.1", "GET", "/", "", 200, "", google),
+            LogLine(now, "a.example", "198.51.100.7", "GET", "/next", "", 200,
+                    "https://a.example/reset?token=abc&page=2#frag", SAFARI)])
+        self.assertEqual(calls, ["66.249.66.1"])
+        call = Client(app)
+        call.sign_in()
+        person = body(call("GET", "/_c/api/log", query={"site": "a.example", "kind": "hum"}))["items"][0]
+        self.assertEqual((person["ip"], person.get("host"), person["ref"]),
+                         ("198.51.100.0", None, "https://a.example/reset?token=…&page=2"))
+        bot = body(call("GET", "/_c/api/log", query={"site": "a.example", "kind": "bot"}))["items"][0]
+        self.assertEqual((bot["ip"], bot["ver"]), ("66.249.66.1", "verified"))
+
+    def test_a_referrer_is_kept_without_its_query_or_fragment(self):
+        """What an older c.js still sends whole."""
+        ids = {"vid": VID, "sid": SID, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
+        self.call("POST", "/_c/i", {**ids, "items": [
+            {"t": "pv", "p": "/welcome", "new": True,
+             "r": "https://a.example/reset?email=pat@example.com&token=abc#access_token=x"}]}, ip="198.51.100.7")
+        view = body(self.call("GET", "/_c/api/log", query={"site": "a.example", "kind": "pv"}))["items"][0]
+        self.assertEqual(view["ref"], "https://a.example/reset")
+
+    def test_no_recording_is_kept_from_an_excluded_page(self):
+        """c.js stops recording there; an older copy that doesn't has its chunks dropped."""
+        site = self.app.cfg.sites["a.example"]
+        chunk = {"sid": SID, "vid": VID, "seq": 0, "events": [{"type": 4}]}
+        self.assertFalse(self.app.store.chunk(site, {**chunk, "p": "/admin/users"}, store_module.Meta()))
+        self.assertEqual(self.app.store.blobs.keys(store_module.rec_prefix(site.id, SID)), [])
+        self.assertTrue(self.app.store.chunk(site, {**chunk, "p": "/blog"}, store_module.Meta()))
+
+    def test_the_served_client_names_the_sites_excluded_paths(self):
+        """So a recording stops on them whatever the page's own tag says."""
+        self.assertIn(b'var SITE_EXCLUDE = ["/admin"];', self.app.client_for(self.app.cfg.sites["a.example"]))
+        self.assertIn(b"var SITE_EXCLUDE = /*__EXCLUDE__*/[];", self.app.client_for(self.app.cfg.sites["b.example"]))
+
     def test_beacons(self):
         ids = {"vid": VID, "sid": SID, "sd": time.strftime("%Y-%m-%d", time.gmtime())}
         chicago = {"cloudfront-viewer-time-zone": "America/Chicago", "cloudfront-viewer-country-region-name": "Illinois"}
@@ -882,6 +982,19 @@ class Console(unittest.TestCase):
         self.assertIn("https://b.example", page.headers["Content-Security-Policy"])
         self.assertIn("/_c/s/console-", page.body)
 
+    def test_console_scripts_are_its_own_files_only(self):
+        """The replay plays recordings anyone can post, and rrweb builds some of their nodes
+        in the console's own document while it seeks: `script-src 'self'`, with nothing
+        inline, eval'd or from elsewhere, is what keeps an onerror in one from running."""
+        for path in ("/_c/admin/", "/_c/admin/replay"):
+            policy = self.call("GET", path).headers["Content-Security-Policy"]
+            directives = {d.split()[0]: d.split()[1:] for d in policy.split(";") if d.strip()}
+            self.assertEqual(directives["script-src"], ["'self'"], path)
+            self.assertNotIn("script-src-attr", directives)
+            self.assertNotIn("script-src-elem", directives)
+            self.assertEqual(directives["object-src"], ["'none'"])
+            self.assertEqual(directives["base-uri"], ["'none'"])
+
     def test_static(self):
         js = self.call("GET", "/_c/c.js")
         self.assertEqual(js.status, 200)
@@ -931,6 +1044,40 @@ class Console(unittest.TestCase):
         self.assertEqual(auth.safe_next(cfg, "https://evil.example/_c/"), "/_c/admin/")
         self.assertEqual(auth.safe_next(cfg, "//evil.example/_c/x"), "/_c/admin/")
         self.assertEqual(auth.safe_next(cfg, "/_c/admin/replay?id=1"), "/_c/admin/replay?id=1")
+
+    def test_a_made_up_state_is_refused_not_a_crash(self):
+        flow = auth.sign(SECRET, "flow", {"state": "abc", "nonce": "n", "verifier": "v", "next": "/_c/admin/",
+                                          "exp": int(time.time()) + 60})
+        res = auth.callback(Request("GET", "/_c/auth/callback", {"state": "é", "code": "c"}, {},
+                                    {auth.FLOW_COOKIE: flow}), self.app.cfg)
+        self.assertEqual(res.status, 400)
+
+    def test_without_an_origin_secret_nothing_is_served(self):
+        """Its Function URL is public: without the secret, anyone could say which site and
+        which visitor address a request is for. The local dev server has no CloudFront."""
+        beacon = Request("POST", "/_c/i", {}, {"x-carterlitics-site": "a.example",
+                                                "cloudfront-viewer-address": "6.6.6.6:1"}, {}, b'{"items":[]}')
+        for dev, status in ((False, 403), (True, 204)):
+            cfg = Config.from_data(DATA, session_secret=SECRET, dev=dev)
+            self.assertEqual(App(cfg, Store(cfg, MemoryTable(), MemoryBlobs())).handle(beacon).status, status)
+        cfg = Config.from_data(DATA, session_secret=SECRET)
+        self.assertEqual(App(cfg, Store(cfg)).handle(Request("GET", "/_c/healthz")).status, 200)
+
+    def test_secrets_come_from_parameter_store(self):
+        """The function's environment names where they are, so its configuration, which a
+        deploy role can read, holds none; a function provisioned before that still works."""
+        asked = []
+
+        def fetch(path):
+            asked.append(path)
+            return {"origin_secret": "o", "session_secret": "s", "server_secret": "v", "client_secret": "c"}
+
+        env = {"CARTERLITICS_CONFIG": json.dumps(DATA), "SECRETS_PATH": "/carterlitics", "ORIGIN_SECRET": "old"}
+        cfg = Config.from_env(env, fetch)
+        self.assertEqual((asked, cfg.origin_secret, cfg.session_secret, cfg.server_secret, cfg.client_secret),
+                         (["/carterlitics"], "o", "s", "v", "c"))
+        old = Config.from_env({"CARTERLITICS_CONFIG": json.dumps(DATA), "ORIGIN_SECRET": "old"}, fetch)
+        self.assertEqual((old.origin_secret, len(asked)), ("old", 1))
 
 
 class LambdaAdapter(unittest.TestCase):
@@ -1614,10 +1761,67 @@ class ClientPageShown(Page, unittest.TestCase):
         # Another tab may have been copied from this one while it was cached: it asks.
         self.assertEqual([e[1]["t"] for e in out["log"] if isinstance(e, list) and e[0] == "tab"], ["claim"])
 
+    def test_a_recording_masks_every_input_to_one_length(self):
+        """Hidden inputs too (CSRF and reset tokens), every value as the same five stars
+        (no password's length), text typed into a rich-text editor, and the tokens a page
+        keeps in its <meta> left out."""
+        out = self.page(cookies={"consent": "all", "vid": VID}, rrweb=True, wait=50, probe=(
+            "(function (o) { var editor = { closest: function (s) { return s.indexOf('contenteditable') >= 0 ? {} : null; } };"
+            "  var plain = { closest: function () { return null; } };"
+            "  return [o.maskAllInputs, o.maskInputOptions.hidden, o.maskInputOptions.password,"
+            "          o.maskInputFn('hunter2'), o.maskInputFn('x'), o.maskInputFn(''), o.blockSelector,"
+            "          o.maskTextFn('dear diary', editor), o.maskTextFn('mail pat@example.com', plain)]; })(rrwebOptions)"))
+        self.assertEqual(out["probe"], [None, True, True, "*****", "*****", "", "[data-private],meta[name*=csrf i],"
+                                        "meta[name*=token i]", "**** *****", "mail ***************"])
+
+    def test_a_recording_stops_on_an_excluded_page(self):
+        """Into an excluded page (here by the tag's data-exclude; the site's own exclude comes
+        in the served file) the recorder stops and drops what it hadn't sent; on the next page
+        it records, it starts again, from a fresh snapshot."""
+        out = self.page(cookies={"consent": "all", "vid": VID}, rrweb=True, dataset={"exclude": "/admin"}, after=(
+            "setTimeout(function () { cl('page', '/admin/users'); cl('page', '/next'); }, 5);"))
+        recorded = [e for e in out["log"] if not (isinstance(e, list) and e[0] == "tab")]
+        self.assertEqual(recorded, ["record", "stop", "record", ["custom", "page", {"path": "/next"}]])
+
+    def test_a_recording_names_its_page_without_its_query(self):
+        out = self.page(url="https://a.example/reset?token=abc#access_token=x", cookies={"consent": "all", "vid": VID},
+                        rrweb=True, after=(
+                            "setTimeout(function () {"
+                            "  rrwebOptions.emit({ type: 4, timestamp: 1, data: { href: location.href } });"
+                            "  fire('window', 'pagehide', {}); }, 5);"))
+        chunks = [p for p in out["posts"] if "events" in p]
+        self.assertEqual(chunks[0]["events"][0]["data"]["href"], "https://a.example/reset")
+
     def test_nothing_recorded_without_consent(self):
         out = self.page(rrweb=True, after=(
             "setTimeout(function () { fire('window', 'pageshow', { persisted: true }); cl('page', '/next'); }, 5);"))
         self.assertEqual(out["log"], [])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
+class ClientAddresses(Page, unittest.TestCase):
+    """What c.js sends of an address: a referrer's site and page, never its query or fragment,
+    which carry what a page was given (a reset token, an email address, an #access_token)."""
+
+    def test_a_referrer_has_no_query_or_fragment(self):
+        out = self.page(url="https://a.example/welcome?email=pat@example.com&reset=abc#access_token=x",
+                        referrer="https://a.example/signup?email=pat@example.com",
+                        cookies={"consent": "all", "vid": VID}, after=(
+                            "location.pathname = '/dashboard'; location.href = 'https://a.example/dashboard';"
+                            "history.pushState({}, '', '/dashboard');"))
+        views = [(i["p"], i["r"]) for i in out["items"] if i["t"] == "pv"]
+        self.assertEqual(views, [("/welcome", "https://a.example/signup"),
+                                 ("/dashboard", "https://a.example/welcome")])
+
+    def test_an_error_keeps_no_query_fragment_or_email(self):
+        out = self.page(after=(
+            "fire('window', 'error', { message: 'Bad address pat@example.com', lineno: 3, colno: 7,"
+            "  filename: 'https://a.example/reset?token=abc', error: { name: 'Error', message: 'Bad address',"
+            "  stack: 'Error: Bad address\\n    at https://a.example/reset?token=abc#x:3:7' } });"))
+        err = [i for i in out["items"] if i["t"] == "err"][0]
+        self.assertEqual((err["m"], err["src"], err["st"]),
+                         ("Bad address [email]", "https://a.example/reset",
+                          "Error: Bad address\n    at https://a.example/reset:3:7"))
 
 
 @unittest.skipUnless(shutil.which("node"), "needs node to run c.js")
@@ -1825,6 +2029,55 @@ class Geo(unittest.TestCase):
         self.assertEqual(geo.lookup("8.8.8.8").asn, "15169")
         self.assertEqual(geo.lookup("192.168.1.1").asn, "")
         self.assertEqual(geo.lookup("not an ip").country, "")
+
+
+class GrantDeploy(unittest.TestCase):
+    """grant-deploy against a stand-in AWS CLI: who ends up allowed to ship code."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("deploy_under_test", ROOT / "infra" / "deploy.py")
+        self.deploy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.deploy)
+        self.calls = []
+
+    def fake_aws(self, held):
+        def aws(*args, **_):
+            self.calls.append(args)
+            if args[1] == "get-account-authorization-details":
+                return {"user": [[n, ["carterlitics-code"]] for k, n in held if k == "user"] + [["someone", None]],
+                        "role": [[n, ["carterlitics-code", "other"]] for k, n in held if k == "role"]}
+            return {}
+        return aws
+
+    def test_a_dropped_user_loses_the_right_and_the_role_keeps_it(self):
+        held = [("user", "site-publisher"), ("role", "cartercole-net-deploy")]
+        with mock.patch.object(self.deploy, "DEPLOYERS", [("role", "cartercole-net-deploy")]), \
+                mock.patch.object(self.deploy, "aws", self.fake_aws(held)), mock.patch("builtins.print"):
+            self.deploy.grant_deploy("123456789012", dry=False)
+        changes = [a[:4] for a in self.calls if a[1] != "get-account-authorization-details"]
+        self.assertEqual(changes, [("iam", "delete-user-policy", "--user-name", "site-publisher"),
+                                   ("iam", "put-role-policy", "--role-name", "cartercole-net-deploy")])
+
+    def test_a_dry_run_changes_nothing(self):
+        with mock.patch.object(self.deploy, "DEPLOYERS", []), \
+                mock.patch.object(self.deploy, "aws", self.fake_aws([("user", "site-publisher")])), \
+                mock.patch("builtins.print") as said:
+            self.deploy.grant_deploy("123456789012", dry=True)
+        self.assertEqual([a[1] for a in self.calls], ["get-account-authorization-details"])
+        self.assertIn("would stop user site-publisher", " ".join(str(c) for c in said.call_args_list))
+
+    def test_nobody_but_an_admin_is_configured_to_ship_code(self):
+        self.assertEqual(self.deploy.DEPLOYERS, [])
+
+    def test_with_nobody_configured_every_holder_loses_the_right(self):
+        held = [("user", "site-publisher"), ("role", "cartercole-net-deploy")]
+        with mock.patch.object(self.deploy, "DEPLOYERS", []), \
+                mock.patch.object(self.deploy, "aws", self.fake_aws(held)), mock.patch("builtins.print"):
+            self.deploy.grant_deploy("123456789012", dry=False)
+        changes = [a[:4] for a in self.calls if a[1] != "get-account-authorization-details"]
+        self.assertEqual(changes, [("iam", "delete-user-policy", "--user-name", "site-publisher"),
+                                   ("iam", "delete-role-policy", "--role-name", "cartercole-net-deploy")])
 
 
 if __name__ == "__main__":

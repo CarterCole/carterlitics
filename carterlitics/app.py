@@ -1,12 +1,15 @@
 """The collector: one Lambda behind every site's CloudFront at `/_c/*`.
 
-    GET  /_c/c.js                   the client: page views, events, errors, consent, recording
+    GET  /_c/c.js                   the client: page views, events, errors, consent, recording,
+                                    and the site's experiments, put in for the site it's asked from
     GET  /_c/s/<file>               static files, content-hashed and immutable
     POST /_c/i                      a batch from c.js: page views, leaves, events, errors,
                                     form attempts
     GET  /_c/who                    what the collector makes of this visitor, for the page:
                                     a bot (checked, if a crawler), VPN, Tor, relay, hosting
     GET  /_c/n.gif                  a page shown without JavaScript: its <noscript> pixel
+    GET  /_c/x                      where a visitor who hasn't consented falls in each experiment,
+                                    from their network and browser (experiments.bucket); kept nowhere
     POST /_c/r                      a chunk of a consented session recording
     POST /_c/server/events          events from a site's own backend (x-carterlitics-key)
     GET  /_c/admin/                 the console (on the console site; others redirect there)
@@ -16,7 +19,8 @@
                                     (/api/ip?ip=…: one address, registry included;
                                     /api/search: Google Search Console, `google.py`;
                                     /api/visitor?id=…: one visitor's sessions, added up;
-                                    /api/forms: how people fill in forms, field by field)
+                                    /api/forms: how people fill in forms, field by field;
+                                    /api/experiments: each experiment's arms, compared)
     GET  /_c/auth/login|callback    sign-in at the OpenID Connect issuer
     POST /_c/auth/logout
 
@@ -39,22 +43,27 @@ import json
 import mimetypes
 import os
 import re
+import threading
+import time
 import traceback
 import urllib.parse
 from pathlib import Path
 
-from . import auth, logs
+from . import auth, classify, experiments, logs
 from .backends import DynamoTable, S3Blobs
 from .config import Config, Funnel
 from .geo import Geolocator
 from .google import GoogleError, SearchConsole, plan
 from .intel import Intelligence
 from .store import EXPORT_DIMS, LOG_KINDS, Meta, Store
-from .web import NO_STORE, Request, Response, from_lambda, no_content, plain, redirect, reply_json, to_lambda
+from .web import JSON_TYPE, NO_STORE, Request, Response, from_lambda, no_content, plain, redirect, reply_json, to_lambda
 
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 64 * 1024            # a batch from c.js: sendBeacon's limit
 MAX_CHUNK_BODY = 3 * 1024 * 1024
+CLIENT_TTL = 60                 # seconds a site's c.js, experiments and a bandit's shares in it, is reused
+EXPERIMENTS_SLOT = b"/*__EXPERIMENTS__*/null"
+EXCLUDE_SLOT = b"/*__EXCLUDE__*/[]"
 PIXEL = bytes.fromhex("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b")
 
 
@@ -84,6 +93,20 @@ class Assets:
         # c.js names the recorder by its hashed URL, so it changes when rrweb does.
         client = self.text("c.js").replace("__RRWEB__", self.urls["vendor/rrweb.min.js"])
         self.client = client.encode()
+        for slot in (EXCLUDE_SLOT, EXPERIMENTS_SLOT):
+            if slot not in self.client:
+                raise RuntimeError(f"c.js has lost its {slot.decode()} slot")
+
+    def client_with(self, experiments: list[dict], exclude: tuple[str, ...] = ()) -> bytes:
+        """c.js with a site's excluded paths (never recorded) and experiments in it: JSON,
+        which is a JavaScript expression."""
+        body = self.client
+        if exclude:
+            body = body.replace(EXCLUDE_SLOT, json.dumps(list(exclude), ensure_ascii=True).encode(), 1)
+        if experiments:
+            data = json.dumps(experiments, separators=(",", ":"), ensure_ascii=True)
+            body = body.replace(EXPERIMENTS_SLOT, data.encode(), 1)
+        return body
 
     def text(self, name: str) -> str:
         return (STATIC / name).read_text(encoding="utf-8")
@@ -113,6 +136,8 @@ class App:
         self.store = store
         self.search = search
         self.assets = Assets(cfg.mount)
+        self._clients: dict[str, tuple[float, bytes]] = {}
+        self._lock = threading.Lock()
 
     # -- helpers
 
@@ -151,10 +176,33 @@ class App:
         """Console data, gzipped: rrweb JSON and long logs shrink about tenfold, which keeps
         them well under the Function URL's 6 MB response cap."""
         body = json.dumps(data, separators=(",", ":"), default=str).encode()
-        headers = {"Content-Type": "application/json; charset=utf-8", **NO_STORE}
+        headers = {**JSON_TYPE, **NO_STORE}
         if len(body) > 1024:
             return Response(200, gzip.compress(body, compresslevel=6), {**headers, "Content-Encoding": "gzip"})
         return Response(200, body, headers)
+
+    def shares(self, site, exp) -> dict[str, float]:
+        """Each arm's share of an experiment's visitors now: fixed for a split, learned for a
+        bandit, from its counters (one query)."""
+        counts = experiments.totals(experiments.tally(self.store.experiment(site, exp.key))) \
+            if exp.allocation != "split" and exp.status == "running" else {}
+        return experiments.weights(exp, counts)
+
+    def client_for(self, site) -> bytes:
+        """c.js as the site's pages get it, its excluded paths and experiments in it. Built at
+        most once a CLIENT_TTL, so a bandit's shares are a minute old at most, plus CloudFront's 5."""
+        if not site or not (site.experiments or site.exclude):
+            return self.assets.client
+        now = time.monotonic()
+        with self._lock:
+            hit = self._clients.get(site.id)
+            if hit and hit[0] > now:
+                return hit[1]
+        data = [x for x in (experiments.client(e, self.shares(site, e)) for e in site.experiments) if x]
+        body = self.assets.client_with(data, site.exclude)
+        with self._lock:
+            self._clients[site.id] = (now + CLIENT_TTL, body)
+        return body
 
     @staticmethod
     def clamp(value, default: int, low: int, high: int) -> int:
@@ -169,6 +217,11 @@ class App:
         cfg, m = self.cfg, self.cfg.mount
         if req.path == f"{m}/healthz":
             return plain(200, "ok")
+        # Without the secret, the Function URL is public and every header CloudFront vouches
+        # for (the site, the visitor's address) is the caller's to make up: refuse, unless
+        # this is the local dev server, which has no CloudFront.
+        if not cfg.origin_secret and not cfg.dev:
+            return plain(403, "forbidden")
         if cfg.origin_secret and not hmac.compare_digest(
                 req.headers.get("x-origin-verify", "").encode(), cfg.origin_secret.encode()):
             return plain(403, "forbidden")
@@ -179,7 +232,7 @@ class App:
 
         if req.method in ("GET", "HEAD"):
             if path == "/c.js":
-                return Response(200, self.assets.client, {
+                return Response(200, self.client_for(self.site_of(req)), {
                     "Content-Type": "text/javascript; charset=utf-8",
                     "Cache-Control": "public, max-age=300, s-maxage=300"})
             if path.startswith("/s/"):
@@ -204,6 +257,20 @@ class App:
                 return plain(404, "unknown site")
             q = req.query
             return reply_json(self.store.who(self.meta(req), q.get("tz", ""), q.get("wd") == "1", q.get("auto", "")))
+
+        if route == ("GET", "/x"):
+            # Where this visitor falls in each of the site's experiments, for c.js to pick their
+            # arm by when they haven't consented (a consented visitor's comes from their cookie).
+            # The same network and browser always get the same answer; nothing is kept.
+            site = self.site_of(req)
+            if not site:
+                return plain(404, "unknown site")
+            meta = self.meta(req)
+            found = {}
+            if not meta.opted_out and not classify.bot_of(meta.user_agent):
+                found = {e.key: round(experiments.bucket(cfg.server_secret, site.id, e.key, meta.ip, meta.user_agent), 6)
+                         for e in site.experiments if e.status == "running" and e.audience == "everyone"}
+            return reply_json({"u": found})
 
         if route == ("GET", "/n.gif"):
             # In a page's <noscript>, so only a browser not running JavaScript asks for it.
@@ -322,6 +389,14 @@ class App:
                                   "configured": [f.to_data() for f in site.funnels]})
         if path == "/forms":
             return self.big_json(self.store.forms(site, self.clamp(q.get("days"), 30, 1, 90)))
+        if path == "/experiments":
+            # Each experiment's whole run, whatever the console's range: one query each.
+            reports = []
+            for exp in site.experiments:
+                items = self.store.experiment(site, exp.key)
+                shares = experiments.weights(exp, experiments.totals(experiments.tally(items)))
+                reports.append(experiments.report(exp, items, shares))
+            return self.big_json({"experiments": reports, "url": site.url})
         if path == "/search":
             return self.big_json(self.search_report(site, self.clamp(q.get("days"), 30, 1, 480)))
         if path == "/ip":
@@ -339,7 +414,7 @@ class App:
             if events is None:
                 return reply_json({"error": "not found"}, 404)
             return Response(200, gzip.compress(events.encode(), compresslevel=6), {
-                "Content-Type": "application/json; charset=utf-8", "Content-Encoding": "gzip", **NO_STORE})
+                **JSON_TYPE, "Content-Encoding": "gzip", **NO_STORE})
         return reply_json({"error": "not found"}, 404)
 
     def search_report(self, site, days: int) -> dict:
