@@ -467,8 +467,9 @@ class Site:
     aliases: tuple[str, ...] = ()    # other hosts that serve it: "www.cartercole.net", or "*.cartercole.net"
     exclude: tuple[str, ...] = ()    # path prefixes that are never pages: "/admin"
     distribution: str = ""           # its CloudFront distribution; found by alias if empty (deploy only)
-    server_ip: str = "bots"          # the server request log's addresses: "bots" (whole for bots,
-                                     # a person's cut to its /24 or /48), "full" or "truncate"
+    server_ip: str = "full"          # the server request log's addresses: "full" (everyone's whole,
+                                     # and looked up), "bots" (a person's cut to its /24 or /48,
+                                     # not looked up) or "truncate"
     dev_url: str = ""                # its local dev server, for links and the CSP
     client: bool = True              # its pages load c.js; false = server logs only
     funnels: tuple[Funnel, ...] = () # [[site.funnel]]: the console's Funnels tab
@@ -566,14 +567,14 @@ class Config:
             site = Site(
                 id=s["id"], url=s.get("url") or f"https://{s['id']}",
                 aliases=tuple(s.get("aliases", ())), exclude=tuple(s.get("exclude", ())),
-                distribution=s.get("distribution", ""), server_ip=s.get("server_ip", "bots"),
+                distribution=s.get("distribution", ""), server_ip=s.get("server_ip", "full"),
                 dev_url=s.get("dev_url", ""), client=bool(s.get("client", True)),
                 funnels=tuple(Funnel.parse(f, s["id"]) for f in s.get("funnel", ())),
                 consent_docs=s.get("consent_docs", ""),
                 experiments=tuple(Experiment.parse(e, s["id"]) for e in s.get("experiment", ())),
             )
-            if site.server_ip not in ("bots", "full", "truncate"):
-                raise ValueError(f"{site.id}: server_ip must be 'bots', 'full' or 'truncate'")
+            if site.server_ip not in ("full", "bots", "truncate"):
+                raise ValueError(f"{site.id}: server_ip must be 'full', 'bots' or 'truncate'")
             if site.consent_docs and not (site.consent_docs.startswith("/") and "{version}" in site.consent_docs):
                 raise ValueError(f"{site.id}: consent_docs is a path with {{version}} in it, like /privacy/v{{version}}")
             names = [f.name for f in site.funnels]
@@ -650,7 +651,7 @@ class Config:
                       **({"url": s.url} if s.url != f"https://{s.id}" else {}),
                       **({"aliases": list(s.aliases)} if s.aliases else {}),
                       **({"exclude": list(s.exclude)} if s.exclude else {}),
-                      **({"server_ip": s.server_ip} if s.server_ip != "bots" else {}),
+                      **({"server_ip": s.server_ip} if s.server_ip != "full" else {}),
                       **({"consent_docs": s.consent_docs} if s.consent_docs else {}),
                       **({"funnel": [f.to_data() for f in s.funnels]} if s.funnels else {})}
                      for s in self.sites.values()],

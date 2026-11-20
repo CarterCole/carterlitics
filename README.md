@@ -95,7 +95,7 @@ country and ASN, and blockers that target third-party analytics hosts don't appl
 
 | | When | What | Kept |
 |---|---|---|---|
-| Server requests | always | IP (a person's cut to its /24 or /48 by default, below), user agent, method, path, query and referrer (credential-like and personal values redacted, below), status, country, network, reverse DNS name (bots' by default), kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
+| Server requests | always | IP (whole by default, below), user agent, method, path, query and referrer (credential-like and personal values redacted, below), status, country, network, reverse DNS name, kind of connection, crawler verdict, edge result. Assets (`.js`, `.css`, images, fonts) are skipped; feeds, sitemaps and `robots.txt` are kept | 30 days |
 | Page counters | always, unless DNT/GPC | daily counts per page, country, device size, browser, OS, kind of connection; views whose browser clock is in another time zone than the address; engaged (visible) time per page; how page views ended and the other sites they left for (host only); signs of automation; pages seen without JavaScript; bots that run JS are counted apart | 400 days |
 | Unique visitors | always, unless DNT/GPC | `sha256(daily salt, site, IP, UA)`; the salt is random and deleted after 2 days, so hashes can't be reversed afterwards | 400 days (as a count) |
 | Visits | always, unless DNT/GPC | daily counts of visits, bounces, landing and exit pages, and where visits came from: source, channel, campaign. The visit in progress is one item per visitor hash: when it was last seen, how many page views and events, its first and latest page, its source; no address or user agent (`v\|<site>\|<hash>`) | 400 days (as counts); the item a day |
@@ -116,9 +116,9 @@ events (`non_interaction`), so DNT and GPC stop them like any other.
 
 Retention is `[retention]` in `carterlitics.toml`; everything expires through the table's
 TTL or a bucket lifecycle rule. A site's `server_ip` says how the request log keeps
-addresses: `"bots"` (the default) keeps a bot's whole, to prove a crawler is the real one,
-and a person's at /24 (IPv4) or /48 (IPv6), with no reverse DNS lookup; `"full"` keeps
-everyone's whole; `"truncate"` cuts everyone's. Query strings and Referers in the request log
+addresses: `"full"` (the default) keeps everyone's whole and looks each one up; `"bots"`
+keeps a bot's whole, to prove a crawler is the real one, and a person's at /24 (IPv4) or
+/48 (IPv6), with no reverse DNS lookup; `"truncate"` cuts everyone's. Query strings and Referers in the request log
 have the values of credential-like and personal parameters (`code`, `state`, `token`,
 `login_hint`, `email`, signatures, …) and of any email address replaced, and a Referer
 loses its fragment: OAuth callbacks, sign-ins and newsletter links carry them, and a
@@ -262,9 +262,9 @@ any lookup service:
   `crawl-66-249-66-1.googlebot.com`), from AWS's resolver, cached a week. Its domain
   is counted too (Traffic: *Host domains*), which names companies with their own
   networks as well as ISPs. Only addresses that are stored whole anyway are looked up:
-  bots in the server logs (and people too with `server_ip = "full"`), consented visits,
-  and backend events that carry an IP. A person in the server log gets none by default,
-  and nobody with `server_ip = "truncate"`, since the names spell the address out.
+  everyone in the server logs (only bots with `server_ip = "bots"`), consented visits,
+  and backend events that carry an IP. Nobody with `server_ip = "truncate"` gets one,
+  since the names spell the address out.
 - **Published ranges**, built into `geo/ranges.bin` by `infra/deploy.py intel` from
   about thirty public lists: the ranges Google, Bing, OpenAI, Perplexity, Apple,
   DuckDuckGo, Common Crawl, UptimeRobot and Pingdom crawl from; AWS, Google Cloud,

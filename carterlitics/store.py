@@ -938,10 +938,10 @@ class Store:
             """Whether a request's address is kept whole (config.Site.server_ip)."""
             return site.server_ip == "full" or (site.server_ip == "bots" and bot is not None)
 
-        # Every address kept whole in the file at once, in parallel: a bot's (by its user
-        # agent, to prove a crawler is the real one), and a person's only with "full". The
-        # rest get no reverse DNS, nor a place in its cache: the names often spell the
-        # address out.
+        # Every address kept whole in the file at once, in parallel: everyone's with "full"
+        # (the default), only a bot's (by its user agent, to prove a crawler is the real one)
+        # with "bots". The rest get no reverse DNS, nor a place in its cache: the names often
+        # spell the address out.
         found = self.intel.lookup_many({line.ip for site, line, bot in rows if whole(site, bot)}, LOG_DNS)
         has_ranges = self.intel.ranges is not None
         for site, line, bot in rows:

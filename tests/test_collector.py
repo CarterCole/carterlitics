@@ -839,11 +839,11 @@ class Enrichment(unittest.TestCase):
         other = body(self.call("GET", "/_c/api/log", query={"site": "b.example", "kind": "hum"}))["items"]
         self.assertNotIn("host", other[0])
 
-    def test_by_default_a_persons_address_is_cut_and_never_looked_up(self):
-        """server_ip's default, "bots": a bot's address whole, to prove a crawler is the real
-        one; a person's cut to its /24, with no reverse DNS (nor a lookup, which its cache would
-        keep), and their Referer with its query redacted and no fragment."""
-        data = {**DATA, "site": [{k: v for k, v in DATA["site"][0].items() if k != "server_ip"}, DATA["site"][1]]}
+    def _log_both(self, server_ip):
+        """A crawler's request and a person's, logged for a.example with server_ip as given
+        (None: the default); the person's row, the bot's, and the addresses looked up."""
+        site = {k: v for k, v in DATA["site"][0].items() if k != "server_ip"}
+        data = {**DATA, "site": [{**site, **({"server_ip": server_ip} if server_ip else {})}, DATA["site"][1]]}
         cfg = Config.from_data(data, session_secret=SECRET, origin_secret="origin", server_secret="server",
                                client_id="client", client_secret="shh")
         table, calls = MemoryTable(), []
@@ -854,13 +854,29 @@ class Enrichment(unittest.TestCase):
             LogLine(now, "a.example", "66.249.66.1", "GET", "/", "", 200, "", google),
             LogLine(now, "a.example", "198.51.100.7", "GET", "/next", "", 200,
                     "https://a.example/reset?token=abc&page=2#frag", SAFARI)])
-        self.assertEqual(calls, ["66.249.66.1"])
         call = Client(app)
         call.sign_in()
         person = body(call("GET", "/_c/api/log", query={"site": "a.example", "kind": "hum"}))["items"][0]
+        bot = body(call("GET", "/_c/api/log", query={"site": "a.example", "kind": "bot"}))["items"][0]
+        return person, bot, sorted(calls)
+
+    def test_by_default_everyones_address_is_whole_and_looked_up(self):
+        """server_ip's default, "full": a person's address kept whole and given its reverse DNS
+        name, as a bot's is; their Referer still has its query redacted and no fragment."""
+        person, bot, calls = self._log_both(None)
+        self.assertEqual(self.app.cfg.to_data()["site"][0].get("server_ip"), None)
+        self.assertEqual(calls, ["198.51.100.7", "66.249.66.1"])
+        self.assertEqual((person["ip"], person["ref"]), ("198.51.100.7", "https://a.example/reset?token=…&page=2"))
+        self.assertIn("host", person)
+        self.assertEqual((bot["ip"], bot["ver"]), ("66.249.66.1", "verified"))
+
+    def test_with_bots_a_persons_address_is_cut_and_never_looked_up(self):
+        """server_ip = "bots": a bot's address whole, to prove a crawler is the real one; a
+        person's cut to its /24, with no reverse DNS (nor a lookup, which its cache would keep)."""
+        person, bot, calls = self._log_both("bots")
+        self.assertEqual(calls, ["66.249.66.1"])
         self.assertEqual((person["ip"], person.get("host"), person["ref"]),
                          ("198.51.100.0", None, "https://a.example/reset?token=…&page=2"))
-        bot = body(call("GET", "/_c/api/log", query={"site": "a.example", "kind": "bot"}))["items"][0]
         self.assertEqual((bot["ip"], bot["ver"]), ("66.249.66.1", "verified"))
 
     def test_a_referrer_is_kept_without_its_query_or_fragment(self):
